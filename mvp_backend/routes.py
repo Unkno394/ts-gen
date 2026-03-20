@@ -12,18 +12,25 @@ from email_service import (
 )
 from generator import build_preview, generate_typescript
 from matcher import map_fields
-from models import AuthPayload, EmailCodePayload, RegisterPayload
+from models import AuthPayload, CorrectionSessionPayload, EmailCodePayload, RegisterPayload, UserTemplatePayload
 from parsers import ParseError, infer_target_fields, parse_file, resolve_generation_source
 from storage import (
     InvalidCredentialsError,
     UserConflictError,
     cleanup_expired_guest_files,
+    ensure_schema_fingerprint,
+    finalize_guest_upload,
     get_history,
+    get_learning_summary,
     is_email_registered,
+    list_user_templates,
     login_user,
+    record_uploaded_file,
     register_user,
+    save_correction_session,
     save_generation,
     save_upload,
+    save_user_template,
 )
 
 router = APIRouter()
@@ -88,6 +95,13 @@ async def generate(
 
     try:
         saved_path = save_upload(file_bytes, filename, mode=mode, user_id=user_id)
+        upload_record_id = record_uploaded_file(
+            file_path=saved_path,
+            original_file_name=filename,
+            file_bytes=file_bytes,
+            mode=mode,
+            user_id=user_id,
+        )
         parsed = parse_file(saved_path, filename)
         target_fields, target_payload = infer_target_fields(target_json)
         source_columns, source_rows, source_warnings = resolve_generation_source(parsed, selected_sheet)
@@ -110,9 +124,28 @@ async def generate(
                 warnings_json=json.dumps(all_warnings, ensure_ascii=False),
                 parsed_file_json=json.dumps(_model_to_dict(parsed), ensure_ascii=False),
                 selected_sheet=selected_sheet,
+                source_columns=source_columns,
+                upload_record_id=upload_record_id,
             )
-        elif not keep_guest_file:
-            saved_path.unlink(missing_ok=True)
+        else:
+            schema_fingerprint_id = ensure_schema_fingerprint(
+                parsed_file_json=json.dumps(_model_to_dict(parsed), ensure_ascii=False),
+                target_json=json.dumps(target_payload, ensure_ascii=False),
+                selected_sheet=selected_sheet,
+                source_columns=source_columns,
+            )
+            if not keep_guest_file:
+                try:
+                    saved_path.unlink(missing_ok=True)
+                except PermissionError:
+                    # Excel readers on Windows can briefly keep the file handle open.
+                    all_warnings.append('Temporary upload cleanup was deferred because the file is still locked by the OS.')
+            finalize_guest_upload(
+                upload_id=upload_record_id,
+                schema_fingerprint_id=schema_fingerprint_id,
+                file_path=saved_path,
+                keep_file=keep_guest_file,
+            )
 
         return {
             'generation_id': generation_id,
@@ -152,3 +185,43 @@ def history(user_id: str) -> dict:
             }
         )
     return {'items': normalized}
+
+
+@router.get('/learning/summary/{user_id}')
+def learning_summary(user_id: str) -> dict:
+    return get_learning_summary(user_id)
+
+
+@router.get('/learning/templates/{user_id}')
+def learning_templates(user_id: str) -> dict:
+    return {'items': list_user_templates(user_id)}
+
+
+@router.post('/learning/templates')
+def learning_save_template(payload: UserTemplatePayload) -> dict:
+    return save_user_template(
+        user_id=payload.user_id,
+        name=payload.name,
+        template_kind=payload.template_kind,
+        template_json=payload.template_json,
+        description=payload.description,
+        target_json=payload.target_json,
+        generated_typescript=payload.generated_typescript,
+        prompt_suffix=payload.prompt_suffix,
+        schema_fingerprint_id=payload.schema_fingerprint_id,
+        is_shared=payload.is_shared,
+        metadata=payload.metadata,
+    )
+
+
+@router.post('/learning/corrections')
+def learning_save_corrections(payload: CorrectionSessionPayload) -> dict:
+    return save_correction_session(
+        user_id=payload.user_id,
+        generation_id=payload.generation_id,
+        session_type=payload.session_type,
+        schema_fingerprint_id=payload.schema_fingerprint_id,
+        notes=payload.notes,
+        metadata=payload.metadata,
+        corrections=[_model_to_dict(correction) for correction in payload.corrections],
+    )

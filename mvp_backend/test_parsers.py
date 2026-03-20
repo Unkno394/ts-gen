@@ -5,7 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional dependency in local env
+    pd = None
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -15,6 +18,7 @@ from models import ParsedFile, ParsedSheet
 from parsers import ParseError, parse_file, resolve_generation_source
 
 
+@unittest.skipIf(pd is None, 'pandas is not installed in the current environment')
 class ExcelParserTests(unittest.TestCase):
     def test_numeric_excel_headers_are_converted_to_strings(self) -> None:
         dataframe = pd.DataFrame([['zov', 120, 'sddf']], columns=[1223, 'hsdh', 'sdvsdv'])

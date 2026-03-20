@@ -125,46 +125,46 @@ def _parse_excel(file_path: Path) -> tuple[list[str], list[dict[str, Any]], list
     warnings: list[str] = []
     engine = 'openpyxl' if file_path.suffix.lower() == '.xlsx' else 'xlrd'
     try:
-        excel = pd.ExcelFile(file_path, engine=engine)
-        combined_columns: list[str] = []
-        combined_rows: list[dict[str, Any]] = []
-        non_empty_sheets: list[str] = []
-        sheets: list[ParsedSheet] = []
+        with pd.ExcelFile(file_path, engine=engine) as excel:
+            combined_columns: list[str] = []
+            combined_rows: list[dict[str, Any]] = []
+            non_empty_sheets: list[str] = []
+            sheets: list[ParsedSheet] = []
 
-        for sheet_name in excel.sheet_names:
-            df = pd.read_excel(file_path, sheet_name=sheet_name, engine=engine)
-            df = df.where(pd.notnull(df), None)
-            raw_columns = df.columns.tolist()
-            if any(
-                column is None
-                or not isinstance(column, str)
-                or (isinstance(column, str) and (column.strip() == '' or column.startswith('Unnamed:')))
-                for column in raw_columns
-            ):
-                warnings.append(
-                    f'Sheet "{sheet_name}": Excel first row is treated as column headers. Some headers are empty or non-text, so the first row may contain data instead of column names.'
-                )
+            for sheet_name in excel.sheet_names:
+                df = pd.read_excel(excel, sheet_name=sheet_name, engine=engine)
+                df = df.where(pd.notnull(df), None)
+                raw_columns = df.columns.tolist()
+                if any(
+                    column is None
+                    or not isinstance(column, str)
+                    or (isinstance(column, str) and (column.strip() == '' or column.startswith('Unnamed:')))
+                    for column in raw_columns
+                ):
+                    warnings.append(
+                        f'Sheet "{sheet_name}": Excel first row is treated as column headers. Some headers are empty or non-text, so the first row may contain data instead of column names.'
+                    )
 
-            columns = [str(column) for column in raw_columns]
-            df.columns = columns
-            rows = [{str(key): value for key, value in row.items()} for row in df.to_dict(orient='records')]
+                columns = [str(column) for column in raw_columns]
+                df.columns = columns
+                rows = [{str(key): value for key, value in row.items()} for row in df.to_dict(orient='records')]
 
-            if not columns and not rows:
-                continue
+                if not columns and not rows:
+                    continue
 
-            non_empty_sheets.append(sheet_name)
-            sheets.append(ParsedSheet(name=sheet_name, columns=columns, rows=rows[:PREVIEW_ROW_LIMIT]))
-            for column in columns:
-                if column not in combined_columns:
-                    combined_columns.append(column)
-            combined_rows.extend(rows)
+                non_empty_sheets.append(sheet_name)
+                sheets.append(ParsedSheet(name=sheet_name, columns=columns, rows=rows[:PREVIEW_ROW_LIMIT]))
+                for column in columns:
+                    if column not in combined_columns:
+                        combined_columns.append(column)
+                combined_rows.extend(rows)
 
-        if len(non_empty_sheets) > 1:
-            warnings.append(f'Merged {len(non_empty_sheets)} sheets: {", ".join(non_empty_sheets)}')
-        elif len(excel.sheet_names) > 1 and len(non_empty_sheets) == 1:
-            warnings.append(f'Workbook has multiple sheets. Used the only non-empty sheet: {non_empty_sheets[0]}')
+            if len(non_empty_sheets) > 1:
+                warnings.append(f'Merged {len(non_empty_sheets)} sheets: {", ".join(non_empty_sheets)}')
+            elif len(excel.sheet_names) > 1 and len(non_empty_sheets) == 1:
+                warnings.append(f'Workbook has multiple sheets. Used the only non-empty sheet: {non_empty_sheets[0]}')
 
-        return combined_columns, combined_rows[:PREVIEW_ROW_LIMIT], warnings, sheets
+            return combined_columns, combined_rows[:PREVIEW_ROW_LIMIT], warnings, sheets
     except Exception as exc:  # noqa: BLE001
         raise ParseError(f'Failed to parse Excel: {exc}') from exc
 

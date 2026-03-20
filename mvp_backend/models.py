@@ -64,3 +64,51 @@ class UserProfile(BaseModel):
     id: str
     name: str
     email: str
+
+
+class ManualCorrection(BaseModel):
+    correction_type: Literal[
+        'mapping_override',
+        'value_fix',
+        'ignore_field',
+        'rename_field',
+        'template_edit',
+        'target_schema_edit',
+        'code_edit',
+        'feedback_note',
+    ] = 'feedback_note'
+    row_index: int | None = None
+    field_path: str | None = None
+    source_field: str | None = None
+    target_field: str | None = None
+    original_value: Any | None = None
+    corrected_value: Any | None = None
+    correction_payload: Any | None = None
+    rationale: str | None = None
+    confidence_before: float | None = None
+    confidence_after: float | None = None
+    accepted: bool = True
+
+
+class CorrectionSessionPayload(BaseModel):
+    user_id: str
+    generation_id: int | None = None
+    session_type: Literal['manual_review', 'post_generation_fix', 'template_authoring', 'feedback_loop'] = 'manual_review'
+    schema_fingerprint_id: int | None = None
+    notes: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    corrections: list[ManualCorrection] = Field(default_factory=list)
+
+
+class UserTemplatePayload(BaseModel):
+    user_id: str
+    name: str
+    template_kind: Literal['transform', 'mapping', 'postprocess', 'schema', 'hybrid'] = 'transform'
+    template_json: dict[str, Any]
+    description: str | None = None
+    target_json: dict[str, Any] | None = None
+    generated_typescript: str | None = None
+    prompt_suffix: str | None = None
+    schema_fingerprint_id: int | None = None
+    is_shared: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)

@@ -77,6 +77,11 @@ def cmd_generate(args: argparse.Namespace) -> None:
             generated_typescript=code,
             preview_json=json.dumps(preview, ensure_ascii=False),
             warnings_json=json.dumps(warnings, ensure_ascii=False),
+            parsed_file_json=json.dumps(
+                parsed_file.model_dump() if hasattr(parsed_file, 'model_dump') else parsed_file.dict(),
+                ensure_ascii=False,
+            ),
+            source_columns=list(parsed_file.columns),
         )
 
     print('TSGen generate')
