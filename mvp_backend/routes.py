@@ -7,30 +7,58 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from email_service import (
     EmailDeliveryError,
     EmailServiceError,
+    consume_email_change_code,
     consume_registration_code,
+    consume_password_reset_code,
+    consume_password_reset_token,
+    request_email_change_code,
     request_registration_code,
+    request_password_reset_code,
+    verify_password_reset_code,
 )
 from generator import build_preview, generate_typescript
 from matcher import map_fields
-from models import AuthPayload, CorrectionSessionPayload, EmailCodePayload, RegisterPayload, UserTemplatePayload
+from models import (
+    AuthPayload,
+    ChangeEmailPayload,
+    ChangePasswordPayload,
+    CorrectionSessionPayload,
+    EmailChangeCodePayload,
+    EmailCodePayload,
+    RegisterPayload,
+    ResetPasswordPayload,
+    UserTemplatePayload,
+    VerifyResetCodePayload,
+    UpdateProfilePayload,
+)
 from parsers import ParseError, infer_target_fields, parse_file, resolve_generation_source
 from storage import (
+    EmailChangeError,
     InvalidCredentialsError,
+    ProfileUpdateError,
     UserConflictError,
+    UserNotFoundError,
+    change_user_password,
+    change_user_email,
     cleanup_expired_guest_files,
     ensure_schema_fingerprint,
     finalize_guest_upload,
+    get_user_profile,
     get_history,
     get_learning_summary,
     is_email_registered,
     list_user_templates,
     login_user,
     record_uploaded_file,
+    prepare_email_change,
     register_user,
     save_correction_session,
     save_generation,
     save_upload,
     save_user_template,
+    update_user_profile_name,
+    update_user_password,
+    verify_user_password,
 )
 
 router = APIRouter()
@@ -69,6 +97,93 @@ def register(payload: RegisterPayload) -> dict:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except EmailServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post('/auth/send-reset-code')
+def send_reset_code(payload: EmailCodePayload) -> dict:
+    try:
+        return request_password_reset_code(payload.email, email_exists=is_email_registered(payload.email))
+    except EmailServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post('/auth/reset-password')
+def reset_password(payload: ResetPasswordPayload) -> dict:
+    try:
+        if payload.reset_token and payload.reset_token.strip():
+            consume_password_reset_token(payload.email, payload.reset_token)
+        else:
+            consume_password_reset_code(payload.email, payload.verification_code or '')
+        update_user_password(email=payload.email, password=payload.password)
+        return {'message': 'Пароль обновлён. Теперь можно войти с новым паролем.'}
+    except UserConflictError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except UserNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except EmailServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post('/auth/verify-reset-code')
+def verify_reset_code(payload: VerifyResetCodePayload) -> dict:
+    try:
+        reset_token = verify_password_reset_code(payload.email, payload.verification_code)
+        return {'message': 'Код подтверждён.', 'reset_token': reset_token}
+    except EmailServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post('/auth/send-email-change-code')
+def send_email_change_code(payload: EmailChangeCodePayload) -> dict:
+    try:
+        current_email, normalized_new_email = prepare_email_change(payload.user_id, payload.new_email)
+        return request_email_change_code(
+            user_id=payload.user_id,
+            current_email=current_email,
+            new_email=normalized_new_email,
+        )
+    except (UserNotFoundError, EmailChangeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EmailServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post('/auth/change-email')
+def change_email(payload: ChangeEmailPayload) -> dict:
+    try:
+        if payload.current_password and payload.current_password.strip():
+            verify_user_password(payload.user_id, payload.current_password)
+        elif payload.verification_code and payload.verification_code.strip():
+            consume_email_change_code(payload.user_id, payload.new_email, payload.verification_code)
+        else:
+            raise EmailChangeError('Подтвердите смену почты паролем или кодом из письма.')
+
+        return change_user_email(payload.user_id, payload.new_email)
+    except InvalidCredentialsError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (UserNotFoundError, EmailChangeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EmailServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post('/auth/update-profile')
+def update_profile(payload: UpdateProfilePayload) -> dict:
+    try:
+        return update_user_profile_name(payload.user_id, payload.name)
+    except (UserNotFoundError, ProfileUpdateError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post('/auth/change-password')
+def change_password(payload: ChangePasswordPayload) -> dict:
+    try:
+        change_user_password(payload.user_id, payload.current_password, payload.new_password)
+        return {'message': 'Пароль обновлён.'}
+    except InvalidCredentialsError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (UserNotFoundError, UserConflictError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post('/auth/login')
@@ -225,3 +340,11 @@ def learning_save_corrections(payload: CorrectionSessionPayload) -> dict:
         metadata=payload.metadata,
         corrections=[_model_to_dict(correction) for correction in payload.corrections],
     )
+
+
+@router.get('/auth/profile/{user_id}')
+def auth_profile(user_id: str) -> dict:
+    try:
+        return get_user_profile(user_id)
+    except UserNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

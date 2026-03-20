@@ -43,6 +43,18 @@ class InvalidCredentialsError(ValueError):
     pass
 
 
+class UserNotFoundError(ValueError):
+    pass
+
+
+class EmailChangeError(ValueError):
+    pass
+
+
+class ProfileUpdateError(ValueError):
+    pass
+
+
 def is_email_registered(email: str) -> bool:
     normalized_email = email.strip().lower()
     if not normalized_email:
@@ -132,6 +144,192 @@ def login_user(email: str, password: str) -> dict[str, str]:
     )
     if row is None or not verify_password(password, row['password_hash']):
         raise InvalidCredentialsError('Неверный email или пароль.')
+
+    return {
+        'id': str(row['external_id'] or ''),
+        'name': str(row['display_name'] or row['email'] or 'Desktop User'),
+        'email': str(row['email'] or ''),
+    }
+
+
+def update_user_password(email: str, password: str) -> None:
+    normalized_email = email.strip().lower()
+    normalized_password = password.strip()
+
+    if not normalized_email:
+        raise UserNotFoundError('Введите email.')
+    if not normalized_password:
+        raise UserConflictError('Введите новый пароль.')
+    if len(normalized_password) < 8:
+        raise UserConflictError('Пароль должен содержать минимум 8 символов.')
+
+    db = get_db()
+    row = db.get(
+        '''
+        SELECT id
+        FROM users
+        WHERE email = :email
+        ''',
+        {'email': normalized_email},
+    )
+    if row is None:
+        raise UserNotFoundError('Пользователь с таким email не найден.')
+
+    db.run(
+        '''
+        UPDATE users
+        SET password_hash = :password_hash
+        WHERE email = :email
+        ''',
+        {
+            'email': normalized_email,
+            'password_hash': hash_password(normalized_password),
+        },
+    )
+
+
+def get_user_profile(external_id: str) -> dict[str, str]:
+    normalized_external_id = external_id.strip()
+    if not normalized_external_id:
+        raise UserNotFoundError('Пользователь не найден.')
+
+    db = get_db()
+    row = db.get(
+        '''
+        SELECT external_id, email, display_name
+        FROM users
+        WHERE external_id = :external_id
+        ''',
+        {'external_id': normalized_external_id},
+    )
+    if row is None:
+        raise UserNotFoundError('Пользователь не найден.')
+
+    return {
+        'id': str(row['external_id'] or ''),
+        'name': str(row['display_name'] or row['email'] or 'Desktop User'),
+        'email': str(row['email'] or ''),
+    }
+
+
+def _get_user_row_by_external_id(external_id: str):
+    normalized_external_id = external_id.strip()
+    if not normalized_external_id:
+        raise UserNotFoundError('Пользователь не найден.')
+
+    db = get_db()
+    row = db.get(
+        '''
+        SELECT id, external_id, email, display_name, password_hash
+        FROM users
+        WHERE external_id = :external_id
+        ''',
+        {'external_id': normalized_external_id},
+    )
+    if row is None:
+        raise UserNotFoundError('Пользователь не найден.')
+    return row
+
+
+def _validate_new_email(new_email: str, current_email: str) -> str:
+    normalized_email = new_email.strip().lower()
+    if not normalized_email:
+        raise EmailChangeError('Введите новый email.')
+    if normalized_email == current_email.strip().lower():
+        raise EmailChangeError('Новая почта совпадает с текущей.')
+    if is_email_registered(normalized_email):
+        raise EmailChangeError('Этот email уже занят другим аккаунтом.')
+    return normalized_email
+
+
+def verify_user_password(external_id: str, password: str) -> None:
+    row = _get_user_row_by_external_id(external_id)
+    normalized_password = password.strip()
+    if not normalized_password:
+        raise InvalidCredentialsError('Введите текущий пароль.')
+    if not verify_password(normalized_password, row['password_hash']):
+        raise InvalidCredentialsError('Неверный текущий пароль.')
+
+
+def prepare_email_change(external_id: str, new_email: str) -> tuple[str, str]:
+    row = _get_user_row_by_external_id(external_id)
+    current_email = str(row['email'] or '')
+    normalized_new_email = _validate_new_email(new_email, current_email)
+    return current_email, normalized_new_email
+
+
+def change_user_email(external_id: str, new_email: str) -> dict[str, str]:
+    row = _get_user_row_by_external_id(external_id)
+    normalized_new_email = _validate_new_email(new_email, str(row['email'] or ''))
+
+    db = get_db()
+    db.run(
+        '''
+        UPDATE users
+        SET email = :email
+        WHERE external_id = :external_id
+        ''',
+        {
+            'email': normalized_new_email,
+            'external_id': external_id.strip(),
+        },
+    )
+
+    return {
+        'id': str(row['external_id'] or ''),
+        'name': str(row['display_name'] or normalized_new_email.split('@', 1)[0] or 'Desktop User'),
+        'email': normalized_new_email,
+    }
+
+
+def update_user_profile_name(external_id: str, name: str) -> dict[str, str]:
+    row = _get_user_row_by_external_id(external_id)
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ProfileUpdateError('Введите имя.')
+
+    db = get_db()
+    db.run(
+        '''
+        UPDATE users
+        SET display_name = :display_name
+        WHERE external_id = :external_id
+        ''',
+        {
+            'display_name': normalized_name,
+            'external_id': external_id.strip(),
+        },
+    )
+
+    return {
+        'id': str(row['external_id'] or ''),
+        'name': normalized_name,
+        'email': str(row['email'] or ''),
+    }
+
+
+def change_user_password(external_id: str, current_password: str, new_password: str) -> dict[str, str]:
+    row = _get_user_row_by_external_id(external_id)
+    verify_user_password(external_id, current_password)
+
+    normalized_password = new_password.strip()
+    if not normalized_password:
+        raise UserConflictError('Введите новый пароль.')
+    if len(normalized_password) < 8:
+        raise UserConflictError('Пароль должен содержать минимум 8 символов.')
+
+    db = get_db()
+    db.run(
+        '''
+        UPDATE users
+        SET password_hash = :password_hash
+        WHERE external_id = :external_id
+        ''',
+        {
+            'password_hash': hash_password(normalized_password),
+            'external_id': external_id.strip(),
+        },
+    )
 
     return {
         'id': str(row['external_id'] or ''),

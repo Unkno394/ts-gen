@@ -112,6 +112,10 @@ export default function App() {
         const next = await fetchHistory(profile.id);
         setHistory(next);
         localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+      },
+      updateProfile(next: UserProfile) {
+        localStorage.setItem(USER_KEY, JSON.stringify(next));
+        setProfile(next);
       }
     }),
     [profile]
@@ -129,6 +133,7 @@ export default function App() {
     <Workspace
       history={history}
       onLogout={actions.logout}
+      onProfileUpdate={actions.updateProfile}
       onSaveHistory={actions.saveHistory}
       profile={profile}
     />

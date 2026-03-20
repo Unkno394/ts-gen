@@ -8,6 +8,7 @@ import re
 import smtplib
 import ssl
 import time
+import uuid
 from email.message import EmailMessage
 from html import escape
 from pathlib import Path
@@ -53,6 +54,9 @@ RESEND_FROM = os.getenv('RESEND_FROM', '').strip()
 RESEND_API_URL = os.getenv('RESEND_API_URL', 'https://api.resend.com/emails').strip()
 
 verification_store: dict[str, dict[str, float | str]] = {}
+password_reset_store: dict[str, dict[str, float | str]] = {}
+password_reset_token_store: dict[str, dict[str, float | str]] = {}
+email_change_store: dict[str, dict[str, float | str]] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -319,6 +323,68 @@ def request_registration_code(email: str) -> dict[str, int | str]:
     }
 
 
+def request_password_reset_code(email: str, email_exists: bool) -> dict[str, int | str]:
+    normalized_email = normalize_email(email)
+    if not validate_email(normalized_email):
+        raise EmailVerificationError('Введите корректный email.')
+    if not email_exists:
+        raise EmailVerificationError('Пользователь с таким email не найден.')
+
+    now = time.time()
+    entry = password_reset_store.get(normalized_email)
+    if entry and now - float(entry.get('last_sent', 0)) < RESEND_COOLDOWN_SECONDS:
+        wait_seconds = int(RESEND_COOLDOWN_SECONDS - (now - float(entry.get('last_sent', 0))))
+        raise EmailRateLimitError(f'Подождите {wait_seconds} сек. перед повторной отправкой.')
+
+    code = generate_code()
+    logger.info('password reset code generated: to=%s length=%s', normalized_email, len(code))
+    send_email_code(normalized_email, code)
+
+    password_reset_store[normalized_email] = {
+        'code': code,
+        'expires': now + CODE_TTL_SECONDS,
+        'last_sent': now,
+    }
+
+    return {
+        'message': 'Код для восстановления отправлен на почту.',
+        'expires_in': CODE_TTL_SECONDS,
+    }
+
+
+def request_email_change_code(user_id: str, current_email: str, new_email: str) -> dict[str, int | str]:
+    normalized_current_email = normalize_email(current_email)
+    normalized_new_email = normalize_email(new_email)
+    if not user_id.strip():
+        raise EmailVerificationError('Пользователь не найден.')
+    if not validate_email(normalized_current_email):
+        raise EmailVerificationError('Текущая почта указана некорректно.')
+    if not validate_email(normalized_new_email):
+        raise EmailVerificationError('Введите корректный новый email.')
+
+    key = f'{user_id.strip()}::{normalized_new_email}'
+    now = time.time()
+    entry = email_change_store.get(key)
+    if entry and now - float(entry.get('last_sent', 0)) < RESEND_COOLDOWN_SECONDS:
+        wait_seconds = int(RESEND_COOLDOWN_SECONDS - (now - float(entry.get('last_sent', 0))))
+        raise EmailRateLimitError(f'Подождите {wait_seconds} сек. перед повторной отправкой.')
+
+    code = generate_code()
+    logger.info('email change code generated: user_id=%s current_email=%s new_email=%s', user_id, normalized_current_email, normalized_new_email)
+    send_email_code(normalized_current_email, code)
+
+    email_change_store[key] = {
+        'code': code,
+        'expires': now + CODE_TTL_SECONDS,
+        'last_sent': now,
+    }
+
+    return {
+        'message': 'Код для смены почты отправлен на текущий email.',
+        'expires_in': CODE_TTL_SECONDS,
+    }
+
+
 def consume_registration_code(email: str, code: str) -> None:
     normalized_email = normalize_email(email)
     normalized_code = code.strip()
@@ -341,3 +407,108 @@ def consume_registration_code(email: str, code: str) -> None:
         raise EmailVerificationError('Неверный код подтверждения.')
 
     verification_store.pop(normalized_email, None)
+
+
+def consume_password_reset_code(email: str, code: str) -> None:
+    normalized_email = normalize_email(email)
+    normalized_code = code.strip()
+
+    if not validate_email(normalized_email):
+        raise EmailVerificationError('Введите корректный email.')
+    if not normalized_code:
+        raise EmailVerificationError('Введите код из письма.')
+
+    entry = password_reset_store.get(normalized_email)
+    if entry is None:
+        raise EmailVerificationError('Сначала запросите код для восстановления.')
+
+    now = time.time()
+    if now > float(entry['expires']):
+        password_reset_store.pop(normalized_email, None)
+        raise EmailVerificationError('Срок действия кода истек. Запросите новый.')
+
+    if normalized_code != str(entry['code']):
+        raise EmailVerificationError('Неверный код подтверждения.')
+
+    password_reset_store.pop(normalized_email, None)
+
+
+def verify_password_reset_code(email: str, code: str) -> str:
+    normalized_email = normalize_email(email)
+    normalized_code = code.strip()
+
+    if not validate_email(normalized_email):
+        raise EmailVerificationError('Введите корректный email.')
+    if not normalized_code:
+        raise EmailVerificationError('Введите код из письма.')
+
+    entry = password_reset_store.get(normalized_email)
+    if entry is None:
+        raise EmailVerificationError('Сначала запросите код для восстановления.')
+
+    now = time.time()
+    if now > float(entry['expires']):
+      password_reset_store.pop(normalized_email, None)
+      raise EmailVerificationError('Срок действия кода истек. Запросите новый.')
+
+    if normalized_code != str(entry['code']):
+        raise EmailVerificationError('Неверный код подтверждения.')
+
+    password_reset_store.pop(normalized_email, None)
+
+    reset_token = str(uuid.uuid4())
+    password_reset_token_store[reset_token] = {
+        'email': normalized_email,
+        'expires': now + CODE_TTL_SECONDS,
+    }
+    return reset_token
+
+
+def consume_password_reset_token(email: str, reset_token: str) -> None:
+    normalized_email = normalize_email(email)
+    normalized_token = reset_token.strip()
+
+    if not validate_email(normalized_email):
+        raise EmailVerificationError('Введите корректный email.')
+    if not normalized_token:
+        raise EmailVerificationError('Подтвердите код из письма.')
+
+    entry = password_reset_token_store.get(normalized_token)
+    if entry is None:
+        raise EmailVerificationError('Ссылка на восстановление устарела. Запросите новый код.')
+
+    now = time.time()
+    if now > float(entry['expires']):
+        password_reset_token_store.pop(normalized_token, None)
+        raise EmailVerificationError('Срок действия подтверждения истек. Запросите новый код.')
+
+    if str(entry['email']) != normalized_email:
+        raise EmailVerificationError('Подтверждение не подходит для этого email.')
+
+    password_reset_token_store.pop(normalized_token, None)
+
+
+def consume_email_change_code(user_id: str, new_email: str, code: str) -> None:
+    normalized_code = code.strip()
+    normalized_new_email = normalize_email(new_email)
+    if not user_id.strip():
+        raise EmailVerificationError('Пользователь не найден.')
+    if not validate_email(normalized_new_email):
+        raise EmailVerificationError('Введите корректный новый email.')
+    if not normalized_code:
+        raise EmailVerificationError('Введите код из письма.')
+
+    key = f'{user_id.strip()}::{normalized_new_email}'
+    entry = email_change_store.get(key)
+    if entry is None:
+        raise EmailVerificationError('Сначала запросите код для смены почты.')
+
+    now = time.time()
+    if now > float(entry['expires']):
+        email_change_store.pop(key, None)
+        raise EmailVerificationError('Срок действия кода истек. Запросите новый.')
+
+    if normalized_code != str(entry['code']):
+        raise EmailVerificationError('Неверный код подтверждения.')
+
+    email_change_store.pop(key, None)

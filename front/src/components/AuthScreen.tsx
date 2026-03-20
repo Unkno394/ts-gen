@@ -1,7 +1,14 @@
-import { ArrowRight, KeyRound, LogIn, Mail, ShieldCheck, Sparkles, UserPlus, UserRound } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Eye, EyeOff, KeyRound, LogIn, Mail, ShieldCheck, Sparkles, UserPlus, UserRound } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
-import { loginWithBackend, registerWithBackend, requestRegistrationCode } from '../lib/api';
+import {
+  completePasswordReset,
+  loginWithBackend,
+  registerWithBackend,
+  requestPasswordResetCode,
+  requestRegistrationCode,
+  verifyPasswordResetCode,
+} from '../lib/api';
 import type { AuthMode, UserProfile } from '../types';
 import { BrandLogo } from './BrandLogo';
 import { VibeBackground } from './VibeBackground';
@@ -38,6 +45,35 @@ function Field({ icon: Icon, label, placeholder, type = 'text', value, autoCompl
   );
 }
 
+function PasswordField({ icon: Icon, label, placeholder, value, autoComplete, onChange }: Omit<FieldProps, 'type'>) {
+  const [visible, setVisible] = useState(false);
+
+  return (
+    <label className="auth-field">
+      <span className="auth-field-label">{label}</span>
+      <div className="auth-input-wrap">
+        <Icon size={18} />
+        <input
+          autoComplete={autoComplete}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={placeholder}
+          type={visible ? 'text' : 'password'}
+          value={value}
+        />
+        <button
+          className="password-toggle"
+          onClick={() => setVisible((current) => !current)}
+          tabIndex={-1}
+          title={visible ? 'Скрыть пароль' : 'Показать пароль'}
+          type="button"
+        >
+          {visible ? <EyeOff size={18} /> : <Eye size={18} />}
+        </button>
+      </div>
+    </label>
+  );
+}
+
 export function AuthScreen({ onComplete }: Props) {
   const [mode, setMode] = useState<AuthMode>('register');
   const [name, setName] = useState('');
@@ -49,15 +85,27 @@ export function AuthScreen({ onComplete }: Props) {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [verificationEmail, setVerificationEmail] = useState('');
+  const [resetMode, setResetMode] = useState(false);
+  const [resetStep, setResetStep] = useState<'email' | 'code' | 'password'>('email');
+  const [resetToken, setResetToken] = useState('');
   const verificationRequested = mode === 'register' && Boolean(verificationEmail);
 
-  const title = mode === 'register' ? 'Регистрация' : 'Войти в аккаунт';
+  const title = resetMode ? 'Восстановление пароля' : mode === 'register' ? 'Регистрация' : 'Войти в аккаунт';
   const helperText = useMemo(() => {
+    if (resetMode) {
+      if (resetStep === 'email') {
+        return 'Введите email, чтобы получить код восстановления.';
+      }
+      if (resetStep === 'code') {
+        return 'Введите код из письма. При необходимости запросите новый код рядом с полем.';
+      }
+      return 'Код подтверждён. Теперь задайте новый пароль для аккаунта.';
+    }
     if (mode === 'register') {
       return 'Регистрация подтверждается кодом из письма. После этого история генераций и рабочие данные сохраняются в общей базе проекта.';
     }
     return 'Войдите в существующий аккаунт, чтобы продолжить работу с сохраненной историей.';
-  }, [mode]);
+  }, [mode, resetMode]);
 
   const resetRegisterVerification = () => {
     setVerificationCode('');
@@ -65,10 +113,20 @@ export function AuthScreen({ onComplete }: Props) {
     setNotice('');
   };
 
+  const resetPasswordRecovery = () => {
+    setVerificationCode('');
+    setPassword('');
+    setResetToken('');
+    setNotice('');
+    setResetStep('email');
+  };
+
   const handleModeChange = (nextMode: AuthMode) => {
     setMode(nextMode);
+    setResetMode(false);
     setError('');
     setNotice('');
+    resetPasswordRecovery();
 
     if (nextMode === 'login') {
       resetRegisterVerification();
@@ -78,13 +136,17 @@ export function AuthScreen({ onComplete }: Props) {
   const handleEmailChange = (value: string) => {
     setEmail(value);
 
-    if (mode !== 'register') {
+    if (mode !== 'register' && !resetMode) {
       return;
     }
 
     const normalized = value.trim().toLowerCase();
     if (verificationEmail && normalized !== verificationEmail) {
       resetRegisterVerification();
+    }
+    if (resetMode && resetStep !== 'email' && normalized !== verificationEmail) {
+      resetPasswordRecovery();
+      setVerificationEmail('');
     }
   };
 
@@ -119,6 +181,58 @@ export function AuthScreen({ onComplete }: Props) {
     try {
       const normalizedEmail = email.trim().toLowerCase();
       const normalizedPassword = password.trim();
+
+      if (resetMode) {
+        if (resetStep === 'email') {
+          if (!normalizedEmail) {
+            throw new Error('Введите email.');
+          }
+
+          const response = await requestPasswordResetCode(normalizedEmail);
+          const ttlMinutes = Math.max(1, Math.ceil(response.expiresIn / 60));
+          setVerificationEmail(normalizedEmail);
+          setResetStep('code');
+          setNotice(`${response.message} Код действует ${ttlMinutes} мин.`);
+          return;
+        }
+
+        if (resetStep === 'code') {
+          if (!verificationCode.trim()) {
+            throw new Error('Введите код из письма.');
+          }
+
+          const response = await verifyPasswordResetCode(normalizedEmail, verificationCode.trim());
+          setResetToken(response.resetToken);
+          setResetStep('password');
+          setNotice('Код подтверждён. Теперь введите новый пароль.');
+          return;
+        }
+
+        if (!normalizedPassword) {
+          throw new Error('Введите новый пароль.');
+        }
+        if (normalizedPassword.length < 8) {
+          throw new Error('Пароль должен содержать минимум 8 символов.');
+        }
+        if (!resetToken) {
+          throw new Error('Сначала подтвердите код из письма.');
+        }
+
+        const message = await completePasswordReset({
+          email: normalizedEmail,
+          password: normalizedPassword,
+          resetToken,
+        });
+        setNotice(message);
+        setResetMode(false);
+        setResetStep('email');
+        setVerificationCode('');
+        setPassword('');
+        setResetToken('');
+        setVerificationEmail('');
+        setMode('login');
+        return;
+      }
 
       if (mode === 'register') {
         if (!verificationRequested) {
@@ -233,29 +347,48 @@ export function AuthScreen({ onComplete }: Props) {
 
             <p className="subtle-text auth-copy auth-copy-v2">{helperText}</p>
 
-            <div className="mode-switch mode-switch-v2">
+            {!resetMode && (
+              <div className="mode-switch mode-switch-v2">
+                <button
+                  className={mode === 'register' ? 'active' : ''}
+                  onClick={() => {
+                    handleModeChange('register');
+                  }}
+                  type="button"
+                >
+                  Регистрация
+                </button>
+                <button
+                  className={mode === 'login' ? 'active' : ''}
+                  onClick={() => {
+                    handleModeChange('login');
+                  }}
+                  type="button"
+                >
+                  Вход
+                </button>
+              </div>
+            )}
+
+            {resetMode && (
               <button
-                className={mode === 'register' ? 'active' : ''}
+                className="auth-back-btn ghost-btn ghost-btn-v2"
                 onClick={() => {
-                  handleModeChange('register');
+                  setResetMode(false);
+                  setMode('login');
+                  setError('');
+                  setNotice('');
+                  resetPasswordRecovery();
                 }}
                 type="button"
               >
-                Регистрация
+                <ArrowLeft size={16} />
+                Назад ко входу
               </button>
-              <button
-                className={mode === 'login' ? 'active' : ''}
-                onClick={() => {
-                  handleModeChange('login');
-                }}
-                type="button"
-              >
-                Вход
-              </button>
-            </div>
+            )}
 
             <form className="auth-form auth-form-v2" onSubmit={submit}>
-              <div className={mode === 'register' ? 'auth-field-animated expanded' : 'auth-field-animated collapsed'}>
+              <div className={mode === 'register' && !resetMode ? 'auth-field-animated expanded' : 'auth-field-animated collapsed'}>
                 <Field
                   autoComplete="name"
                   icon={UserRound}
@@ -276,17 +409,18 @@ export function AuthScreen({ onComplete }: Props) {
                 value={email}
               />
 
-              <Field
-                autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
-                icon={KeyRound}
-                label="Пароль"
-                onChange={setPassword}
-                placeholder="Минимум 8 символов"
-                type="password"
-                value={password}
-              />
+              <div className={!resetMode || resetStep === 'password' ? 'auth-field-animated expanded' : 'auth-field-animated collapsed'}>
+                <PasswordField
+                  autoComplete={mode === 'register' || resetMode ? 'new-password' : 'current-password'}
+                  icon={KeyRound}
+                  label={resetMode ? 'Новый пароль' : 'Пароль'}
+                  onChange={setPassword}
+                  placeholder={resetMode ? 'Новый пароль, минимум 8 символов' : 'Минимум 8 символов'}
+                  value={password}
+                />
+              </div>
 
-              <div className={verificationRequested ? 'auth-field-animated expanded' : 'auth-field-animated collapsed'}>
+              <div className={verificationRequested || (resetMode && resetStep !== 'email') ? 'auth-field-animated expanded' : 'auth-field-animated collapsed'}>
                 <label className="auth-field auth-code-field">
                   <span className="auth-field-label">Код подтверждения</span>
                   <div className="auth-code-inline">
@@ -303,7 +437,29 @@ export function AuthScreen({ onComplete }: Props) {
                     <button
                       className="secondary-btn auth-code-btn auth-code-btn-inline"
                       disabled={sendingCode}
-                      onClick={sendCode}
+                      onClick={resetMode ? async () => {
+                        const normalizedEmail = email.trim().toLowerCase();
+                        if (!normalizedEmail) {
+                          setError('Введите email.');
+                          return;
+                        }
+
+                        setSendingCode(true);
+                        setError('');
+                        setNotice('');
+
+                        try {
+                          const response = await requestPasswordResetCode(normalizedEmail);
+                          const ttlMinutes = Math.max(1, Math.ceil(response.expiresIn / 60));
+                          setVerificationEmail(normalizedEmail);
+                          setResetStep('code');
+                          setNotice(`${response.message} Код действует ${ttlMinutes} мин.`);
+                        } catch (sendCodeError) {
+                          setError(sendCodeError instanceof Error ? sendCodeError.message : 'Не удалось отправить письмо.');
+                        } finally {
+                          setSendingCode(false);
+                        }
+                      } : sendCode}
                       type="button"
                     >
                       <Mail size={16} />
@@ -311,7 +467,9 @@ export function AuthScreen({ onComplete }: Props) {
                     </button>
                   </div>
                   <span className="auth-code-caption">
-                    Поле и кнопка появляются только после первого нажатия на регистрацию.
+                    {resetMode
+                      ? 'После отправки кода подтвердите его здесь. Если письмо не пришло, запросите новый код рядом.'
+                      : 'Поле и кнопка появляются только после первого нажатия на регистрацию.'}
                   </span>
                 </label>
               </div>
@@ -320,11 +478,17 @@ export function AuthScreen({ onComplete }: Props) {
               {error && <div className="warning-item auth-status auth-status-error">{error}</div>}
 
               <button className="primary-btn primary-btn-v2" disabled={busy} type="submit">
-                {mode === 'register' ? <UserPlus size={16} /> : <LogIn size={16} />}
+                {resetMode ? <ShieldCheck size={16} /> : mode === 'register' ? <UserPlus size={16} /> : <LogIn size={16} />}
                 <span>
                   {busy
                     ? 'Подождите...'
-                    : mode === 'register'
+                    : resetMode
+                      ? resetStep === 'email'
+                        ? 'Восстановить пароль'
+                        : resetStep === 'code'
+                          ? 'Подтвердить код'
+                          : 'Сохранить новый пароль'
+                      : mode === 'register'
                       ? verificationRequested
                         ? 'Завершить регистрацию'
                         : 'Зарегистрироваться'
@@ -332,6 +496,25 @@ export function AuthScreen({ onComplete }: Props) {
                 </span>
               </button>
             </form>
+
+            {!resetMode && mode === 'login' && (
+              <button
+                className="auth-reset-link"
+                onClick={() => {
+                  setResetMode(true);
+                  setError('');
+                  setNotice('');
+                  setVerificationCode('');
+                  setPassword('');
+                  setResetStep('email');
+                  setResetToken('');
+                  setVerificationEmail('');
+                }}
+                type="button"
+              >
+                Забыли пароль?
+              </button>
+            )}
 
             <button
               className="register-cta ghost-btn ghost-btn-v2"

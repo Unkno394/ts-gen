@@ -18,6 +18,7 @@ type VibeBackgroundProps = {
   };
   playing?: boolean;
   lite?: boolean;
+  staticFrame?: boolean;
 };
 
 const clamp = (v: number, min = 0, max = 1) => Math.min(max, Math.max(min, v));
@@ -387,13 +388,14 @@ export function VibeBackground({
   useDefaultHue = false,
   customColors = defaultCustomColors,
   playing = false,
-  lite = false
+  lite = false,
+  staticFrame = false
 }: VibeBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const stableProps = useMemo(
-    () => ({ collectionHue, energy, backgroundColor, baseScale, useDefaultHue, customColors, playing, lite }),
-    [collectionHue, energy, backgroundColor, baseScale, useDefaultHue, customColors, playing, lite]
+    () => ({ collectionHue, energy, backgroundColor, baseScale, useDefaultHue, customColors, playing, lite, staticFrame }),
+    [collectionHue, energy, backgroundColor, baseScale, useDefaultHue, customColors, playing, lite, staticFrame]
   );
 
   useEffect(() => {
@@ -555,7 +557,7 @@ export function VibeBackground({
     };
 
     updateCanvasSize();
-    if (isWeakDevice) {
+    if (isWeakDevice || stableProps.staticFrame) {
       drawFrame();
       const onResize = () => {
         updateCanvasSize();

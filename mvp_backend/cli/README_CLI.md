@@ -1,74 +1,119 @@
 # TSGen CLI
 
-`cli.py` is a Typer-based command line interface over the backend core.
+`cli.py` is a small `argparse`-based command line wrapper over the backend core.
+
+It does not call HTTP endpoints. It imports backend modules directly:
+- `parsers.py`
+- `matcher.py`
+- `generator.py`
+- `storage.py`
+
+## Quick start
+
+Run commands from the backend directory:
+
+```bash
+cd mvp_backend
+python cli/cli.py --help
+```
 
 ## Commands
 
 ### Generate
+
+Generate TypeScript from an input file and target JSON schema.
+
 ```bash
-python cli.py generate --input example.csv --schema example_target.json --out parser.ts
+python cli/cli.py generate \
+  --input example.csv \
+  --schema example_target.json \
+  --out parser.ts
 ```
 
 Options:
-- `--guest`
-- `--save-history / --no-save-history`
-- `--show-preview`
-- `--show-mapping`
+- `--input, -i`: input file path
+- `--schema, -s`: target JSON file path
+- `--out, -o`: output TypeScript file path, default `parser.ts`
+- `--user-id`: history owner id, default `cli-user`
+- `--guest`: do not save generation to history
+- `--show-preview`: print preview JSON
+- `--show-mapping`: print field mapping
+
+Notes:
+- without `--guest`, the command initializes SQLite runtime storage and saves the result to history
+- for `csv/xlsx/xls`, preview is built from parsed rows
+- for text `pdf/docx`, parsing still goes through backend parser logic
 
 ### Preview
+
+Show parsed preview for an input file.
+
 ```bash
-python cli.py preview --input example.csv
+python cli/cli.py preview --input example.csv --rows 5
 ```
+
+Options:
+- `--input, -i`: input file path
+- `--rows, -r`: number of rows to print, default `5`
 
 ### Explain
+
+Show how source fields map to the target schema.
+
 ```bash
-python cli.py explain --input example.csv --schema example_target.json
+python cli/cli.py explain --input example.csv --schema example_target.json
 ```
+
+Options:
+- `--input, -i`: input file path
+- `--schema, -s`: target JSON file path
 
 ### History
+
+Show saved history for one user.
+
 ```bash
-python cli.py history --limit 10
+python cli/cli.py history --user-id cli-user --limit 10
 ```
 
+Options:
+- `--user-id`: user external id, default `cli-user`
+- `--limit, -n`: max entries to show, default `20`
+- `--full`: print full JSON payload for each entry
+
 ### Show
+
+Show one history entry by id.
+
 ```bash
-python cli.py show --id <entry-id>
+python cli/cli.py show --id 1
 ```
 
 ### Cleanup
+
+Clean up expired guest files from runtime storage.
+
 ```bash
-python cli.py cleanup --ttl-hours 24
+python cli/cli.py cleanup --ttl-hours 24
+python cli/cli.py cleanup --ttl-hours 24 --dry-run
 ```
 
-## Expected backend module functions
+Options:
+- `--ttl-hours`: guest file TTL in hours
+- `--dry-run`: print what would be removed without deleting anything
 
-The CLI tries to resolve one of several candidate functions from each module.
+## Example workflow
 
-### parsers.py
-Expected one of:
-- `parse_input_file(path)` / `parse_file(path)` / `parse_document(path)`
-- `parse_target_json(path)` / `parse_target_schema(path)` / `parse_schema(path)`
+```bash
+cd mvp_backend
+python cli/cli.py preview --input example.csv
+python cli/cli.py explain --input example.csv --schema example_target.json
+python cli/cli.py generate --input example.csv --schema example_target.json --out parser.ts --show-mapping
+python cli/cli.py history --user-id cli-user
+```
 
-### matcher.py
-Expected one of:
-- `build_mapping(parsed_file, target_schema)`
-- `match_fields(parsed_file, target_schema)`
-- `match_schema(parsed_file, target_schema)`
+## Current limitations
 
-### generator.py
-Expected one of:
-- `generate_typescript(parsed_file, target_schema, mapping)`
-- `generate_parser(parsed_file, target_schema, mapping)`
-- `generate_code(parsed_file, target_schema, mapping)`
-
-### storage.py
-Expected one of:
-- `save_generation(record)` / `save_history(record)`
-- `get_history(limit=..., include_guest=...)`
-- `get_generation_by_id(entry_id)`
-- `cleanup_guest_files(ttl_hours=..., dry_run=...)`
-
-## Notes
-
-- The CLI is intentionally defensive and can work with dicts, pydantic models, or simple objects.
-- If your backend uses different function names, either add aliases in backend modules or extend candidate lists in `cli.py`.
+- CLI does not expose every web/backend feature
+- auth, email verification, profile editing and password reset are web/backend flows, not CLI flows
+- CLI currently focuses on parsing, mapping, generation and local history inspection

@@ -71,6 +71,15 @@ type BackendSendCodeResponse = {
   expires_in: number;
 };
 
+type BackendMessageResponse = {
+  message: string;
+};
+
+type BackendVerifyResetCodeResponse = {
+  message: string;
+  reset_token: string;
+};
+
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const GENERATE_REQUEST_TIMEOUT_MS = 60_000;
@@ -207,6 +216,91 @@ export async function requestRegistrationCode(email: string): Promise<{ message:
     message: response.message,
     expiresIn: response.expires_in,
   };
+}
+
+export async function requestPasswordResetCode(email: string): Promise<{ message: string; expiresIn: number }> {
+  const response = await postJson<BackendSendCodeResponse>('/api/auth/send-reset-code', {
+    email,
+  });
+
+  return {
+    message: response.message,
+    expiresIn: response.expires_in,
+  };
+}
+
+export async function requestEmailChangeCode(params: { userId: string; newEmail: string }): Promise<{ message: string; expiresIn: number }> {
+  const response = await postJson<BackendSendCodeResponse>('/api/auth/send-email-change-code', {
+    user_id: params.userId,
+    new_email: params.newEmail,
+  });
+
+  return {
+    message: response.message,
+    expiresIn: response.expires_in,
+  };
+}
+
+export async function resetPasswordWithBackend(params: { email: string; password: string; verificationCode: string }): Promise<string> {
+  const response = await postJson<BackendMessageResponse>('/api/auth/reset-password', {
+    email: params.email,
+    password: params.password,
+    verification_code: params.verificationCode,
+  });
+  return response.message;
+}
+
+export async function verifyPasswordResetCode(email: string, verificationCode: string): Promise<{ message: string; resetToken: string }> {
+  const response = await postJson<BackendVerifyResetCodeResponse>('/api/auth/verify-reset-code', {
+    email,
+    verification_code: verificationCode,
+  });
+
+  return {
+    message: response.message,
+    resetToken: response.reset_token,
+  };
+}
+
+export async function completePasswordReset(params: { email: string; password: string; resetToken: string }): Promise<string> {
+  const response = await postJson<BackendMessageResponse>('/api/auth/reset-password', {
+    email: params.email,
+    password: params.password,
+    reset_token: params.resetToken,
+  });
+  return response.message;
+}
+
+export async function changeEmailWithPassword(params: { userId: string; newEmail: string; currentPassword: string }): Promise<UserProfile> {
+  return postJson<BackendUserProfile>('/api/auth/change-email', {
+    user_id: params.userId,
+    new_email: params.newEmail,
+    current_password: params.currentPassword,
+  });
+}
+
+export async function changeEmailWithCode(params: { userId: string; newEmail: string; verificationCode: string }): Promise<UserProfile> {
+  return postJson<BackendUserProfile>('/api/auth/change-email', {
+    user_id: params.userId,
+    new_email: params.newEmail,
+    verification_code: params.verificationCode,
+  });
+}
+
+export async function updateProfileName(params: { userId: string; name: string }): Promise<UserProfile> {
+  return postJson<BackendUserProfile>('/api/auth/update-profile', {
+    user_id: params.userId,
+    name: params.name,
+  });
+}
+
+export async function changePasswordWithBackend(params: { userId: string; currentPassword: string; newPassword: string }): Promise<string> {
+  const response = await postJson<BackendMessageResponse>('/api/auth/change-password', {
+    user_id: params.userId,
+    current_password: params.currentPassword,
+    new_password: params.newPassword,
+  });
+  return response.message;
 }
 
 export async function generateFromBackend({ file, targetJson, userId, selectedSheet }: GenerateParams): Promise<GenerationResult> {

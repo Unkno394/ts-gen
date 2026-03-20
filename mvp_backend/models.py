@@ -60,6 +60,41 @@ class EmailCodePayload(BaseModel):
     email: str
 
 
+class ResetPasswordPayload(BaseModel):
+    email: str
+    verification_code: str | None = None
+    reset_token: str | None = None
+    password: str
+
+
+class VerifyResetCodePayload(BaseModel):
+    email: str
+    verification_code: str
+
+
+class EmailChangeCodePayload(BaseModel):
+    user_id: str
+    new_email: str
+
+
+class ChangeEmailPayload(BaseModel):
+    user_id: str
+    new_email: str
+    current_password: str | None = None
+    verification_code: str | None = None
+
+
+class UpdateProfilePayload(BaseModel):
+    user_id: str
+    name: str
+
+
+class ChangePasswordPayload(BaseModel):
+    user_id: str
+    current_password: str
+    new_password: str
+
+
 class UserProfile(BaseModel):
     id: str
     name: str

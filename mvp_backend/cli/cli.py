@@ -46,6 +46,16 @@ def _mapping_to_json(mappings: list[Any]) -> list[dict[str, Any]]:
     return [mapping.model_dump() if hasattr(mapping, 'model_dump') else dict(mapping) for mapping in mappings]
 
 
+def _model_to_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, 'model_dump'):
+        return value.model_dump()
+    if hasattr(value, 'dict'):
+        return value.dict()
+    if isinstance(value, dict):
+        return value
+    raise SystemExit(f'Unsupported model value: {type(value)!r}')
+
+
 def cmd_generate(args: argparse.Namespace) -> None:
     input_path = _ensure_file(Path(args.input), 'Input file')
     schema_path = _ensure_file(Path(args.schema), 'Schema file')
@@ -77,10 +87,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
             generated_typescript=code,
             preview_json=json.dumps(preview, ensure_ascii=False),
             warnings_json=json.dumps(warnings, ensure_ascii=False),
-            parsed_file_json=json.dumps(
-                parsed_file.model_dump() if hasattr(parsed_file, 'model_dump') else parsed_file.dict(),
-                ensure_ascii=False,
-            ),
+            parsed_file_json=json.dumps(_model_to_dict(parsed_file), ensure_ascii=False),
             source_columns=list(parsed_file.columns),
         )
 
