@@ -1,0 +1,22 @@
+services:
+  backend:
+    build:
+      context: ./mvp_backend
+    container_name: tsgen-backend
+    env_file:
+      - ./mvp_backend/.env
+    ports:
+      - '8000:8000'
+    volumes:
+      - ./mvp_backend/.runtime:/app/.runtime
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./front
+    container_name: tsgen-frontend
+    depends_on:
+      - backend
+    ports:
+      - '8080:80'
+    restart: unless-stopped

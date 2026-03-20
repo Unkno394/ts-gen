@@ -1,0 +1,56 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Backend
+mvp_backend/.venv/
+mvp_backend/.runtime/
+mvp_backend/wheelhouse/
+*.whl
+
+# Frontend / Electron
+front/node_modules/
+front/dist/
+front/dist-ssr/
+front/.vite/
+front/.vite-temp/
+front/*.local
+front/electron-*.zip
+*.tsbuildinfo
