@@ -1060,6 +1060,67 @@ input::-ms-reveal {
   white-space: pre-wrap;
 }
 
+.code-editor {
+  width: 100%;
+  resize: vertical;
+  color: #f4f7ff;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  outline: none;
+}
+
+.learning-status-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.learning-status-card {
+  text-align: center;
+  gap: 8px;
+}
+
+.mapping-editor-list {
+  display: grid;
+  gap: 12px;
+}
+
+.mapping-editor-row {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.mapping-editor-source {
+  display: grid;
+  gap: 4px;
+}
+
+.mapping-editor-source span {
+  color: rgba(255, 255, 255, 0.54);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.mapping-editor-source strong {
+  word-break: break-word;
+}
+
+.mapping-editor-select {
+  min-height: 44px;
+  padding: 0 14px;
+  color: #f4f7ff;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(9, 12, 22, 0.92);
+}
+
+.mapping-editor-note {
+  margin: 12px 0 0;
+}
+
 .data-grid {
   width: max-content;
   min-width: 100%;

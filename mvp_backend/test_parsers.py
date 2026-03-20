@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
+
+from docx import Document
 
 try:
     import pandas as pd
@@ -18,11 +22,59 @@ from models import ParsedFile, ParsedSheet
 from parsers import ParseError, parse_file, resolve_generation_source
 
 
+class FakeExcelFile:
+    def __init__(self, sheet_names: list[str]) -> None:
+        self.sheet_names = sheet_names
+
+    def __enter__(self) -> 'FakeExcelFile':
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class DocumentParserTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.test_root = BACKEND_DIR / '.test_runtime' / 'documents' / str(uuid.uuid4())
+        self.test_root.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.test_root, ignore_errors=True)
+
+    def test_docx_table_is_parsed_without_generic_no_columns_warning(self) -> None:
+        path = self.test_root / 'table.docx'
+        doc = Document()
+        table = doc.add_table(rows=2, cols=2)
+        table.rows[0].cells[0].text = 'customerName'
+        table.rows[0].cells[1].text = 'amount'
+        table.rows[1].cells[0].text = 'Alice'
+        table.rows[1].cells[1].text = '10'
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.columns, ['customerName', 'amount'])
+        self.assertEqual(parsed.rows, [{'customerName': 'Alice', 'amount': '10'}])
+        self.assertNotIn('No columns detected in the file.', parsed.warnings)
+
+    def test_docx_text_fallback_returns_document_warning_without_generic_no_columns_warning(self) -> None:
+        path = self.test_root / 'text.docx'
+        doc = Document()
+        doc.add_paragraph('Just plain text without tables')
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.columns, [])
+        self.assertTrue(any('No tables found in DOCX' in warning for warning in parsed.warnings))
+        self.assertTrue(any('Документ загружен.' in warning for warning in parsed.warnings))
+        self.assertNotIn('No columns detected in the file.', parsed.warnings)
+
 @unittest.skipIf(pd is None, 'pandas is not installed in the current environment')
 class ExcelParserTests(unittest.TestCase):
     def test_numeric_excel_headers_are_converted_to_strings(self) -> None:
         dataframe = pd.DataFrame([['zov', 120, 'sddf']], columns=[1223, 'hsdh', 'sdvsdv'])
-        fake_excel = type('FakeExcelFile', (), {'sheet_names': ['Sheet1']})()
+        fake_excel = FakeExcelFile(['Sheet1'])
 
         with patch('parsers.pd.ExcelFile', return_value=fake_excel), patch('parsers.pd.read_excel', return_value=dataframe):
             path = Path('numeric_headers.xlsx')
@@ -38,7 +90,7 @@ class ExcelParserTests(unittest.TestCase):
         )
 
     def test_multiple_excel_sheets_are_merged(self) -> None:
-        fake_excel = type('FakeExcelFile', (), {'sheet_names': ['Jan', 'Feb']})()
+        fake_excel = FakeExcelFile(['Jan', 'Feb'])
         jan = pd.DataFrame([['alice', 10]], columns=['customerName', 'amount'])
         feb = pd.DataFrame([['bob', 20]], columns=['customerName', 'amount'])
 

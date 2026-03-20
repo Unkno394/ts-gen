@@ -48,7 +48,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
     else:
         raise ParseError(f'Unsupported file type: {ext}')
 
-    if not columns:
+    if not columns and not (ext in {'pdf', 'docx'} and warnings):
         warnings.append('No columns detected in the file.')
 
     logger.info(
@@ -198,14 +198,14 @@ def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], l
         )
 
         if content_type != 'table':
-            logger.warning(
+            logger.info(
                 'document parser fallback to non-tabular mode: file=%s content_type=%s warnings=%s',
                 file_path.name,
                 content_type,
                 warnings,
             )
         elif filtered_out > 0:
-            logger.warning(
+            logger.info(
                 'document parser dropped sparse rows: file=%s dropped=%d remaining=%d',
                 file_path.name,
                 filtered_out,

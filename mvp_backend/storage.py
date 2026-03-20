@@ -699,6 +699,8 @@ def get_history(user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
             u.external_id AS user_id,
             a.file_name,
             a.file_type,
+            a.selected_sheet,
+            a.parsed_file_json,
             v.target_json,
             a.mappings_json,
             v.generated_typescript,

@@ -1,4 +1,4 @@
-import type { GenerationResult, HistoryItem, UserProfile } from '../types';
+import type { CorrectionSessionResult, GenerationResult, HistoryItem, LearningSummary, ManualCorrectionInput, UserProfile } from '../types';
 
 type GenerateParams = {
   file: File;
@@ -39,6 +39,19 @@ type BackendHistoryResponse = {
     user_id: string;
     file_name: string;
     file_type: string;
+    selected_sheet: string | null;
+    parsed_file: {
+      file_name: string;
+      file_type: string;
+      columns: string[];
+      rows: Record<string, unknown>[];
+      sheets: Array<{
+        name: string;
+        columns: string[];
+        rows: Record<string, unknown>[];
+      }>;
+      warnings: string[];
+    } | null;
     target_json: Record<string, unknown>;
     mappings: Array<{
       source: string | null;
@@ -51,6 +64,29 @@ type BackendHistoryResponse = {
     warnings: string[];
     created_at: string;
   }>;
+};
+
+type BackendLearningSummaryResponse = {
+  user_id: string;
+  uploads: number;
+  schema_fingerprints: number;
+  mapping_memory: number;
+  few_shot_examples: number;
+  user_templates: number;
+  correction_sessions: number;
+  user_corrections: number;
+  frequent_djson: number;
+  global_pattern_candidates: number;
+  global_curated_dataset_items: number;
+};
+
+type BackendCorrectionSessionResponse = {
+  session_id: number;
+  generation_id: number | null;
+  schema_fingerprint_id: number | null;
+  correction_ids: number[];
+  accepted_count: number;
+  count: number;
 };
 
 type AuthParams = {
@@ -359,6 +395,17 @@ export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
     id: item.id,
     createdAt: item.created_at,
     fileName: item.file_name,
+    selectedSheet: item.selected_sheet,
+    parsedFile: item.parsed_file
+      ? {
+          fileName: item.parsed_file.file_name,
+          extension: item.parsed_file.file_type,
+          columns: item.parsed_file.columns,
+          rows: item.parsed_file.rows,
+          sheets: item.parsed_file.sheets ?? [],
+          warnings: item.parsed_file.warnings,
+        }
+      : null,
     schema: JSON.stringify(item.target_json, null, 2),
     code: item.generated_typescript,
     mappings: item.mappings.map((mapping) => ({
@@ -370,4 +417,68 @@ export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
     preview: item.preview,
     warnings: item.warnings,
   }));
+}
+
+export async function fetchLearningSummary(userId: string): Promise<LearningSummary> {
+  const response = await fetchWithTimeout(
+    buildApiUrl(`/api/learning/summary/${encodeURIComponent(userId)}`),
+    {
+      method: 'GET',
+    },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+  const payload = await parseJson<BackendLearningSummaryResponse>(response);
+  return {
+    userId: payload.user_id,
+    uploads: payload.uploads,
+    schemaFingerprints: payload.schema_fingerprints,
+    mappingMemory: payload.mapping_memory,
+    fewShotExamples: payload.few_shot_examples,
+    userTemplates: payload.user_templates,
+    correctionSessions: payload.correction_sessions,
+    userCorrections: payload.user_corrections,
+    frequentDjson: payload.frequent_djson,
+    globalPatternCandidates: payload.global_pattern_candidates,
+    globalCuratedDatasetItems: payload.global_curated_dataset_items,
+  };
+}
+
+export async function saveLearningCorrections(params: {
+  userId: string;
+  generationId?: number | null;
+  sessionType?: 'manual_review' | 'post_generation_fix' | 'template_authoring' | 'feedback_loop';
+  notes?: string;
+  metadata?: Record<string, unknown>;
+  corrections: ManualCorrectionInput[];
+}): Promise<CorrectionSessionResult> {
+  const response = await postJson<BackendCorrectionSessionResponse>('/api/learning/corrections', {
+    user_id: params.userId,
+    generation_id: params.generationId ?? null,
+    session_type: params.sessionType ?? 'manual_review',
+    notes: params.notes ?? null,
+    metadata: params.metadata ?? {},
+    corrections: params.corrections.map((correction) => ({
+      correction_type: correction.correctionType,
+      row_index: correction.rowIndex ?? null,
+      field_path: correction.fieldPath ?? null,
+      source_field: correction.sourceField ?? null,
+      target_field: correction.targetField ?? null,
+      original_value: correction.originalValue ?? null,
+      corrected_value: correction.correctedValue ?? null,
+      correction_payload: correction.correctionPayload ?? null,
+      rationale: correction.rationale ?? null,
+      confidence_before: correction.confidenceBefore ?? null,
+      confidence_after: correction.confidenceAfter ?? null,
+      accepted: correction.accepted ?? true,
+    })),
+  });
+
+  return {
+    sessionId: response.session_id,
+    generationId: response.generation_id,
+    schemaFingerprintId: response.schema_fingerprint_id,
+    correctionIds: response.correction_ids,
+    acceptedCount: response.accepted_count,
+    count: response.count,
+  };
 }

@@ -26,11 +26,13 @@ import {
   changeEmailWithCode,
   changeEmailWithPassword,
   changePasswordWithBackend,
+  fetchLearningSummary,
   generateFromBackend,
   requestEmailChangeCode,
+  saveLearningCorrections,
   updateProfileName,
 } from '../lib/api';
-import type { GenerationResult, HistoryItem, ParsedFileInfo, ParsedSheetInfo, UserProfile } from '../types';
+import type { GenerationResult, HistoryItem, LearningSummary, ManualCorrectionInput, MappingInfo, ParsedFileInfo, ParsedSheetInfo, UserProfile } from '../types';
 import { VibeBackground } from './VibeBackground';
 
 type Props = {
@@ -51,6 +53,15 @@ const defaultCode = `// Generated TypeScript will appear here
 export function transform(row: any) {
   return {};
 }`;
+
+const CORRECTION_AUTOSAVE_MS = 900;
+
+type CorrectionBaseline = {
+  generationId: string;
+  schema: string;
+  code: string;
+  mappings: MappingInfo[];
+};
 
 function buildPreviewSheet(name: string, columns: string[], rows: Record<string, unknown>[]): ParsedSheetInfo {
   return {
@@ -163,6 +174,7 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
     };
   }
 
+
   if (extension === 'pdf' || extension === 'docx') {
     return {
       fileName: file.name,
@@ -182,6 +194,61 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
     sheets: [],
     warnings: ['Поддерживаются CSV, XLSX, XLS, PDF и DOCX.'],
   };
+}
+
+function cloneMappings(mappings: MappingInfo[]): MappingInfo[] {
+  return mappings.map((mapping) => ({ ...mapping }));
+}
+
+function buildCorrectionBaseline(generationId: string, schema: string, result: GenerationResult): CorrectionBaseline {
+  return {
+    generationId,
+    schema,
+    code: result.code,
+    mappings: cloneMappings(result.mappings),
+  };
+}
+
+function parseSchemaFields(schemaText: string): string[] {
+  try {
+    const parsed = JSON.parse(schemaText) as Record<string, unknown>;
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+      return [];
+    }
+    return Object.keys(parsed);
+  } catch {
+    return [];
+  }
+}
+
+function parseMaybeJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function confidenceToScore(confidence: MappingInfo['confidence']): number {
+  switch (confidence) {
+    case 'high':
+      return 1;
+    case 'medium':
+      return 0.7;
+    case 'low':
+      return 0.35;
+    default:
+      return 0;
+  }
+}
+
+function areMappingsEqual(left: MappingInfo, right: MappingInfo): boolean {
+  return (
+    left.source === right.source &&
+    left.target === right.target &&
+    left.confidence === right.confidence &&
+    (left.reason ?? '') === (right.reason ?? '')
+  );
 }
 
 export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveHistory }: Props) {
@@ -216,7 +283,29 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [passwordChangeBusy, setPasswordChangeBusy] = useState(false);
   const [passwordChangeNotice, setPasswordChangeNotice] = useState('');
   const [passwordChangeError, setPasswordChangeError] = useState('');
+  const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(null);
+  const [learningSummaryError, setLearningSummaryError] = useState('');
+  const [correctionBaseline, setCorrectionBaseline] = useState<CorrectionBaseline | null>(null);
+  const [correctionSaveBusy, setCorrectionSaveBusy] = useState(false);
+  const [correctionSaveNotice, setCorrectionSaveNotice] = useState('');
+  const [correctionSaveError, setCorrectionSaveError] = useState('');
   const hasGeneratedResult = result.code !== defaultCode;
+
+  const refreshLearningSummary = async () => {
+    if (profile.skipped) {
+      setLearningSummary(null);
+      setLearningSummaryError('');
+      return;
+    }
+
+    try {
+      const nextSummary = await fetchLearningSummary(profile.id);
+      setLearningSummary(nextSummary);
+      setLearningSummaryError('');
+    } catch (error) {
+      setLearningSummaryError(error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.');
+    }
+  };
 
   const previewSheets = useMemo(() => {
     if (!parsedFile) {
@@ -258,9 +347,82 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return `${parsedFile.fileName} · ${parsedFile.columns.length} колонок · ${parsedFile.rows.length} preview rows`;
   }, [parsedFile]);
 
+  const schemaTargetFields = useMemo(() => parseSchemaFields(schema), [schema]);
+
+  const mappingTargetOptions = useMemo(() => {
+    const options = schemaTargetFields.length > 0 ? schemaTargetFields : result.mappings.map((mapping) => mapping.target);
+    return Array.from(new Set(options.filter(Boolean)));
+  }, [result.mappings, schemaTargetFields]);
+
+  const pendingCorrections = useMemo(() => {
+    if (profile.skipped || !correctionBaseline) {
+      return [] as ManualCorrectionInput[];
+    }
+
+    const nextCorrections: ManualCorrectionInput[] = [];
+    if (schema !== correctionBaseline.schema) {
+      nextCorrections.push({
+        correctionType: 'target_schema_edit',
+        fieldPath: '$',
+        originalValue: parseMaybeJson(correctionBaseline.schema),
+        correctedValue: parseMaybeJson(schema),
+        correctionPayload: {
+          originalText: correctionBaseline.schema,
+          correctedText: schema,
+        },
+        rationale: 'Schema edited in the frontend workspace.',
+        accepted: true,
+      });
+    }
+
+    const maxLength = Math.max(correctionBaseline.mappings.length, result.mappings.length);
+    for (let index = 0; index < maxLength; index += 1) {
+      const previousMapping = correctionBaseline.mappings[index];
+      const currentMapping = result.mappings[index];
+      if (!currentMapping || !previousMapping) {
+        continue;
+      }
+      if (areMappingsEqual(previousMapping, currentMapping)) {
+        continue;
+      }
+
+      nextCorrections.push({
+        correctionType: 'mapping_override',
+        sourceField: currentMapping.source === 'not found' ? null : currentMapping.source,
+        targetField: currentMapping.target,
+        originalValue: previousMapping,
+        correctedValue: currentMapping,
+        correctionPayload: {
+          mappingIndex: index,
+          previousTarget: previousMapping.target,
+          nextTarget: currentMapping.target,
+          previousReason: previousMapping.reason ?? null,
+          nextReason: currentMapping.reason ?? null,
+        },
+        rationale: 'Mapping adjusted manually in the frontend workspace.',
+        confidenceBefore: confidenceToScore(previousMapping.confidence),
+        confidenceAfter: confidenceToScore(currentMapping.confidence),
+        accepted: true,
+      });
+    }
+
+    if (result.code !== correctionBaseline.code) {
+      nextCorrections.push({
+        correctionType: 'code_edit',
+        fieldPath: 'generated_typescript',
+        originalValue: correctionBaseline.code,
+        correctedValue: result.code,
+        rationale: 'Generated TypeScript edited in the frontend workspace.',
+        accepted: true,
+      });
+    }
+
+    return nextCorrections;
+  }, [correctionBaseline, profile.skipped, result.code, result.mappings, schema]);
+
   const visibleWarnings = useMemo(() => {
-    return Array.from(new Set([...result.warnings, ...(parsedFile?.warnings ?? []), saveMessage].filter(Boolean)));
-  }, [parsedFile?.warnings, result.warnings, saveMessage]);
+    return Array.from(new Set([...result.warnings, ...(parsedFile?.warnings ?? []), saveMessage, correctionSaveError].filter(Boolean)));
+  }, [correctionSaveError, parsedFile?.warnings, result.warnings, saveMessage]);
 
   const profileStats = useMemo(() => {
     const totalGenerations = history.length;
@@ -355,13 +517,22 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const restoreHistoryItem = (item: HistoryItem) => {
     setActiveHistoryId(item.id);
+    setSelectedFile(null);
+    setParsedFile(item.parsedFile ?? null);
     setSchema(item.schema);
-    setResult({
+    const restoredResult: GenerationResult = {
+      generationId: item.id,
       code: item.code,
       mappings: item.mappings,
       preview: item.preview,
       warnings: item.warnings,
-    });
+      parsedFile: item.parsedFile ?? null,
+    };
+    setResult(restoredResult);
+    setActivePreviewSheet(item.selectedSheet ?? item.parsedFile?.sheets[0]?.name ?? null);
+    setCorrectionBaseline(profile.skipped ? null : buildCorrectionBaseline(item.id, item.schema, restoredResult));
+    setCorrectionSaveNotice('');
+    setCorrectionSaveError('');
     setActiveView('generator');
   };
 
@@ -382,12 +553,89 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDisplayName(profile.name);
   }, [profile.name]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadLearningData() {
+      if (profile.skipped) {
+        if (!cancelled) {
+          setLearningSummary(null);
+          setLearningSummaryError('');
+        }
+        return;
+      }
+
+      try {
+        const nextSummary = await fetchLearningSummary(profile.id);
+        if (!cancelled) {
+          setLearningSummary(nextSummary);
+          setLearningSummaryError('');
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setLearningSummaryError(error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.');
+        }
+      }
+    }
+
+    void loadLearningData();
+    return () => {
+      cancelled = true;
+    };
+  }, [profile.id, profile.skipped]);
+
+  useEffect(() => {
+    if (profile.skipped || !correctionBaseline || pendingCorrections.length === 0 || correctionSaveBusy) {
+      return;
+    }
+
+    const generationId = Number(correctionBaseline.generationId);
+    if (!Number.isFinite(generationId)) {
+      return;
+    }
+
+    const timer = window.setTimeout(async () => {
+      setCorrectionSaveBusy(true);
+      setCorrectionSaveError('');
+
+      try {
+        const saved = await saveLearningCorrections({
+          userId: profile.id,
+          generationId,
+          sessionType: 'post_generation_fix',
+          notes: `Autosaved ${pendingCorrections.length} correction(s) from the frontend workspace.`,
+          metadata: {
+            source: 'workspace_autosave',
+            file_name: parsedFile?.fileName ?? null,
+            selected_sheet: currentPreviewSheet?.name ?? null,
+          },
+          corrections: pendingCorrections,
+        });
+
+        setCorrectionBaseline(buildCorrectionBaseline(String(saved.generationId ?? generationId), schema, result));
+        setCorrectionSaveNotice(`Сервер сохранил ${saved.count} правк(и).`);
+        setCorrectionSaveError('');
+        await refreshLearningSummary();
+      } catch (error) {
+        setCorrectionSaveError(error instanceof Error ? error.message : 'Не удалось сохранить правки на сервере.');
+      } finally {
+        setCorrectionSaveBusy(false);
+      }
+    }, CORRECTION_AUTOSAVE_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [correctionBaseline, correctionSaveBusy, currentPreviewSheet?.name, parsedFile?.fileName, pendingCorrections, profile.id, profile.skipped, result, schema]);
+
   const handleSelectedFile = async (file: File) => {
     setSelectedFile(file);
     const parsed = await parseFile(file);
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
     setSaveMessage('');
+    setCorrectionBaseline(null);
+    setCorrectionSaveError('');
   };
 
   const onFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -448,10 +696,12 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setParsedFile(generated.parsedFile ?? parsedFile);
       setResult(generated);
       setSaveMessage('');
+      setCorrectionSaveError('');
 
       if (!profile.skipped) {
         if (generated.generationId) {
           setActiveHistoryId(generated.generationId);
+          setCorrectionBaseline(buildCorrectionBaseline(generated.generationId, schema, generated));
         }
         try {
           await onSaveHistory();
@@ -462,6 +712,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               : 'Generation finished, but the history list could not be refreshed.'
           );
         }
+        await refreshLearningSummary();
+      } else {
+        setCorrectionBaseline(null);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Не удалось выполнить генерацию.';
@@ -471,9 +724,26 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         preview: [],
         warnings: [message],
       });
+      setCorrectionBaseline(null);
     } finally {
       setBusy(false);
     }
+  };
+
+  const onMappingTargetChange = (mappingIndex: number, nextTarget: string) => {
+    setResult((current) => ({
+      ...current,
+      mappings: current.mappings.map((mapping, index) =>
+        index === mappingIndex
+          ? {
+              ...mapping,
+              target: nextTarget,
+              confidence: 'high',
+              reason: 'Manual override from frontend workspace',
+            }
+          : mapping
+      ),
+    }));
   };
 
   const onDownload = async () => {
@@ -716,6 +986,16 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               >
                 <Download size={16} /> Скачать .ts
               </button>
+              {false && !profile.skipped && (
+                <div className="learning-status-stack">
+                  <div className="empty-card compact learning-status-card">
+                    <strong>{correctionSaveBusy ? 'Сохраняем правки...' : 'Серверное хранение включено'}</strong>
+                    <span>Схема, маппинги и код из рабочей области сохраняются в backend автоматически.</span>
+                  </div>
+                  {correctionSaveNotice && <div className="auth-status auth-status-success">{correctionSaveNotice}</div>}
+                  {correctionSaveError && <div className="warning-item auth-status auth-status-error">{correctionSaveError}</div>}
+                </div>
+              )}
             </section>
           ) : (
             <section className="profile-nav-card sidebar-history-card">
@@ -805,8 +1085,19 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       {copied ? <Check size={16} /> : <Copy size={16} />}
                     </button>
                   </div>
-                  <pre className="code-pane">{result.code}</pre>
+                  <textarea
+                    className="code-pane code-editor"
+                    onChange={(event) =>
+                      setResult((current) => ({
+                        ...current,
+                        code: event.target.value,
+                      }))
+                    }
+                    spellCheck={false}
+                    value={result.code}
+                  />
                 </section>
+
               </div>
 
               <div className="insight-grid">
@@ -815,6 +1106,39 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     <Sparkles size={16} /> Preview JSON
                   </div>
                   <pre className="preview-pane">{JSON.stringify(result.preview, null, 2)}</pre>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
+                    <SquarePen size={16} /> Mapping overrides
+                  </div>
+                  <div className="mapping-editor-list">
+                    {result.mappings.length === 0 && <div className="empty-card compact">После генерации здесь появятся найденные соответствия.</div>}
+                    {result.mappings.map((mapping, index) => (
+                      <div className="mapping-editor-row" key={`${mapping.source}-${mapping.target}-${index}`}>
+                        <div className="mapping-editor-source">
+                          <span>Source</span>
+                          <strong>{mapping.source}</strong>
+                        </div>
+                        <select
+                          className="mapping-editor-select"
+                          disabled={mappingTargetOptions.length === 0}
+                          onChange={(event) => onMappingTargetChange(index, event.target.value)}
+                          value={mapping.target}
+                        >
+                          {mappingTargetOptions.length === 0 && <option value={mapping.target}>{mapping.target}</option>}
+                          {mappingTargetOptions.map((targetField) => (
+                            <option key={targetField} value={targetField}>
+                              {targetField}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="subtle-text mapping-editor-note">
+                    Изменения сохраняются на сервере автоматически. Чтобы пересчитать preview и код по новой схеме, нажмите «Сгенерировать».
+                  </p>
                 </section>
 
                 <section className="insight-card">
@@ -829,6 +1153,31 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     ))}
                     {visibleWarnings.length === 0 && <div className="empty-card compact">Пока без предупреждений.</div>}
                   </div>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
+                    <Sparkles size={16} /> Server learning
+                  </div>
+                  <div className="profile-fun-grid">
+                    <div className="empty-card compact">
+                      <strong>{learningSummary?.uploads ?? 0}</strong>
+                      <span>uploads</span>
+                    </div>
+                    <div className="empty-card compact">
+                      <strong>{learningSummary?.mappingMemory ?? 0}</strong>
+                      <span>mapping memory</span>
+                    </div>
+                    <div className="empty-card compact">
+                      <strong>{learningSummary?.correctionSessions ?? 0}</strong>
+                      <span>sessions</span>
+                    </div>
+                    <div className="empty-card compact">
+                      <strong>{learningSummary?.userCorrections ?? 0}</strong>
+                      <span>corrections</span>
+                    </div>
+                  </div>
+                  {learningSummaryError && <div className="warning-item auth-status auth-status-error">{learningSummaryError}</div>}
                 </section>
               </div>
             </>

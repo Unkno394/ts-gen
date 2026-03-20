@@ -291,6 +291,8 @@ def history(user_id: str) -> dict:
                 'user_id': item['user_id'],
                 'file_name': item['file_name'],
                 'file_type': item['file_type'],
+                'selected_sheet': item['selected_sheet'],
+                'parsed_file': json.loads(item['parsed_file_json']) if item.get('parsed_file_json') else None,
                 'target_json': json.loads(item['target_json']),
                 'mappings': json.loads(item['mappings_json']),
                 'generated_typescript': item['generated_typescript'],
