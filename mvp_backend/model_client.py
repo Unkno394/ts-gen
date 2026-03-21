@@ -364,9 +364,101 @@ def suggest_draft_json_fields(
     return normalized, warnings
 
 
+def suggest_form_field_repair(
+    *,
+    target_field: str,
+    question: str,
+    options: list[dict[str, Any]],
+    enum_map: dict[str, str],
+    context_lines: list[str] | None = None,
+    allow_multiple: bool = False,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not _form_repair_enabled():
+        return None, []
+
+    runtime = _get_model_runtime_config()
+    compact_options = []
+    for option in options[:8]:
+        if not isinstance(option, dict):
+            continue
+        compact_options.append(
+            {
+                'label': str(option.get('label') or '').strip(),
+                'selected': bool(option.get('selected')),
+                'marker_text': str(option.get('marker_text') or '').strip() or None,
+            }
+        )
+    payload = {
+        'task': 'repair_form_field_resolution',
+        'target_field': target_field,
+        'question': question,
+        'options': compact_options,
+        'enum_map': enum_map,
+        'context_lines': [str(line).strip() for line in (context_lines or []) if str(line).strip()][:12],
+        'allow_multiple': allow_multiple,
+        'output_schema': {
+            'status': 'resolved|ambiguous|not_found',
+            'enum_value': 'string|null',
+            'enum_values': ['string'],
+            'reason': 'short_reason',
+            'confidence': '0..1',
+        },
+    }
+    instructions = (
+        'Repair one ambiguous form-field extraction from a document fragment. '
+        'Return only strict JSON. '
+        'Use only the provided question, options, markers and local context. '
+        'Do not invent enums outside enum_map. '
+        'If uncertain, return status ambiguous or not_found.'
+    )
+    raw_response, warnings = _call_model_as_json(
+        instructions=instructions,
+        payload=payload,
+        max_tokens=min(runtime['mapping_max_tokens'], 192),
+    )
+    if not isinstance(raw_response, dict):
+        return None, warnings
+
+    if allow_multiple:
+        enum_values = [
+            str(value).strip()
+            for value in raw_response.get('enum_values', [])
+            if str(value).strip() in set(enum_map.values())
+        ] if isinstance(raw_response.get('enum_values'), list) else []
+        if not enum_values:
+            single_value = str(raw_response.get('enum_value') or '').strip()
+            if single_value in set(enum_map.values()):
+                enum_values = [single_value]
+        if not enum_values:
+            return None, warnings
+        return {
+            'status': str(raw_response.get('status') or 'resolved'),
+            'enum_values': list(dict.fromkeys(enum_values)),
+            'confidence': _normalize_confidence_score(raw_response.get('confidence')),
+            'reason': str(raw_response.get('reason') or 'form_repair_model'),
+        }, warnings
+
+    enum_value = str(raw_response.get('enum_value') or '').strip()
+    if enum_value not in set(enum_map.values()):
+        return None, warnings
+    return {
+        'status': str(raw_response.get('status') or 'resolved'),
+        'enum_value': enum_value,
+        'confidence': _normalize_confidence_score(raw_response.get('confidence')),
+        'reason': str(raw_response.get('reason') or 'form_repair_model'),
+    }, warnings
+
+
 def _model_enabled() -> bool:
     runtime = _get_model_runtime_config()
     return runtime['provider'] == 'gigachat'
+
+
+def _form_repair_enabled() -> bool:
+    runtime = _get_model_runtime_config()
+    if runtime['provider'] != 'gigachat':
+        return False
+    return bool(runtime.get('api_key') or runtime.get('gigachat_auth_key'))
 
 
 def _call_model_as_json(

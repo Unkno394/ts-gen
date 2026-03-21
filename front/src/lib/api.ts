@@ -2,6 +2,8 @@ import type {
   CorrectionSessionResult,
   DraftJsonFeedbackResult,
   DraftJsonResult,
+  FormRepairAction,
+  FormExplainability,
   GenerationConfirmationResult,
   GenerationResult,
   HistoryItem,
@@ -10,6 +12,8 @@ import type {
   LearningSummary,
   ManualCorrectionInput,
   MappingFeedbackResult,
+  RepairApplyResult,
+  RepairPreviewResult,
   UserProfile,
 } from '../types';
 
@@ -26,6 +30,7 @@ type BackendParsedFile = {
   columns: string[];
   rows: Record<string, unknown>[];
   content_type?: 'table' | 'form' | 'text' | 'image_like' | 'mixed' | 'unknown';
+  document_mode?: 'data_table_mode' | 'form_layout_mode';
   extraction_status?: string;
   raw_text?: string;
   text_blocks?: Array<{
@@ -57,6 +62,14 @@ type BackendParsedFile = {
     columns: string[];
     rows: Record<string, unknown>[];
   }>;
+  form_model?: {
+    scalars?: Record<string, unknown>[];
+    groups?: Record<string, unknown>[];
+    section_hierarchy?: Record<string, unknown>[];
+    layout_lines?: Record<string, unknown>[];
+    layout_meta?: Record<string, unknown>;
+    resolved_fields?: Record<string, unknown>[];
+  } | null;
   warnings: string[];
 };
 
@@ -65,6 +78,7 @@ type BackendGenerateResponse = {
   schema_fingerprint_id?: number | null;
   mode: 'guest' | 'authorized';
   parsed_file: BackendParsedFile;
+  form_explainability?: BackendFormExplainability | null;
   mappings: Array<{
     source: string | null;
     target: string;
@@ -128,6 +142,7 @@ type BackendGenerateResponse = {
 
 type BackendSourcePreviewResponse = {
   parsed_file: BackendParsedFile;
+  form_explainability?: BackendFormExplainability | null;
 };
 
 type BackendHistoryResponse = {
@@ -394,6 +409,7 @@ function normalizeParsedFile(payload: BackendParsedFile) {
     columns: payload.columns,
     rows: payload.rows,
     contentType: payload.content_type ?? 'unknown',
+    documentMode: payload.document_mode ?? 'data_table_mode',
     extractionStatus: payload.extraction_status ?? 'unknown',
     rawText: payload.raw_text ?? '',
     textBlocks: (payload.text_blocks ?? []).map((block) => ({
@@ -421,6 +437,69 @@ function normalizeParsedFile(payload: BackendParsedFile) {
       sectionTitle: candidate.section_title ?? null,
     })),
     sheets: payload.sheets ?? [],
+    formModel: payload.form_model
+      ? {
+          scalars: payload.form_model.scalars ?? [],
+          groups: payload.form_model.groups ?? [],
+          sectionHierarchy: payload.form_model.section_hierarchy ?? [],
+          layoutLines: payload.form_model.layout_lines ?? [],
+          layoutMeta: payload.form_model.layout_meta ?? {},
+          resolvedFields: payload.form_model.resolved_fields ?? [],
+        }
+      : null,
+    warnings: payload.warnings,
+  };
+}
+
+function serializeParsedFile(payload: NonNullable<GenerationResult['parsedFile']>): BackendParsedFile {
+  return {
+    file_name: payload.fileName,
+    file_type: payload.extension,
+    columns: payload.columns,
+    rows: payload.rows,
+    content_type: payload.contentType,
+    document_mode: payload.documentMode ?? 'data_table_mode',
+    extraction_status: payload.extractionStatus,
+    raw_text: payload.rawText,
+    text_blocks: payload.textBlocks.map((block) => ({
+      id: block.id,
+      kind: block.kind,
+      text: block.text,
+      label: block.label ?? null,
+    })),
+    sections: payload.sections.map((section) => ({
+      title: section.title,
+      text: section.text,
+    })),
+    kv_pairs: payload.kvPairs.map((pair) => ({
+      label: pair.label,
+      value: pair.value,
+      confidence: pair.confidence,
+      source_text: pair.sourceText ?? null,
+    })),
+    source_candidates: payload.sourceCandidates.map((candidate) => ({
+      candidate_type: candidate.candidateType,
+      label: candidate.label,
+      value: candidate.value,
+      sample_values: candidate.sampleValues,
+      source_text: candidate.sourceText ?? null,
+      section_title: candidate.sectionTitle ?? null,
+    })),
+    sheets: payload.sheets.map((sheet) => ({
+      name: sheet.name,
+      columns: sheet.columns,
+      rows: sheet.rows,
+    })),
+    form_model: payload.formModel
+      ? {
+          scalars: payload.formModel.scalars,
+          groups: payload.formModel.groups,
+          section_hierarchy: payload.formModel.sectionHierarchy,
+          layout_lines: payload.formModel.layoutLines,
+          layout_meta: payload.formModel.layoutMeta,
+          resolved_fields: payload.formModel.resolvedFields,
+        }
+      : null,
     warnings: payload.warnings,
   };
 }
@@ -457,6 +536,7 @@ type BackendGenerationConfirmationResponse = {
 type BackendDraftJsonResponse = {
   schema_fingerprint_id?: number | null;
   parsed_file: BackendGenerateResponse['parsed_file'];
+  form_explainability?: BackendFormExplainability | null;
   draft_json: Record<string, unknown>;
   field_suggestions: Array<{
     source_column: string;
@@ -471,6 +551,106 @@ type BackendDraftJsonResponse = {
     schema_fingerprint_id?: number | null;
   }>;
   warnings: string[];
+};
+
+type BackendFormExplainability = {
+  document_mode: string;
+  final_source_mode?: string | null;
+  layout_meta?: Record<string, unknown>;
+  quality_summary?: {
+    needs_attention?: boolean;
+    repair_recommended?: boolean;
+    resolved_field_count?: number;
+    target_field_count?: number;
+    ambiguous_fields?: string[];
+    unresolved_fields?: string[];
+    unresolved_critical_fields?: string[];
+    repair_fields?: string[];
+    blocked_fields?: string[];
+    multiple_selected_single_choice_groups?: string[];
+    red_flags?: Array<{
+      code: string;
+      message?: string;
+      fields?: string[];
+      groups?: string[];
+      resolved_field_count?: number;
+      target_field_count?: number;
+    }>;
+  } | null;
+  repair_plan?: {
+    recommended: boolean;
+    trigger_stage: 'generic_form_understanding' | 'business_mapping';
+    strategy: string;
+    llm_policy: string;
+    requested_target_fields?: string[];
+    red_flag_codes?: string[];
+    targeted_chunk_count?: number;
+    actions?: Array<{
+      kind: string;
+      priority: 'high' | 'medium' | 'low';
+      reason: string;
+      target_field?: string;
+      group_id?: string;
+      fields?: string[];
+      llm_scope?: string;
+      chunk_refs?: {
+        group_ids?: string[];
+        scalar_labels?: string[];
+        line_ids?: string[];
+      };
+    }>;
+  } | null;
+  resolved_fields?: Array<{
+    field: string;
+    status: 'resolved' | 'weak_match' | 'ambiguous' | 'not_found';
+    resolved_by: 'form_resolver' | 'repair_model' | 'repair_apply' | 'legacy_fallback' | 'fallback_blocked' | 'unresolved';
+    value?: unknown;
+    candidates?: unknown[];
+    source_ref?: Record<string, unknown>;
+    confidence?: number | null;
+  }>;
+  scalar_count?: number;
+  group_count?: number;
+  section_count?: number;
+  layout_line_count?: number;
+  repair_fields?: string[];
+};
+
+type BackendRepairAction = NonNullable<NonNullable<BackendFormExplainability['repair_plan']>['actions']>[number];
+
+type BackendRepairPreviewResponse = {
+  supported: boolean;
+  preview_status: 'patch_available' | 'inspection_only' | 'ambiguous' | 'no_patch';
+  action: BackendRepairAction;
+  target_fields: Array<{
+    name: string;
+    type: string;
+  }>;
+  local_chunks: {
+    groups: Record<string, unknown>[];
+    scalars: Record<string, unknown>[];
+    lines: Record<string, unknown>[];
+  };
+  proposed_resolutions: NonNullable<BackendFormExplainability['resolved_fields']>;
+  proposed_patch: Record<string, unknown>;
+  form_explainability?: BackendFormExplainability | null;
+  warnings: string[];
+};
+
+type BackendRepairApplyResponse = {
+  applied: boolean;
+  action: BackendRepairAction;
+  approved_patch: Record<string, unknown>;
+  parsed_file: BackendParsedFile;
+  form_explainability?: BackendFormExplainability | null;
+  updated_resolved_fields: NonNullable<BackendFormExplainability['resolved_fields']>;
+  persistence: {
+    persisted: boolean;
+    generation_id?: number | string | null;
+    version_id?: number | null;
+    version_number?: number | null;
+    session_id?: number | null;
+  };
 };
 
 type BackendDraftJsonFeedbackResponse = {
@@ -693,6 +873,108 @@ function normalizeTrueQualityMetrics(
   };
 }
 
+function normalizeFormExplainability(payload: BackendFormExplainability | null | undefined): FormExplainability | null {
+  if (!payload) {
+    return null;
+  }
+  return {
+    documentMode: payload.document_mode,
+    finalSourceMode: payload.final_source_mode ?? null,
+    layoutMeta: payload.layout_meta ?? {},
+    qualitySummary: {
+      needsAttention: payload.quality_summary?.needs_attention ?? false,
+      repairRecommended: payload.quality_summary?.repair_recommended ?? false,
+      resolvedFieldCount: payload.quality_summary?.resolved_field_count ?? 0,
+      targetFieldCount: payload.quality_summary?.target_field_count ?? 0,
+      ambiguousFields: payload.quality_summary?.ambiguous_fields ?? [],
+      unresolvedFields: payload.quality_summary?.unresolved_fields ?? [],
+      unresolvedCriticalFields: payload.quality_summary?.unresolved_critical_fields ?? [],
+      repairFields: payload.quality_summary?.repair_fields ?? [],
+      blockedFields: payload.quality_summary?.blocked_fields ?? [],
+      multipleSelectedSingleChoiceGroups: payload.quality_summary?.multiple_selected_single_choice_groups ?? [],
+      redFlags: (payload.quality_summary?.red_flags ?? []).map((flag) => ({
+        code: flag.code,
+        message: flag.message,
+        fields: flag.fields ?? [],
+        groups: flag.groups ?? [],
+        resolvedFieldCount: flag.resolved_field_count,
+        targetFieldCount: flag.target_field_count,
+      })),
+    },
+    repairPlan: {
+      recommended: payload.repair_plan?.recommended ?? false,
+      triggerStage: payload.repair_plan?.trigger_stage ?? 'business_mapping',
+      strategy: payload.repair_plan?.strategy ?? '',
+      llmPolicy: payload.repair_plan?.llm_policy ?? '',
+      requestedTargetFields: payload.repair_plan?.requested_target_fields ?? [],
+      redFlagCodes: payload.repair_plan?.red_flag_codes ?? [],
+      actions: (payload.repair_plan?.actions ?? []).map((action) => ({
+        kind: action.kind,
+        priority: action.priority,
+        reason: action.reason,
+        targetField: action.target_field,
+        groupId: action.group_id,
+        fields: action.fields ?? [],
+        llmScope: action.llm_scope,
+        chunkRefs: {
+          groupIds: action.chunk_refs?.group_ids ?? [],
+          scalarLabels: action.chunk_refs?.scalar_labels ?? [],
+          lineIds: action.chunk_refs?.line_ids ?? [],
+        },
+      })),
+      targetedChunkCount: payload.repair_plan?.targeted_chunk_count ?? 0,
+    },
+    resolvedFields: (payload.resolved_fields ?? []).map((field) => ({
+      field: field.field,
+      status: field.status,
+      resolvedBy: field.resolved_by,
+      value: field.value,
+      candidates: field.candidates ?? [],
+      sourceRef: field.source_ref ?? {},
+      confidence: field.confidence ?? null,
+    })),
+    scalarCount: payload.scalar_count ?? 0,
+    groupCount: payload.group_count ?? 0,
+    sectionCount: payload.section_count ?? 0,
+    layoutLineCount: payload.layout_line_count ?? 0,
+    repairFields: payload.repair_fields ?? [],
+  };
+}
+
+function normalizeRepairAction(action: BackendRepairAction): FormRepairAction {
+  return {
+    kind: action.kind,
+    priority: action.priority,
+    reason: action.reason,
+    targetField: action.target_field,
+    groupId: action.group_id,
+    fields: action.fields ?? [],
+    llmScope: action.llm_scope,
+    chunkRefs: {
+      groupIds: action.chunk_refs?.group_ids ?? [],
+      scalarLabels: action.chunk_refs?.scalar_labels ?? [],
+      lineIds: action.chunk_refs?.line_ids ?? [],
+    },
+  };
+}
+
+function serializeRepairAction(action: FormRepairAction): Record<string, unknown> {
+  return {
+    kind: action.kind,
+    priority: action.priority,
+    reason: action.reason,
+    target_field: action.targetField,
+    group_id: action.groupId,
+    fields: action.fields ?? [],
+    llm_scope: action.llmScope,
+    chunk_refs: {
+      group_ids: action.chunkRefs.groupIds,
+      scalar_labels: action.chunkRefs.scalarLabels,
+      line_ids: action.chunkRefs.lineIds,
+    },
+  };
+}
+
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -900,6 +1182,7 @@ export async function generateFromBackend({ file, targetJson, userId: _userId, s
     generationId: payload.generation_id,
     schemaFingerprintId: payload.schema_fingerprint_id ?? null,
     parsedFile: normalizeParsedFile(payload.parsed_file),
+    formExplainability: normalizeFormExplainability(payload.form_explainability),
     code: payload.generated_typescript,
     mappings: payload.mappings.map((item) => ({
       source: item.source ?? 'not found',
@@ -1255,6 +1538,7 @@ export async function generateDraftJsonFromBackend(params: {
   return {
     schemaFingerprintId: payload.schema_fingerprint_id ?? null,
     parsedFile: normalizeParsedFile(payload.parsed_file),
+    formExplainability: normalizeFormExplainability(payload.form_explainability),
     draftJson: payload.draft_json,
     fieldSuggestions: payload.field_suggestions.map((item) => ({
       sourceColumn: item.source_column,
@@ -1269,6 +1553,93 @@ export async function generateDraftJsonFromBackend(params: {
       schemaFingerprintId: item.schema_fingerprint_id ?? null,
     })),
     warnings: payload.warnings,
+  };
+}
+
+export async function fetchRepairPreviewFromBackend(params: {
+  parsedFile: NonNullable<GenerationResult['parsedFile']>;
+  action: FormRepairAction;
+  targetJson?: string | Record<string, unknown> | unknown[] | null;
+}): Promise<RepairPreviewResult> {
+  const response = await postJson<BackendRepairPreviewResponse>(
+    '/api/repair-preview',
+    {
+      parsed_file: serializeParsedFile(params.parsedFile),
+      action: serializeRepairAction(params.action),
+      target_json: params.targetJson ?? null,
+    },
+    GENERATE_REQUEST_TIMEOUT_MS
+  );
+
+  return {
+    supported: response.supported,
+    previewStatus: response.preview_status,
+    action: normalizeRepairAction(response.action),
+    targetFields: response.target_fields.map((field) => ({
+      name: field.name,
+      type: field.type,
+    })),
+    localChunks: response.local_chunks,
+    proposedResolutions: (response.proposed_resolutions ?? []).map((field) => ({
+      field: field.field,
+      status: field.status,
+      resolvedBy: field.resolved_by,
+      value: field.value,
+      candidates: field.candidates ?? [],
+      sourceRef: field.source_ref ?? {},
+      confidence: field.confidence ?? null,
+    })),
+    proposedPatch: response.proposed_patch ?? {},
+    formExplainability: normalizeFormExplainability(response.form_explainability),
+    warnings: response.warnings ?? [],
+  };
+}
+
+export async function applyRepairFromBackend(params: {
+  parsedFile: NonNullable<GenerationResult['parsedFile']>;
+  action: FormRepairAction;
+  approvedPatch: Record<string, unknown>;
+  targetJson?: string | Record<string, unknown> | unknown[] | null;
+  generationId?: number | null;
+  notes?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<RepairApplyResult> {
+  const response = await postJson<BackendRepairApplyResponse>(
+    '/api/repair-apply',
+    {
+      parsed_file: serializeParsedFile(params.parsedFile),
+      action: serializeRepairAction(params.action),
+      approved_patch: params.approvedPatch,
+      target_json: params.targetJson ?? null,
+      generation_id: params.generationId ?? null,
+      notes: params.notes ?? null,
+      metadata: params.metadata ?? {},
+    },
+    GENERATE_REQUEST_TIMEOUT_MS
+  );
+
+  return {
+    applied: response.applied,
+    action: normalizeRepairAction(response.action),
+    approvedPatch: response.approved_patch ?? {},
+    parsedFile: normalizeParsedFile(response.parsed_file),
+    formExplainability: normalizeFormExplainability(response.form_explainability),
+    updatedResolvedFields: (response.updated_resolved_fields ?? []).map((field) => ({
+      field: field.field,
+      status: field.status,
+      resolvedBy: field.resolved_by,
+      value: field.value,
+      candidates: field.candidates ?? [],
+      sourceRef: field.source_ref ?? {},
+      confidence: field.confidence ?? null,
+    })),
+    persistence: {
+      persisted: response.persistence.persisted,
+      generationId: response.persistence.generation_id ?? null,
+      versionId: response.persistence.version_id ?? null,
+      versionNumber: response.persistence.version_number ?? null,
+      sessionId: response.persistence.session_id ?? null,
+    },
   };
 }
 

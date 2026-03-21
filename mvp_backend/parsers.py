@@ -9,7 +9,22 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
-from models import ParsedFile, ParsedKvPair, ParsedSection, ParsedSheet, ParsedTextBlock, SourceCandidate, TargetField
+from models import (
+    FormDocumentModel,
+    FormFieldResolution,
+    LayoutLine,
+    LayoutToken,
+    OptionItem,
+    ParsedFile,
+    ParsedKvPair,
+    ParsedSection,
+    ParsedSheet,
+    ParsedTextBlock,
+    QuestionGroup,
+    ScalarFieldCandidate,
+    SourceCandidate,
+    TargetField,
+)
 
 try:
     from openpyxl import load_workbook
@@ -27,11 +42,18 @@ if str(PARSER_DIR) not in sys.path:
 
 from candidate_normalizer import build_candidate_source, build_source_candidates  # noqa: E402
 from document_parser import parse_document  # noqa: E402
+from form_layout import resolve_business_form_fields  # noqa: E402
 
 PREVIEW_ROW_LIMIT = 5
 SPARSE_ROW_RATIO_THRESHOLD = 0.35
 IMAGE_FILE_TYPES = {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'}
 logger = logging.getLogger(__name__)
+
+FORM_CRITICAL_TARGET_FIELDS = {
+    'isresidentrf',
+    'istaxresidencyonlyrf',
+    'fatcabeneficiaryoptionlist',
+}
 
 
 class ParseError(ValueError):
@@ -45,6 +67,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         'columns': [],
         'rows': [],
         'content_type': 'unknown',
+        'document_mode': 'data_table_mode',
         'extraction_status': 'unknown',
         'raw_text': '',
         'text_blocks': [],
@@ -52,6 +75,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         'kv_pairs': [],
         'source_candidates': [],
         'sheets': [],
+        'form_model': None,
         'warnings': [],
     }
 
@@ -128,6 +152,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         columns=columns,
         rows=rows[:PREVIEW_ROW_LIMIT],
         content_type=str(parsed_kwargs['content_type']),
+        document_mode=str(parsed_kwargs['document_mode'] or 'data_table_mode'),
         extraction_status=str(parsed_kwargs['extraction_status']),
         raw_text=str(parsed_kwargs['raw_text']),
         text_blocks=list(parsed_kwargs['text_blocks']),
@@ -135,14 +160,93 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         kv_pairs=list(parsed_kwargs['kv_pairs']),
         source_candidates=list(parsed_kwargs['source_candidates']),
         sheets=list(parsed_kwargs['sheets']),
+        form_model=parsed_kwargs.get('form_model'),
         warnings=warnings,
+    )
+
+
+def coerce_parsed_file(value: Any) -> ParsedFile:
+    if isinstance(value, ParsedFile):
+        return value
+    if not isinstance(value, dict):
+        raise ParseError('Parsed file payload must be an object.')
+
+    text_blocks = [
+        ParsedTextBlock(
+            id=str(block.get('id') or f'block-{index}'),
+            kind='line' if str(block.get('kind') or 'paragraph') == 'line' else 'paragraph',
+            text=str(block.get('text') or ''),
+            label=str(block.get('label')) if block.get('label') is not None else None,
+        )
+        for index, block in enumerate(value.get('text_blocks', []), start=1)
+        if isinstance(block, dict)
+    ]
+    sections = [
+        ParsedSection(title=str(section.get('title') or 'Section'), text=str(section.get('text') or ''))
+        for section in value.get('sections', [])
+        if isinstance(section, dict)
+    ]
+    kv_pairs = [
+        ParsedKvPair(
+            label=str(pair.get('label') or ''),
+            value=str(pair.get('value') or ''),
+            confidence=_safe_kv_confidence(pair.get('confidence')),
+            source_text=str(pair.get('source_text')) if pair.get('source_text') is not None else None,
+        )
+        for pair in value.get('kv_pairs', [])
+        if isinstance(pair, dict)
+    ]
+    source_candidates = [
+        SourceCandidate(
+            candidate_type=_safe_candidate_type(candidate.get('candidate_type')),
+            label=str(candidate.get('label') or ''),
+            value=candidate.get('value'),
+            sample_values=list(candidate.get('sample_values') or []),
+            source_text=str(candidate.get('source_text')) if candidate.get('source_text') is not None else None,
+            section_title=str(candidate.get('section_title')) if candidate.get('section_title') is not None else None,
+        )
+        for candidate in value.get('source_candidates', [])
+        if isinstance(candidate, dict)
+    ]
+    sheets = [
+        ParsedSheet(
+            name=str(sheet.get('name') or f'Sheet {index}'),
+            columns=[str(column) for column in sheet.get('columns', [])],
+            rows=[dict(row) for row in sheet.get('rows', []) if isinstance(row, dict)],
+        )
+        for index, sheet in enumerate(value.get('sheets', []), start=1)
+        if isinstance(sheet, dict)
+    ]
+    form_model = _build_form_model(value.get('form_model'))
+    return ParsedFile(
+        file_name=str(value.get('file_name') or 'uploaded_file'),
+        file_type=str(value.get('file_type') or 'unknown'),
+        columns=[str(column) for column in value.get('columns', [])],
+        rows=[dict(row) for row in value.get('rows', []) if isinstance(row, dict)],
+        content_type=str(value.get('content_type') or 'unknown'),
+        document_mode=str(value.get('document_mode') or 'data_table_mode'),
+        extraction_status=str(value.get('extraction_status') or 'unknown'),
+        raw_text=str(value.get('raw_text') or ''),
+        text_blocks=text_blocks,
+        sections=sections,
+        kv_pairs=kv_pairs,
+        source_candidates=source_candidates,
+        sheets=sheets,
+        form_model=form_model,
+        warnings=[str(warning) for warning in value.get('warnings', [])],
     )
 
 
 def resolve_generation_source(
     parsed_file: ParsedFile,
     selected_sheet: str | None = None,
+    target_fields: list[TargetField] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    if parsed_file.document_mode == 'form_layout_mode' and target_fields:
+        form_columns, form_rows, form_warnings = _resolve_form_layout_source(parsed_file, target_fields)
+        if form_columns and form_rows:
+            return form_columns, form_rows, form_warnings
+
     if not parsed_file.sheets:
         if parsed_file.columns or parsed_file.rows:
             return parsed_file.columns, parsed_file.rows, []
@@ -173,6 +277,145 @@ def resolve_generation_source(
     available_sheets = ', '.join(sheet.name for sheet in parsed_file.sheets)
     label = 'Worksheet' if parsed_file.file_type in {'xlsx', 'xls'} else 'Table'
     raise ParseError(f'{label} "{selected_sheet}" not found. Available: {available_sheets}')
+
+
+def preview_business_form_resolutions(
+    parsed_file: ParsedFile,
+    *,
+    target_fields: list[TargetField],
+) -> list[FormFieldResolution]:
+    if parsed_file.form_model is None:
+        return []
+    resolved_fields = resolve_business_form_fields(
+        form_model=_model_to_plain_dict(parsed_file.form_model),
+        target_fields=target_fields,
+    )
+    return [FormFieldResolution(**item) for item in resolved_fields]
+
+
+def _resolve_form_layout_source(
+    parsed_file: ParsedFile,
+    target_fields: list[TargetField],
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    if parsed_file.form_model is None:
+        return [], [], []
+
+    resolved_fields = resolve_business_form_fields(
+        form_model=_model_to_plain_dict(parsed_file.form_model),
+        target_fields=target_fields,
+    )
+    parsed_file.form_model.resolved_fields = [FormFieldResolution(**item) for item in resolved_fields]
+    parsed_file.form_model.layout_meta['requested_target_fields'] = [field.name for field in target_fields]
+    pipeline_layers = dict(parsed_file.form_model.layout_meta.get('pipeline_layers') or {})
+    pipeline_layers['business_mapping'] = {
+        'status': 'completed',
+        'requested_target_fields': [field.name for field in target_fields],
+        'resolved_field_count': sum(
+            1
+            for item in resolved_fields
+            if str(item.get('status') or '') in {'resolved', 'weak_match'} and item.get('value') is not None
+        ),
+    }
+    parsed_file.form_model.layout_meta['pipeline_layers'] = pipeline_layers
+
+    row: dict[str, Any] = {}
+    columns: list[str] = []
+    warnings: list[str] = ['Generated mapping from form-aware extraction.']
+    critical_field_states: dict[str, str] = {}
+    for item in resolved_fields:
+        field_name = str(item.get('field') or '').strip()
+        if not field_name:
+            continue
+        status = str(item.get('status') or 'not_found')
+        normalized_field_name = field_name.casefold()
+        if normalized_field_name in FORM_CRITICAL_TARGET_FIELDS:
+            critical_field_states[field_name] = status
+        value = item.get('value')
+        if status in {'resolved', 'weak_match'} and value is not None:
+            row[field_name] = value
+            columns.append(field_name)
+        elif status == 'ambiguous':
+            warnings.append(
+                f'Form field "{field_name}" is ambiguous and requires review.'
+            )
+        elif status == 'not_found':
+            warnings.append(
+                f'Form field "{field_name}" was not found in form-aware extraction.'
+            )
+
+    if columns:
+        final_source_mode = 'repair_model' if any(
+            field.resolved_by == 'repair_model' for field in parsed_file.form_model.resolved_fields
+        ) else 'form_resolver'
+        parsed_file.form_model.layout_meta['final_source_mode'] = final_source_mode
+        parsed_file.form_model.layout_meta['resolved_columns'] = list(columns)
+        parsed_file.form_model.layout_meta['critical_field_states'] = critical_field_states
+        parsed_file.form_model.layout_meta['quality_summary'] = _assess_form_quality(
+            parsed_file.form_model,
+            target_fields=target_fields,
+            resolved_fields=parsed_file.form_model.resolved_fields,
+            resolved_columns=columns,
+            final_source_mode=final_source_mode,
+        )
+        return columns, [row], _dedupe(warnings)
+
+    unresolved_critical_fields = [
+        field_name
+        for field_name, status in critical_field_states.items()
+        if status not in {'resolved', 'weak_match'}
+    ]
+    if unresolved_critical_fields:
+        parsed_file.form_model.layout_meta['final_source_mode'] = 'fallback_blocked'
+        parsed_file.form_model.layout_meta['critical_field_states'] = critical_field_states
+        parsed_file.form_model.layout_meta['fallback_blocked_for_fields'] = list(unresolved_critical_fields)
+        parsed_file.form_model.resolved_fields = [
+            field if field.field.casefold() not in {name.casefold() for name in unresolved_critical_fields}
+            else field.model_copy(update={'resolved_by': 'fallback_blocked'})
+            if hasattr(field, 'model_copy')
+            else FormFieldResolution(**{**field.model_dump(), 'resolved_by': 'fallback_blocked'})
+            for field in parsed_file.form_model.resolved_fields
+        ]
+        warnings.append(
+            'Legacy fallback was blocked for critical form fields: '
+            + ', '.join(unresolved_critical_fields)
+            + '.'
+        )
+        parsed_file.form_model.layout_meta['quality_summary'] = _assess_form_quality(
+            parsed_file.form_model,
+            target_fields=target_fields,
+            resolved_fields=parsed_file.form_model.resolved_fields,
+            resolved_columns=[],
+            final_source_mode='fallback_blocked',
+        )
+        return [], [], _dedupe(warnings)
+
+    fallback_columns, fallback_rows = build_candidate_source(
+        [_model_to_plain_dict(candidate) for candidate in parsed_file.source_candidates]
+    )
+    if fallback_columns and fallback_rows:
+        parsed_file.form_model.layout_meta['final_source_mode'] = 'legacy_fallback'
+        parsed_file.form_model.layout_meta['legacy_fallback_columns'] = list(fallback_columns)
+        parsed_file.form_model.layout_meta['critical_field_states'] = critical_field_states
+        parsed_file.form_model.layout_meta['quality_summary'] = _assess_form_quality(
+            parsed_file.form_model,
+            target_fields=target_fields,
+            resolved_fields=parsed_file.form_model.resolved_fields,
+            resolved_columns=fallback_columns,
+            final_source_mode='legacy_fallback',
+        )
+        warnings.append('Form-aware extraction did not resolve target fields; fell back to extracted field/value candidates.')
+        return fallback_columns, fallback_rows, _dedupe(warnings)
+
+    parsed_file.form_model.layout_meta['final_source_mode'] = 'form_resolver'
+    parsed_file.form_model.layout_meta['critical_field_states'] = critical_field_states
+    parsed_file.form_model.layout_meta['quality_summary'] = _assess_form_quality(
+        parsed_file.form_model,
+        target_fields=target_fields,
+        resolved_fields=parsed_file.form_model.resolved_fields,
+        resolved_columns=[],
+        final_source_mode='form_resolver',
+    )
+    return [], [], _dedupe(warnings)
 
 
 
@@ -435,6 +678,8 @@ def _parse_document(file_path: Path) -> dict[str, Any]:
             for candidate in parsed.get('source_candidates', [])
             if isinstance(candidate, dict) and str(candidate.get('label') or '').strip()
         ]
+        form_model_payload = parsed.get('form_model')
+        form_model = _build_form_model(form_model_payload)
 
         if content_type not in {'table', 'mixed'} and not rows and not kv_pairs:
             warnings.append('Document uploaded without a tabular preview. Generation will use extracted fields when available.')
@@ -487,12 +732,14 @@ def _parse_document(file_path: Path) -> dict[str, Any]:
             'warnings': warnings,
             'sheets': sheets,
             'content_type': content_type,
+            'document_mode': str(parsed.get('document_mode') or 'data_table_mode'),
             'extraction_status': extraction_status,
             'raw_text': str(parsed.get('text') or ''),
             'text_blocks': text_blocks,
             'sections': sections,
             'kv_pairs': kv_pairs,
             'source_candidates': source_candidates,
+            'form_model': form_model,
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception('document parser failed: file=%s error=%s', file_path.name, exc)
@@ -523,12 +770,186 @@ def _filter_sparse_rows(columns: list[str], rows: list[dict[str, Any]]) -> list[
 
 def _model_to_plain_dict(value: Any) -> dict[str, Any]:
     if hasattr(value, 'model_dump'):
-        return value.model_dump()
+        return _to_plain_jsonish(value.model_dump())
     if hasattr(value, 'dict'):
-        return value.dict()
+        return _to_plain_jsonish(value.dict())
     if isinstance(value, dict):
-        return value
+        return _to_plain_jsonish(value)
     raise TypeError(f'Unsupported parsed model type: {type(value)!r}')
+
+
+def _to_plain_jsonish(value: Any) -> Any:
+    if hasattr(value, 'model_dump'):
+        return _to_plain_jsonish(value.model_dump())
+    if hasattr(value, 'dict'):
+        return _to_plain_jsonish(value.dict())
+    if isinstance(value, dict):
+        return {str(key): _to_plain_jsonish(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_plain_jsonish(item) for item in value]
+    return value
+
+
+def _build_form_model(value: Any) -> FormDocumentModel | None:
+    if hasattr(value, 'model_dump'):
+        value = value.model_dump()
+    elif hasattr(value, 'dict'):
+        value = value.dict()
+    if not isinstance(value, dict):
+        return None
+
+    layout_lines = []
+    for line in value.get('layout_lines', []):
+        if hasattr(line, 'model_dump'):
+            line = line.model_dump()
+        elif hasattr(line, 'dict'):
+            line = line.dict()
+        if not isinstance(line, dict):
+            continue
+        tokens = []
+        for token in line.get('tokens', []):
+            if hasattr(token, 'model_dump'):
+                token = token.model_dump()
+            elif hasattr(token, 'dict'):
+                token = token.dict()
+            if isinstance(token, dict):
+                tokens.append(LayoutToken(**token))
+        layout_lines.append(LayoutLine(**{**line, 'tokens': tokens}))
+
+    scalars = []
+    for item in value.get('scalars', []):
+        if hasattr(item, 'model_dump'):
+            item = item.model_dump()
+        elif hasattr(item, 'dict'):
+            item = item.dict()
+        if isinstance(item, dict):
+            scalars.append(ScalarFieldCandidate(**item))
+    groups = []
+    for item in value.get('groups', []):
+        if hasattr(item, 'model_dump'):
+            item = item.model_dump()
+        elif hasattr(item, 'dict'):
+            item = item.dict()
+        if not isinstance(item, dict):
+            continue
+        options = []
+        for option in item.get('options', []):
+            if hasattr(option, 'model_dump'):
+                option = option.model_dump()
+            elif hasattr(option, 'dict'):
+                option = option.dict()
+            if isinstance(option, dict):
+                options.append(OptionItem(**option))
+        groups.append(QuestionGroup(**{**item, 'options': options}))
+    resolved_fields = []
+    for item in value.get('resolved_fields', []):
+        if hasattr(item, 'model_dump'):
+            item = item.model_dump()
+        elif hasattr(item, 'dict'):
+            item = item.dict()
+        if isinstance(item, dict):
+            resolved_fields.append(FormFieldResolution(**item))
+
+    return FormDocumentModel(
+        scalars=scalars,
+        groups=groups,
+        section_hierarchy=[dict(item) for item in value.get('section_hierarchy', []) if isinstance(item, dict)],
+        layout_lines=layout_lines,
+        layout_meta=dict(value.get('layout_meta') or {}),
+        resolved_fields=resolved_fields,
+    )
+
+
+def _assess_form_quality(
+    form_model: FormDocumentModel,
+    *,
+    target_fields: list[TargetField],
+    resolved_fields: list[FormFieldResolution],
+    resolved_columns: list[str],
+    final_source_mode: str,
+) -> dict[str, Any]:
+    critical_field_states = dict(form_model.layout_meta.get('critical_field_states') or {})
+    ambiguous_fields = [field.field for field in resolved_fields if field.status == 'ambiguous']
+    unresolved_fields = [field.field for field in resolved_fields if field.status == 'not_found']
+    repair_fields = [field.field for field in resolved_fields if field.resolved_by == 'repair_model']
+    blocked_fields = [field.field for field in resolved_fields if field.resolved_by == 'fallback_blocked']
+    unresolved_critical_fields = [
+        field_name
+        for field_name, status in critical_field_states.items()
+        if status not in {'resolved', 'weak_match'}
+    ]
+    multiple_selected_single_choice_groups = [
+        group.group_id
+        for group in form_model.groups
+        if group.group_type == 'single_choice' and sum(1 for option in group.options if option.selected) > 1
+    ]
+
+    red_flags: list[dict[str, Any]] = []
+    if unresolved_critical_fields:
+        red_flags.append(
+            {
+                'code': 'critical_unresolved',
+                'message': 'Critical form fields were not reliably extracted.',
+                'fields': unresolved_critical_fields,
+            }
+        )
+    if ambiguous_fields:
+        red_flags.append(
+            {
+                'code': 'ambiguous_fields',
+                'message': 'Some form fields remain ambiguous.',
+                'fields': ambiguous_fields,
+            }
+        )
+    if multiple_selected_single_choice_groups:
+        red_flags.append(
+            {
+                'code': 'single_choice_multi_select',
+                'message': 'Single-choice groups contain multiple selected options.',
+                'groups': multiple_selected_single_choice_groups,
+            }
+        )
+    if final_source_mode == 'legacy_fallback':
+        red_flags.append(
+            {
+                'code': 'legacy_fallback_used',
+                'message': 'Legacy extracted candidates were used because form-aware extraction was incomplete.',
+                'fields': list(resolved_columns),
+            }
+        )
+    if not resolved_columns and target_fields:
+        red_flags.append(
+            {
+                'code': 'empty_normalized_row',
+                'message': 'Form-aware extraction produced an empty normalized row.',
+            }
+        )
+    if target_fields and len(resolved_columns) <= max(len(target_fields) // 3, 1) and len(target_fields) >= 3:
+        red_flags.append(
+            {
+                'code': 'low_field_coverage',
+                'message': 'Only a small fraction of requested target fields was extracted.',
+                'resolved_field_count': len(resolved_columns),
+                'target_field_count': len(target_fields),
+            }
+        )
+
+    return {
+        'needs_attention': bool(red_flags),
+        'repair_recommended': bool(red_flags) and final_source_mode != 'repair_model',
+        'resolved_field_count': len(resolved_columns),
+        'target_field_count': len(target_fields),
+        'scalar_candidate_count': len(form_model.scalars),
+        'group_count': len(form_model.groups),
+        'layout_line_count': len(form_model.layout_lines),
+        'ambiguous_fields': ambiguous_fields,
+        'unresolved_fields': unresolved_fields,
+        'unresolved_critical_fields': unresolved_critical_fields,
+        'repair_fields': repair_fields,
+        'blocked_fields': blocked_fields,
+        'multiple_selected_single_choice_groups': multiple_selected_single_choice_groups,
+        'red_flags': red_flags,
+    }
 
 
 def _safe_candidate_type(value: Any) -> str:
@@ -543,6 +964,17 @@ def _safe_kv_confidence(value: Any) -> str:
     if confidence in {'high', 'medium', 'low'}:
         return confidence
     return 'medium'
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _extraction_status_message(parsed_file: ParsedFile) -> str:

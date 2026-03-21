@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN apt-get -o Acquire::Retries=3 -o Acquire::ForceIPv4=true update \
     && apt-get install -y --no-install-recommends ca-certificates nodejs npm \
     && npm install -g typescript@5.9.3 \
     && rm -rf /var/lib/apt/lists/*

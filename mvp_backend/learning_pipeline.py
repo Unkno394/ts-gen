@@ -845,7 +845,11 @@ def _is_strong_deterministic_mapping(mapping: FieldMapping) -> bool:
 def _clone_mapping(mapping: FieldMapping, **changes: object) -> FieldMapping:
     if hasattr(mapping, 'model_copy'):
         return mapping.model_copy(update=changes)
-    return mapping.copy(update=changes)
+    if hasattr(mapping, 'copy'):
+        return mapping.copy(update=changes)
+    payload = mapping.model_dump() if hasattr(mapping, 'model_dump') else mapping.dict()
+    payload.update(changes)
+    return FieldMapping(**payload)
 
 
 def _score_to_confidence(score: float) -> str:

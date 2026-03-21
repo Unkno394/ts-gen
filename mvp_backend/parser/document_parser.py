@@ -6,6 +6,7 @@ from typing import Any
 from candidate_normalizer import build_source_candidates
 from document_classifier import classify_document
 from docx_parser import parse_docx
+from form_layout import extract_layout_layer, understand_generic_form
 from form_parser import extract_kv_pairs
 from pdf_parser import parse_pdf
 from text_parser import extract_sections, extract_text_facts, normalize_text, split_text_blocks
@@ -97,6 +98,7 @@ def _parse_image_like_file(path: Path) -> dict[str, Any]:
 def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]) -> dict[str, Any]:
     tables = [table for table in base_result.get('tables', []) if isinstance(table, dict)]
     raw_text = normalize_text(base_result.get('text', ''))
+    layout_blocks = [dict(block) for block in base_result.get('blocks', []) if isinstance(block, dict)]
     text_blocks = split_text_blocks(raw_text)
     sections = extract_sections(raw_text)
     kv_pairs = extract_kv_pairs(raw_text)
@@ -108,6 +110,26 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         text_facts=text_facts,
         sections=sections,
     )
+    layout_layer = extract_layout_layer(
+        file_path=path,
+        file_type=ext,
+        raw_text=raw_text,
+        tables=tables,
+        kv_pairs=kv_pairs,
+        text_blocks=text_blocks,
+        sections=sections,
+        layout_blocks=layout_blocks,
+    )
+    form_model = understand_generic_form(
+        layout_layer=layout_layer,
+        tables=tables,
+        kv_pairs=kv_pairs,
+    )
+    document_mode = 'data_table_mode'
+    if isinstance(form_model, dict):
+        layout_meta = form_model.get('layout_meta')
+        if isinstance(layout_meta, dict) and layout_meta.get('document_mode') == 'form_layout_mode':
+            document_mode = 'form_layout_mode'
 
     warnings = [str(warning) for warning in base_result.get('warnings', [])]
     extraction_status = classification['extraction_status']
@@ -122,6 +144,8 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         warnings.append(f'Detected {len(kv_pairs)} extracted field(s) from a semi-structured document.')
     elif classification['content_type'] == 'text' and raw_text:
         warnings.append('Detected text document with extracted text blocks.')
+    if document_mode == 'form_layout_mode':
+        warnings.append('Detected form-like layout document. Form-aware extraction is enabled.')
 
     deduped_warnings: list[str] = []
     seen_warnings: set[str] = set()
@@ -146,6 +170,8 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         'kv_pairs': kv_pairs,
         'text_facts': text_facts,
         'source_candidates': source_candidates,
+        'document_mode': document_mode,
+        'form_model': form_model,
         'warnings': deduped_warnings,
     }
 

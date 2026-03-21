@@ -26,11 +26,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
 import type { WorkBook } from 'xlsx';
 import {
+  applyRepairFromBackend,
   changeEmailWithCode,
   changeEmailWithPassword,
   changePasswordWithBackend,
   confirmGenerationLearning,
   deleteHistoryEntry,
+  fetchRepairPreviewFromBackend,
   fetchLearningEvents,
   fetchLearningMemory,
   fetchSourcePreviewFromBackend,
@@ -44,6 +46,7 @@ import {
 } from '../lib/api';
 import type {
   DraftFieldSuggestion,
+  FormRepairAction,
   GenerationResult,
   HistoryItem,
   LearningEvent,
@@ -53,6 +56,7 @@ import type {
   MappingInfo,
   ParsedFileInfo,
   ParsedSheetInfo,
+  RepairPreviewResult,
   UserProfile,
   ValidationDiagnostic,
 } from '../types';
@@ -450,6 +454,24 @@ function buildSchemaFromDraftSuggestions(suggestions: DraftFieldSuggestion[]): s
   return JSON.stringify(payload, null, 2);
 }
 
+function buildRepairActionKey(action: FormRepairAction): string {
+  return [action.kind, action.targetField ?? '', action.groupId ?? '', action.chunkRefs.lineIds.join('|')].join('::');
+}
+
+function repairActionLabel(action: FormRepairAction): string {
+  if (action.targetField) {
+    return action.targetField;
+  }
+  if (action.groupId) {
+    return action.groupId;
+  }
+  return action.kind;
+}
+
+function repairActionChunkCount(action: FormRepairAction): number {
+  return new Set([...action.chunkRefs.groupIds, ...action.chunkRefs.scalarLabels, ...action.chunkRefs.lineIds]).size;
+}
+
 function mappingStatusLabel(mapping: MappingInfo): string {
   if (mapping.status === 'rejected') {
     return 'Отклонено';
@@ -830,11 +852,21 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [generationConfirmed, setGenerationConfirmed] = useState(false);
   const [mappingReviewNotes, setMappingReviewNotes] = useState<Record<string, string>>({});
   const [draftReviewNotes, setDraftReviewNotes] = useState<Record<string, string>>({});
+  const [repairBusy, setRepairBusy] = useState(false);
+  const [repairNotice, setRepairNotice] = useState('');
+  const [repairError, setRepairError] = useState('');
+  const [activeRepairActionKey, setActiveRepairActionKey] = useState<string | null>(null);
+  const [repairPreview, setRepairPreview] = useState<RepairPreviewResult | null>(null);
   const [sectionStateCache, setSectionStateCache] = useState<Record<string, SectionWorkspaceState>>({});
   const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
+  const currentFormExplainability = result.formExplainability ?? null;
+  const currentRepairPlan = currentFormExplainability?.repairPlan ?? null;
+  const currentRepairActions = currentRepairPlan?.actions ?? [];
+  const currentFormQuality = currentFormExplainability?.qualitySummary ?? null;
+  const currentFormRedFlags = currentFormQuality?.redFlags ?? [];
 
   const refreshLearningData = async () => {
     if (profile.skipped) {
@@ -1195,10 +1227,12 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
           learningReviewError,
           draftJsonNotice,
           learningReviewNotice,
+          repairNotice,
+          repairError,
         ].filter(Boolean)
       )
     );
-  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, result.warnings, saveMessage]);
+  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, repairError, repairNotice, result.warnings, saveMessage]);
 
   const visibleTsDiagnostics = useMemo(() => result.tsDiagnostics ?? [], [result.tsDiagnostics]);
   const visiblePreviewDiagnostics = useMemo(() => result.previewDiagnostics ?? [], [result.previewDiagnostics]);
@@ -1300,6 +1334,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       preview: item.preview,
       warnings: item.warnings,
       parsedFile: item.parsedFile ?? null,
+      formExplainability: item.formExplainability ?? null,
       targetSchema: item.validation?.targetSchema ?? null,
       requiredFields: item.validation?.targetSchemaSummary?.requiredFields ?? [],
       tsValid: item.validation?.tsValidation?.valid ?? false,
@@ -1332,6 +1367,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftJsonNotice('');
     setDraftJsonError('');
     setDraftJsonSaved(false);
+    setRepairNotice('');
+    setRepairError('');
+    setActiveRepairActionKey(null);
+    setRepairPreview(null);
     setLearningReviewNotice('');
     setLearningReviewError('');
     setGenerationConfirmed(true);
@@ -1614,6 +1653,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftJsonNotice('');
     setDraftJsonError('');
     setDraftJsonSaved(false);
+    setRepairNotice('');
+    setRepairError('');
+    setActiveRepairActionKey(null);
+    setRepairPreview(null);
     setLearningReviewNotice('');
     setLearningReviewError('');
     setGenerationConfirmed(false);
@@ -1698,6 +1741,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setDraftReviewNotes({});
       setDraftJsonNotice('');
       setDraftJsonError('');
+      setRepairNotice('');
+      setRepairError('');
+      setActiveRepairActionKey(null);
+      setRepairPreview(null);
       setLearningReviewNotice('');
       setLearningReviewError('');
       return;
@@ -1724,6 +1771,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftReviewNotes({ ...nextState.draftReviewNotes });
     setDraftJsonNotice('');
     setDraftJsonError('');
+    setRepairNotice('');
+    setRepairError('');
+    setActiveRepairActionKey(null);
+    setRepairPreview(null);
     setLearningReviewNotice('');
     setLearningReviewError('');
   };
@@ -1781,6 +1832,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftJsonNotice('');
     setDraftJsonError('');
     setDraftJsonSaved(false);
+    setRepairNotice('');
+    setRepairError('');
+    setActiveRepairActionKey(null);
+    setRepairPreview(null);
     setLearningReviewNotice('');
     setLearningReviewError('');
     setGenerationConfirmed(false);
@@ -1844,6 +1899,130 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setCorrectionBaseline(null);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const onPreviewRepair = async (action: FormRepairAction) => {
+    const currentParsed = result.parsedFile ?? parsedFile;
+    if (!currentParsed) {
+      setRepairError('Сначала постройте генерацию для формы.');
+      return;
+    }
+
+    const actionKey = buildRepairActionKey(action);
+    setRepairBusy(true);
+    setRepairError('');
+    setRepairNotice('');
+    setActiveRepairActionKey(actionKey);
+
+    try {
+      const preview = await fetchRepairPreviewFromBackend({
+        parsedFile: currentParsed,
+        action,
+        targetJson: schema,
+      });
+      setRepairPreview(preview);
+      if (preview.previewStatus === 'patch_available') {
+        setRepairNotice(`Готов repair preview для "${repairActionLabel(action)}".`);
+      } else if (preview.previewStatus === 'inspection_only') {
+        setRepairNotice(`Для "${repairActionLabel(action)}" собраны локальные chunks без готового patch.`);
+      } else if (preview.previewStatus === 'ambiguous') {
+        setRepairNotice(`Preview для "${repairActionLabel(action)}" остаётся ambiguous.`);
+      } else {
+        setRepairNotice(`Для "${repairActionLabel(action)}" repair patch не собран.`);
+      }
+    } catch (error) {
+      setRepairPreview(null);
+      setRepairError(error instanceof Error ? error.message : 'Не удалось получить repair preview.');
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
+  const onApplyRepair = async () => {
+    const currentParsed = result.parsedFile ?? parsedFile;
+    if (!currentParsed || !repairPreview) {
+      setRepairError('Сначала запросите repair preview.');
+      return;
+    }
+    if (Object.keys(repairPreview.proposedPatch ?? {}).length === 0) {
+      setRepairError('В repair preview нет patch для применения.');
+      return;
+    }
+
+    const numericGenerationId =
+      !profile.skipped && typeof result.generationId === 'string' && Number.isFinite(Number(result.generationId))
+        ? Number(result.generationId)
+        : !profile.skipped && typeof result.generationId === 'number'
+          ? result.generationId
+          : null;
+
+    setRepairBusy(true);
+    setRepairError('');
+    setRepairNotice('');
+
+    try {
+      const applied = await applyRepairFromBackend({
+        parsedFile: currentParsed,
+        action: repairPreview.action,
+        approvedPatch: repairPreview.proposedPatch,
+        targetJson: schema,
+        generationId: numericGenerationId,
+        notes: 'Applied from frontend repair flow.',
+        metadata: {
+          source: 'workspace_repair_apply',
+          action_kind: repairPreview.action.kind,
+          target_field: repairPreview.action.targetField ?? null,
+          file_name: currentParsed.fileName,
+        },
+      });
+
+      const nextResult: GenerationResult = {
+        ...result,
+        parsedFile: applied.parsedFile,
+        formExplainability: applied.formExplainability ?? result.formExplainability ?? null,
+      };
+      setParsedFile(applied.parsedFile);
+      setResult(nextResult);
+      setRepairPreview((current) =>
+        current
+          ? {
+              ...current,
+              proposedPatch: applied.approvedPatch,
+              proposedResolutions: applied.updatedResolvedFields,
+              formExplainability: applied.formExplainability ?? current.formExplainability ?? null,
+            }
+          : current
+      );
+      setSectionStateCache((current) => ({
+        ...current,
+        [currentSectionKey]: buildSectionWorkspaceState({
+          schema,
+          result: nextResult,
+          draftSuggestions,
+          draftJsonSaved,
+          generationConfirmed,
+          correctionBaseline,
+          mappingReviewNotes,
+          draftReviewNotes,
+        }),
+      }));
+
+      if (applied.persistence.persisted && !profile.skipped) {
+        await onSaveHistory();
+        await refreshLearningSummary();
+        setRepairNotice(
+          applied.persistence.versionNumber
+            ? `Repair patch применён и сохранён как версия ${applied.persistence.versionNumber}.`
+            : 'Repair patch применён и сохранён в истории.'
+        );
+      } else {
+        setRepairNotice('Repair patch применён локально к extraction state.');
+      }
+    } catch (error) {
+      setRepairError(error instanceof Error ? error.message : 'Не удалось применить repair patch.');
+    } finally {
+      setRepairBusy(false);
     }
   };
 
@@ -2731,6 +2910,113 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   <p className="subtle-text mapping-editor-note">
                     Readiness показывает полноту и объём ручной проверки в runtime. Accuracy-метрики считаются отдельно оффлайн на benchmark-наборах.
                   </p>
+                  {currentFormExplainability && (
+                    <div className="generation-diagnostics-stack">
+                      <div className="generation-diagnostics-group">
+                        <strong>Form extraction</strong>
+                        <div className="generation-diagnostics-list">
+                          <div className="generation-diagnostic-item">
+                            <span>
+                              {currentFormExplainability.documentMode} → {currentFormExplainability.finalSourceMode ?? 'unknown'}
+                            </span>
+                            <small>
+                              scalar: {currentFormExplainability.scalarCount}, groups: {currentFormExplainability.groupCount}, sections:{' '}
+                              {currentFormExplainability.sectionCount}, layout lines: {currentFormExplainability.layoutLineCount}
+                            </small>
+                          </div>
+                          <div className="generation-diagnostic-item">
+                            <span>
+                              resolved {currentFormQuality?.resolvedFieldCount ?? 0}/{currentFormQuality?.targetFieldCount ?? 0}
+                            </span>
+                            <small>
+                              ambiguous: {(currentFormQuality?.ambiguousFields ?? []).join(', ') || 'none'} · critical unresolved:{' '}
+                              {(currentFormQuality?.unresolvedCriticalFields ?? []).join(', ') || 'none'}
+                            </small>
+                          </div>
+                        </div>
+                      </div>
+                      {currentFormRedFlags.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>Red flags</strong>
+                          <div className="warning-list">
+                            {currentFormRedFlags.map((flag) => (
+                              <div className="warning-item" key={flag.code}>
+                                <strong>{flag.code}</strong>
+                                <div>{flag.message ?? 'Нужно проверить form extraction.'}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {currentRepairPlan && currentRepairActions.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>Режим «Переделать»</strong>
+                          <div className="review-queue-list">
+                            {currentRepairActions.map((action) => {
+                              const actionKey = buildRepairActionKey(action);
+                              const isActive = activeRepairActionKey === actionKey;
+                              const isPreviewForAction =
+                                isActive && repairPreview !== null && buildRepairActionKey(repairPreview.action) === actionKey;
+                              return (
+                                <div className="review-queue-item" key={actionKey}>
+                                  <strong>{repairActionLabel(action)}</strong>
+                                  <span>
+                                    {action.reason} · {action.priority} priority · {repairActionChunkCount(action)} chunk(s)
+                                  </span>
+                                  <div className="mapping-decision-row">
+                                    <button className="secondary-btn" disabled={repairBusy} onClick={() => void onPreviewRepair(action)} type="button">
+                                      {repairBusy && isActive ? 'Собираем preview...' : 'Предпросмотр'}
+                                    </button>
+                                    {isPreviewForAction && repairPreview.previewStatus === 'patch_available' && (
+                                      <button className="primary-btn" disabled={repairBusy} onClick={() => void onApplyRepair()} type="button">
+                                        {repairBusy ? 'Применяем...' : 'Применить'}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {isPreviewForAction && (
+                                    <div className="generation-diagnostics-stack">
+                                      <div className="generation-diagnostic-item">
+                                        <span>{repairPreview.previewStatus}</span>
+                                        <small>
+                                          local chunks: groups {repairPreview.localChunks.groups.length}, scalars {repairPreview.localChunks.scalars.length},
+                                          lines {repairPreview.localChunks.lines.length}
+                                        </small>
+                                      </div>
+                                      {repairPreview.proposedResolutions.length > 0 && (
+                                        <div className="generation-diagnostic-item">
+                                          <span>Proposed resolutions</span>
+                                          <small>
+                                            {repairPreview.proposedResolutions
+                                              .map((item) => `${item.field}: ${item.status} via ${item.resolvedBy}`)
+                                              .join(' · ')}
+                                          </small>
+                                        </div>
+                                      )}
+                                      {Object.keys(repairPreview.proposedPatch ?? {}).length > 0 && (
+                                        <pre className="preview-pane source-text-pane">{JSON.stringify(repairPreview.proposedPatch, null, 2)}</pre>
+                                      )}
+                                      {repairPreview.warnings.length > 0 && (
+                                        <div className="warning-list">
+                                          {repairPreview.warnings.map((warning, index) => (
+                                            <div className="warning-item" key={`${actionKey}-warning-${index}`}>
+                                              {warning}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <p className="subtle-text mapping-editor-note">
+                            Repair работает по локальным chunks из form layout, а не по полному документу. Сначала preview, потом apply.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {(visibleTsDiagnostics.length > 0 || visiblePreviewDiagnostics.length > 0) && (
                     <div className="generation-diagnostics-stack">
                       {visibleTsDiagnostics.length > 0 && (

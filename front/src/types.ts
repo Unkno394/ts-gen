@@ -13,6 +13,7 @@ export type HistoryItem = {
   fileName: string;
   selectedSheet?: string | null;
   parsedFile?: ParsedFileInfo | null;
+  formExplainability?: FormExplainability | null;
   schema: string;
   code: string;
   mappings: MappingInfo[];
@@ -27,6 +28,7 @@ export type ParsedFileInfo = {
   columns: string[];
   rows: Record<string, unknown>[];
   contentType: 'table' | 'form' | 'text' | 'image_like' | 'mixed' | 'unknown';
+  documentMode?: 'data_table_mode' | 'form_layout_mode';
   extractionStatus: string;
   rawText: string;
   textBlocks: ParsedTextBlockInfo[];
@@ -34,7 +36,117 @@ export type ParsedFileInfo = {
   kvPairs: ParsedKvPairInfo[];
   sourceCandidates: SourceCandidateInfo[];
   sheets: ParsedSheetInfo[];
+  formModel?: {
+    scalars: Record<string, unknown>[];
+    groups: Record<string, unknown>[];
+    sectionHierarchy: Record<string, unknown>[];
+    layoutLines: Record<string, unknown>[];
+    layoutMeta: Record<string, unknown>;
+    resolvedFields: Record<string, unknown>[];
+  } | null;
   warnings: string[];
+};
+
+export type FormRepairAction = {
+  kind: string;
+  priority: 'high' | 'medium' | 'low';
+  reason: string;
+  targetField?: string;
+  groupId?: string;
+  fields?: string[];
+  llmScope?: string;
+  chunkRefs: {
+    groupIds: string[];
+    scalarLabels: string[];
+    lineIds: string[];
+  };
+};
+
+export type FormRepairPlan = {
+  recommended: boolean;
+  triggerStage: 'generic_form_understanding' | 'business_mapping';
+  strategy: string;
+  llmPolicy: string;
+  requestedTargetFields: string[];
+  redFlagCodes: string[];
+  actions: FormRepairAction[];
+  targetedChunkCount: number;
+};
+
+export type FormExplainability = {
+  documentMode: string;
+  finalSourceMode?: string | null;
+  layoutMeta: Record<string, unknown>;
+  qualitySummary: {
+    needsAttention?: boolean;
+    repairRecommended?: boolean;
+    resolvedFieldCount?: number;
+    targetFieldCount?: number;
+    ambiguousFields?: string[];
+    unresolvedFields?: string[];
+    unresolvedCriticalFields?: string[];
+    repairFields?: string[];
+    blockedFields?: string[];
+    multipleSelectedSingleChoiceGroups?: string[];
+    redFlags?: Array<{
+      code: string;
+      message?: string;
+      fields?: string[];
+      groups?: string[];
+      resolvedFieldCount?: number;
+      targetFieldCount?: number;
+    }>;
+  };
+  repairPlan: FormRepairPlan;
+  resolvedFields: Array<{
+    field: string;
+    status: 'resolved' | 'weak_match' | 'ambiguous' | 'not_found';
+    resolvedBy: 'form_resolver' | 'repair_model' | 'repair_apply' | 'legacy_fallback' | 'fallback_blocked' | 'unresolved';
+    value?: unknown;
+    candidates?: unknown[];
+    sourceRef?: Record<string, unknown>;
+    confidence?: number | null;
+  }>;
+  scalarCount: number;
+  groupCount: number;
+  sectionCount: number;
+  layoutLineCount: number;
+  repairFields: string[];
+};
+
+export type RepairPreviewResult = {
+  supported: boolean;
+  previewStatus: 'patch_available' | 'inspection_only' | 'ambiguous' | 'no_patch';
+  action: FormRepairAction;
+  targetFields: Array<{
+    name: string;
+    type: string;
+  }>;
+  localChunks: {
+    groups: Record<string, unknown>[];
+    scalars: Record<string, unknown>[];
+    lines: Record<string, unknown>[];
+  };
+  proposedResolutions: FormExplainability['resolvedFields'];
+  proposedPatch: Record<string, unknown>;
+  formExplainability?: FormExplainability | null;
+  warnings: string[];
+};
+
+export type RepairApplyResult = {
+  applied: boolean;
+  action: FormRepairAction;
+  approvedPatch: Record<string, unknown>;
+  parsedFile: ParsedFileInfo;
+  formExplainability?: FormExplainability | null;
+  updatedResolvedFields: FormExplainability['resolvedFields'];
+  persistence: {
+    persisted: boolean;
+    generationId?: number | string | null;
+    versionId?: number | null;
+    versionNumber?: number | null;
+    sessionId?: number | null;
+  };
 };
 
 export type ParsedSheetInfo = {
@@ -86,6 +198,7 @@ export type GenerationResult = {
   generationId?: string | null;
   schemaFingerprintId?: number | null;
   parsedFile?: ParsedFileInfo | null;
+  formExplainability?: FormExplainability | null;
   code: string;
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
@@ -173,6 +286,7 @@ export type DraftFieldSuggestion = {
 export type DraftJsonResult = {
   schemaFingerprintId?: number | null;
   parsedFile?: ParsedFileInfo | null;
+  formExplainability?: FormExplainability | null;
   draftJson: Record<string, unknown>;
   fieldSuggestions: DraftFieldSuggestion[];
   warnings: string[];

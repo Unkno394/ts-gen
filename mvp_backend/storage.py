@@ -5158,6 +5158,128 @@ def save_correction_session(
     }
 
 
+def apply_generation_repair_patch(
+    *,
+    user_id: str,
+    generation_id: int,
+    parsed_file_json: str | dict[str, Any],
+    approved_patch: dict[str, Any],
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    db = get_db()
+    internal_user_id = ensure_user_record(external_id=user_id)
+    context = _load_generation_learning_context(db, generation_id)
+    if context is None:
+        raise ValueError(f'Generation не найдена: {generation_id}')
+    if int(context['internal_user_id']) != internal_user_id:
+        raise ValueError('Generation не найдена или недоступна пользователю.')
+
+    parsed_payload = _ensure_json_value(parsed_file_json, _build_fallback_parsed_file('generation', 'unknown'))
+    if not isinstance(parsed_payload, dict):
+        raise ValueError('Некорректный parsed_file для repair apply.')
+
+    resolved_schema_fingerprint_id = context.get('schema_fingerprint_id')
+    normalized_patch = {
+        str(key).strip(): value
+        for key, value in (approved_patch or {}).items()
+        if str(key).strip()
+    }
+    if not normalized_patch:
+        raise ValueError('Repair apply требует непустой approved_patch.')
+
+    source_columns, source_rows, source_warnings = _resolve_generation_source_payload(
+        parsed_payload,
+        context['selected_sheet'],
+    )
+    canonical_mapping_payload = _load_generation_canonical_mappings(
+        db=db,
+        generation_id=generation_id,
+        fallback_mappings_json=str(context['mappings_json'] or '[]'),
+    )
+    canonical_mappings = [FieldMapping(**mapping) for mapping in canonical_mapping_payload]
+    target_fields, target_payload, target_schema, target_schema_summary = _build_runtime_target_schema_payload(
+        str(context['target_json'] or '{}')
+    )
+    generated_typescript = generate_typescript(target_fields, canonical_mappings)
+    preview = build_preview(source_rows, target_fields, canonical_mappings)
+    ts_validation = compile_typescript_code(generated_typescript)
+    preview_validation = validate_preview_against_target_schema(preview, target_schema)
+    mapping_explainability = _build_mapping_explainability_from_payload(
+        canonical_mapping_payload,
+        schema_fingerprint_id=resolved_schema_fingerprint_id,
+    )
+    quality_summary = {
+        'operational_mapping_status': assess_mapping_operational_status(
+            mapping_explainability['mapping_stats'],
+            target_field_count=len(target_fields),
+        ),
+        'true_quality_metrics': None,
+        'ts_syntax_valid': bool(ts_validation['valid']),
+        'ts_runtime_preview_valid': bool(preview_validation['runtime_valid']),
+        'output_schema_valid': bool(preview_validation['schema_valid']),
+    }
+    warnings = _dedupe_values(
+        [str(item) for item in parsed_payload.get('warnings', []) or []]
+        + source_warnings
+        + _build_mapping_warnings_from_payload(canonical_mapping_payload)
+    )
+    validation_payload = {
+        'target_schema': target_schema,
+        'target_schema_summary': target_schema_summary,
+        'ts_validation': ts_validation,
+        'preview_validation': preview_validation,
+        'mapping_explainability': mapping_explainability,
+        'quality_summary': quality_summary,
+    }
+
+    correction_result = save_correction_session(
+        user_id=user_id,
+        generation_id=generation_id,
+        schema_fingerprint_id=resolved_schema_fingerprint_id,
+        session_type='post_generation_fix',
+        notes=notes,
+        metadata=_merge_json_objects(metadata, {'source': 'repair_apply', 'approved_patch': normalized_patch}),
+        corrections=[
+            {
+                'correction_type': 'value_fix',
+                'field_path': field_name,
+                'target_field': field_name,
+                'corrected_value': corrected_value,
+                'correction_payload': {'source': 'repair_apply'},
+                'accepted': True,
+            }
+            for field_name, corrected_value in normalized_patch.items()
+        ],
+    )
+
+    version_info = _append_generation_state_version(
+        db=db,
+        generation_id=generation_id,
+        parent_version_id=int(context['version_id']) if context['version_id'] is not None else None,
+        parent_version_number=int(context['version_number']) if context['version_number'] is not None else None,
+        note=notes or 'Applied reviewed repair patch',
+        target_json=str(context['target_json'] or _ensure_json_text(target_payload, {})),
+        generated_typescript=generated_typescript,
+        file_name=str(context['file_name'] or 'generation'),
+        file_path=str(context['file_path']) if context.get('file_path') else None,
+        file_type=str(context['file_type'] or 'unknown'),
+        selected_sheet=context['selected_sheet'],
+        parsed_file_json=_ensure_json_text(parsed_payload, {}),
+        mappings_json=_ensure_json_text(canonical_mapping_payload, []),
+        preview_json=_ensure_json_text(preview, []),
+        warnings_json=_ensure_json_text(warnings, []),
+        validation_json=_ensure_json_text(validation_payload, {}),
+    )
+    return {
+        'generation_id': generation_id,
+        'schema_fingerprint_id': resolved_schema_fingerprint_id,
+        'session_id': correction_result.get('session_id'),
+        'approved_patch': normalized_patch,
+        **version_info,
+    }
+
+
 def cleanup_expired_guest_files() -> None:
     ensure_dirs()
     now = time.time()

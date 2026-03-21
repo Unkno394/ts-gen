@@ -39,12 +39,93 @@ class SourceCandidate(BaseModel):
     section_title: str | None = None
 
 
+class LayoutToken(BaseModel):
+    text: str
+    page: int | None = None
+    block_id: str | None = None
+    line_id: str | None = None
+    column_id: int | None = None
+    x: float | None = None
+    y: float | None = None
+    width: float | None = None
+    height: float | None = None
+    table_idx: int | None = None
+    row_idx: int | None = None
+    cell_idx: int | None = None
+    paragraph_idx: int | None = None
+    font_bold: bool | None = None
+    font_size: float | None = None
+    source_type: Literal['paragraph', 'table_cell', 'line'] = 'line'
+
+
+class LayoutLine(BaseModel):
+    text: str
+    page: int | None = None
+    block_id: str | None = None
+    line_id: str | None = None
+    column_id: int | None = None
+    x: float | None = None
+    y: float | None = None
+    width: float | None = None
+    height: float | None = None
+    table_idx: int | None = None
+    row_idx: int | None = None
+    cell_idx: int | None = None
+    paragraph_idx: int | None = None
+    font_bold: bool | None = None
+    font_size: float | None = None
+    source_type: Literal['paragraph', 'table_cell', 'line'] = 'line'
+    tokens: list[LayoutToken] = Field(default_factory=list)
+
+
+class ScalarFieldCandidate(BaseModel):
+    label: str
+    value: Any
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+    confidence: Literal['high', 'medium', 'low'] = 'medium'
+
+
+class OptionItem(BaseModel):
+    label: str
+    selected: bool = False
+    marker_text: str | None = None
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+
+
+class QuestionGroup(BaseModel):
+    group_id: str
+    question: str
+    group_type: Literal['single_choice', 'multi_choice', 'unknown'] = 'unknown'
+    options: list[OptionItem] = Field(default_factory=list)
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+
+
+class FormFieldResolution(BaseModel):
+    field: str
+    status: Literal['resolved', 'weak_match', 'ambiguous', 'not_found'] = 'not_found'
+    resolved_by: Literal['form_resolver', 'repair_model', 'repair_apply', 'legacy_fallback', 'fallback_blocked', 'unresolved'] = 'unresolved'
+    value: Any | None = None
+    candidates: list[Any] = Field(default_factory=list)
+    source_ref: dict[str, Any] = Field(default_factory=dict)
+    confidence: float | None = None
+
+
+class FormDocumentModel(BaseModel):
+    scalars: list[ScalarFieldCandidate] = Field(default_factory=list)
+    groups: list[QuestionGroup] = Field(default_factory=list)
+    section_hierarchy: list[dict[str, Any]] = Field(default_factory=list)
+    layout_lines: list[LayoutLine] = Field(default_factory=list)
+    layout_meta: dict[str, Any] = Field(default_factory=dict)
+    resolved_fields: list[FormFieldResolution] = Field(default_factory=list)
+
+
 class ParsedFile(BaseModel):
     file_name: str
     file_type: str
     columns: list[str]
     rows: list[dict[str, Any]]
     content_type: Literal['table', 'form', 'text', 'image_like', 'mixed', 'unknown'] = 'unknown'
+    document_mode: Literal['data_table_mode', 'form_layout_mode'] = 'data_table_mode'
     extraction_status: str = 'unknown'
     raw_text: str = ''
     text_blocks: list[ParsedTextBlock] = Field(default_factory=list)
@@ -52,6 +133,7 @@ class ParsedFile(BaseModel):
     kv_pairs: list[ParsedKvPair] = Field(default_factory=list)
     source_candidates: list[SourceCandidate] = Field(default_factory=list)
     sheets: list[ParsedSheet] = Field(default_factory=list)
+    form_model: FormDocumentModel | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -296,3 +378,19 @@ class DraftJsonFeedbackPayload(BaseModel):
     notes: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     feedback: list[DraftJsonFeedbackItem] = Field(default_factory=list)
+
+
+class RepairPreviewPayload(BaseModel):
+    parsed_file: dict[str, Any]
+    action: dict[str, Any]
+    target_json: dict[str, Any] | list[Any] | str | None = None
+
+
+class RepairApplyPayload(BaseModel):
+    parsed_file: dict[str, Any]
+    action: dict[str, Any]
+    approved_patch: dict[str, Any]
+    target_json: dict[str, Any] | list[Any] | str | None = None
+    generation_id: int | None = None
+    notes: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
