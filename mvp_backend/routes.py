@@ -571,6 +571,10 @@ def learning_promote_patterns(payload: PatternPromotionPayload) -> dict:
         min_distinct_users=payload.min_distinct_users,
         min_stability_score=payload.min_stability_score,
         max_drift_score=payload.max_drift_score,
+        min_acceptance_rate=payload.min_acceptance_rate,
+        max_semantic_conflict_rate=payload.max_semantic_conflict_rate,
+        max_sensitivity_score=payload.max_sensitivity_score,
+        min_generalizability_score=payload.min_generalizability_score,
     )
 
 

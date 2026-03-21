@@ -1,4 +1,6 @@
 import {
+  ChevronLeft,
+  ChevronRight,
   Check,
   Copy,
   Download,
@@ -29,6 +31,7 @@ import {
   changePasswordWithBackend,
   confirmGenerationLearning,
   fetchLearningEvents,
+  fetchLearningMemory,
   fetchLearningSummary,
   generateDraftJsonFromBackend,
   generateFromBackend,
@@ -43,6 +46,7 @@ import type {
   GenerationResult,
   HistoryItem,
   LearningEvent,
+  LearningMemory,
   LearningSummary,
   ManualCorrectionInput,
   MappingInfo,
@@ -80,6 +84,17 @@ type CorrectionBaseline = {
   schema: string;
   code: string;
   mappings: MappingInfo[];
+};
+
+type SectionWorkspaceState = {
+  schema: string;
+  result: GenerationResult;
+  draftSuggestions: DraftFieldSuggestion[];
+  draftJsonSaved: boolean;
+  generationConfirmed: boolean;
+  correctionBaseline: CorrectionBaseline | null;
+  mappingReviewNotes: Record<string, string>;
+  draftReviewNotes: Record<string, string>;
 };
 
 function buildPreviewSheet(name: string, columns: string[], rows: Record<string, unknown>[]): ParsedSheetInfo {
@@ -235,6 +250,41 @@ function buildCorrectionBaseline(generationId: string, schema: string, result: G
   };
 }
 
+function buildSectionCacheKey(fileName: string | undefined, sectionName: string | null | undefined): string {
+  return `${fileName ?? 'file'}::${sectionName ?? 'default'}`;
+}
+
+function buildSectionWorkspaceState(params: {
+  schema: string;
+  result: GenerationResult;
+  draftSuggestions?: DraftFieldSuggestion[];
+  draftJsonSaved?: boolean;
+  generationConfirmed?: boolean;
+  correctionBaseline?: CorrectionBaseline | null;
+  mappingReviewNotes?: Record<string, string>;
+  draftReviewNotes?: Record<string, string>;
+}): SectionWorkspaceState {
+  return {
+    schema: params.schema,
+    result: {
+      ...params.result,
+      mappings: cloneMappings(params.result.mappings),
+      preview: params.result.preview.map((row) => ({ ...row })),
+    },
+    draftSuggestions: cloneDraftSuggestions(params.draftSuggestions ?? []),
+    draftJsonSaved: params.draftJsonSaved ?? false,
+    generationConfirmed: params.generationConfirmed ?? false,
+    correctionBaseline: params.correctionBaseline
+      ? {
+          ...params.correctionBaseline,
+          mappings: cloneMappings(params.correctionBaseline.mappings),
+        }
+      : null,
+    mappingReviewNotes: { ...(params.mappingReviewNotes ?? {}) },
+    draftReviewNotes: { ...(params.draftReviewNotes ?? {}) },
+  };
+}
+
 function parseSchemaFields(schemaText: string): string[] {
   try {
     const parsed = JSON.parse(schemaText) as Record<string, unknown>;
@@ -310,6 +360,9 @@ function mappingSourceLabel(mapping: MappingInfo): string {
   if (mapping.sourceOfTruth === 'model_suggestion') {
     return 'Модель';
   }
+  if (mapping.sourceOfTruth === 'semantic_graph') {
+    return 'Семантический граф';
+  }
   if (mapping.sourceOfTruth === 'deterministic_rule') {
     return 'Системное правило';
   }
@@ -320,6 +373,59 @@ function mappingSourceLabel(mapping: MappingInfo): string {
     return 'Не определено';
   }
   return 'Источник не указан';
+}
+
+function semanticGraphRelationLabel(relationKind: LearningMemory['layers']['semanticGraph']['items'][number]['relationKind']): string {
+  return relationKind === 'mapping_synonym' ? 'Семантическая связь' : 'Семантический конфликт';
+}
+
+function semanticGraphRoleLabel(role: string | null | undefined): string {
+  if (role === 'identifier') return 'identifier';
+  if (role === 'label') return 'label';
+  if (role === 'description') return 'description';
+  if (role === 'timestamp') return 'timestamp';
+  if (role === 'numeric_value') return 'numeric';
+  if (role === 'flag') return 'flag';
+  if (role === 'unit') return 'unit';
+  return role ?? 'role';
+}
+
+function memoryPatternStatusLabel(status: LearningMemory['layers']['globalKnowledge']['items'][number]['status']): string {
+  if (status === 'shared_promoted') return 'Shared promoted';
+  if (status === 'shared_candidate') return 'Shared candidate';
+  if (status === 'blocked_sensitive') return 'Blocked sensitive';
+  return 'Personal only';
+}
+
+function memoryPatternStatusTone(status: LearningMemory['layers']['globalKnowledge']['items'][number]['status']): string {
+  if (status === 'shared_promoted') return 'promoted';
+  if (status === 'shared_candidate') return 'candidate';
+  if (status === 'blocked_sensitive') return 'blocked';
+  return 'personal';
+}
+
+function formatMetricScore(value: number | null | undefined): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '—';
+  }
+  return value.toFixed(2);
+}
+
+function previewSectionLabel(extension: string | undefined, totalSections: number): string {
+  if (extension === 'pdf' || extension === 'docx') {
+    return totalSections > 1 ? 'Таблицы документа' : 'Таблица документа';
+  }
+  if (extension === 'xlsx' || extension === 'xls') {
+    return 'Листы файла';
+  }
+  return 'Секции preview';
+}
+
+function previewSectionStatusLabel(status: 'idle' | 'cached' | 'confirmed' | 'loading'): string {
+  if (status === 'confirmed') return 'Подтверждена';
+  if (status === 'cached') return 'В кэше';
+  if (status === 'loading') return 'Генерируем';
+  return 'Не считалась';
 }
 
 function draftSuggestionSourceLabel(suggestion: DraftFieldSuggestion): string {
@@ -530,6 +636,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(null);
   const [learningSummaryError, setLearningSummaryError] = useState('');
   const [learningEvents, setLearningEvents] = useState<LearningEvent[]>([]);
+  const [learningMemory, setLearningMemory] = useState<LearningMemory | null>(null);
   const [learningEventsError, setLearningEventsError] = useState('');
   const [learningEventFilter, setLearningEventFilter] = useState<LearningEventFilter>('all');
   const [learningEventSearch, setLearningEventSearch] = useState('');
@@ -548,6 +655,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [generationConfirmed, setGenerationConfirmed] = useState(false);
   const [mappingReviewNotes, setMappingReviewNotes] = useState<Record<string, string>>({});
   const [draftReviewNotes, setDraftReviewNotes] = useState<Record<string, string>>({});
+  const [sectionStateCache, setSectionStateCache] = useState<Record<string, SectionWorkspaceState>>({});
+  const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
@@ -557,18 +666,21 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setLearningSummary(null);
       setLearningSummaryError('');
       setLearningEvents([]);
+      setLearningMemory(null);
       setLearningEventsError('');
       return;
     }
 
     try {
-      const [nextSummary, nextEvents] = await Promise.all([
+      const [nextSummary, nextEvents, nextMemory] = await Promise.all([
         fetchLearningSummary(profile.id),
         fetchLearningEvents(profile.id, 18),
+        fetchLearningMemory(profile.id, 14),
       ]);
       setLearningSummary(nextSummary);
       setLearningSummaryError('');
       setLearningEvents(nextEvents);
+      setLearningMemory(nextMemory);
       setLearningEventsError('');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.';
@@ -601,9 +713,25 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return previewSheets.find((sheet) => sheet.name === activePreviewSheet) ?? previewSheets[0];
   }, [activePreviewSheet, previewSheets]);
 
+  const currentPreviewIndex = useMemo(() => {
+    if (!currentPreviewSheet) {
+      return -1;
+    }
+    return previewSheets.findIndex((sheet) => sheet.name === currentPreviewSheet.name);
+  }, [currentPreviewSheet, previewSheets]);
+
+  const currentSectionKey = useMemo(
+    () => buildSectionCacheKey(parsedFile?.fileName, currentPreviewSheet?.name ?? activePreviewSheet ?? 'default'),
+    [activePreviewSheet, currentPreviewSheet?.name, parsedFile?.fileName]
+  );
+
   const fileSummary = useMemo(() => {
     if (!parsedFile) {
       return 'Файл еще не загружен';
+    }
+
+    if ((parsedFile.extension === 'pdf' || parsedFile.extension === 'docx') && parsedFile.sheets.length > 1) {
+      return `${parsedFile.fileName} · ${parsedFile.sheets.length} таблиц(ы) найдено`;
     }
 
     if (parsedFile.extension === 'pdf' || parsedFile.extension === 'docx') {
@@ -1011,11 +1139,17 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       });
   }, [history]);
 
+  const semanticGraphHighlights = useMemo(() => learningMemory?.layers.semanticGraph.items ?? [], [learningMemory]);
+  const semanticGraphClusters = useMemo(() => learningMemory?.layers.semanticGraph.clusters ?? [], [learningMemory]);
+  const personalMemoryHighlights = useMemo(() => learningMemory?.layers.personalMemory.items ?? [], [learningMemory]);
+  const globalKnowledgeHighlights = useMemo(() => learningMemory?.layers.globalKnowledge.items ?? [], [learningMemory]);
+
   const restoreHistoryItem = (item: HistoryItem) => {
     setActiveHistoryId(item.id);
     setSelectedFile(null);
     setParsedFile(item.parsedFile ?? null);
     setSchema(item.schema);
+    setAutoGenerateSectionKey(null);
     const restoredResult: GenerationResult = {
       generationId: item.id,
       code: item.code,
@@ -1026,6 +1160,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     };
     setResult(restoredResult);
     setActivePreviewSheet(item.selectedSheet ?? item.parsedFile?.sheets[0]?.name ?? null);
+    setSectionStateCache({});
     setCorrectionBaseline(profile.skipped ? null : buildCorrectionBaseline(item.id, item.schema, restoredResult));
     setCorrectionSaveNotice('');
     setCorrectionSaveError('');
@@ -1146,19 +1281,22 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         if (!cancelled) {
           setLearningSummary(null);
           setLearningSummaryError('');
+          setLearningMemory(null);
         }
         return;
       }
 
       try {
-        const [nextSummary, nextEvents] = await Promise.all([
+        const [nextSummary, nextEvents, nextMemory] = await Promise.all([
           fetchLearningSummary(profile.id),
           fetchLearningEvents(profile.id, 18),
+          fetchLearningMemory(profile.id, 14),
         ]);
         if (!cancelled) {
           setLearningSummary(nextSummary);
           setLearningSummaryError('');
           setLearningEvents(nextEvents);
+          setLearningMemory(nextMemory);
           setLearningEventsError('');
         }
       } catch (error) {
@@ -1225,6 +1363,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     const parsed = await parseFile(file);
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
+    setSectionStateCache({});
+    setAutoGenerateSectionKey(null);
     setSaveMessage('');
     setCorrectionBaseline(null);
     setCorrectionSaveError('');
@@ -1237,6 +1377,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setLearningReviewNotice('');
     setLearningReviewError('');
     setGenerationConfirmed(false);
+    setResult({ code: defaultCode, mappings: [], preview: [], warnings: [] });
   };
 
   const onFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1271,6 +1412,117 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     await handleSelectedFile(file);
   };
 
+  const captureCurrentSectionState = (): SectionWorkspaceState =>
+    buildSectionWorkspaceState({
+      schema,
+      result,
+      draftSuggestions,
+      draftJsonSaved,
+      generationConfirmed,
+      correctionBaseline,
+      mappingReviewNotes,
+      draftReviewNotes,
+    });
+
+  const getSectionStateSnapshot = (sectionKey: string): SectionWorkspaceState | null => {
+    if (sectionKey === currentSectionKey) {
+      return captureCurrentSectionState();
+    }
+    return sectionStateCache[sectionKey] ?? null;
+  };
+
+  const getPreviewSectionStatus = (sheetName: string): 'idle' | 'cached' | 'confirmed' | 'loading' => {
+    const sectionKey = buildSectionCacheKey(parsedFile?.fileName, sheetName);
+    if (autoGenerateSectionKey === sectionKey && busy) {
+      return 'loading';
+    }
+
+    const snapshot = getSectionStateSnapshot(sectionKey);
+    if (!snapshot || snapshot.result.code === defaultCode) {
+      return 'idle';
+    }
+    if (snapshot.generationConfirmed) {
+      return 'confirmed';
+    }
+    return 'cached';
+  };
+
+  const applySectionState = (nextState: SectionWorkspaceState | null | undefined) => {
+    if (!nextState) {
+      setResult({ code: defaultCode, mappings: [], preview: [], warnings: [] });
+      setDraftSuggestions([]);
+      setDraftJsonSaved(false);
+      setGenerationConfirmed(false);
+      setCorrectionBaseline(null);
+      setMappingReviewNotes({});
+      setDraftReviewNotes({});
+      setDraftJsonNotice('');
+      setDraftJsonError('');
+      setLearningReviewNotice('');
+      setLearningReviewError('');
+      return;
+    }
+
+    setSchema(nextState.schema);
+    setResult({
+      ...nextState.result,
+      mappings: cloneMappings(nextState.result.mappings),
+      preview: nextState.result.preview.map((row) => ({ ...row })),
+    });
+    setDraftSuggestions(cloneDraftSuggestions(nextState.draftSuggestions));
+    setDraftJsonSaved(nextState.draftJsonSaved);
+    setGenerationConfirmed(nextState.generationConfirmed);
+    setCorrectionBaseline(
+      nextState.correctionBaseline
+        ? {
+            ...nextState.correctionBaseline,
+            mappings: cloneMappings(nextState.correctionBaseline.mappings),
+          }
+        : null
+    );
+    setMappingReviewNotes({ ...nextState.mappingReviewNotes });
+    setDraftReviewNotes({ ...nextState.draftReviewNotes });
+    setDraftJsonNotice('');
+    setDraftJsonError('');
+    setLearningReviewNotice('');
+    setLearningReviewError('');
+  };
+
+  const switchToPreviewSheet = (nextSheetName: string) => {
+    if (currentPreviewSheet?.name === nextSheetName) {
+      return;
+    }
+    const nextSectionKey = buildSectionCacheKey(parsedFile?.fileName, nextSheetName);
+    const currentState = captureCurrentSectionState();
+    const nextState = sectionStateCache[nextSectionKey];
+    setSectionStateCache((current) => ({
+      ...current,
+      [currentSectionKey]: currentState,
+    }));
+    setActivePreviewSheet(nextSheetName);
+    if (nextState) {
+      setAutoGenerateSectionKey(null);
+      applySectionState(nextState);
+      return;
+    }
+
+    applySectionState(null);
+    if (selectedFile && hasGeneratedResult) {
+      setAutoGenerateSectionKey(nextSectionKey);
+      setSaveMessage(`Подгружаем генерацию для ${nextSheetName}...`);
+    } else {
+      setAutoGenerateSectionKey(null);
+    }
+  };
+
+  const selectRelativePreviewSheet = (direction: -1 | 1) => {
+    if (previewSheets.length <= 1 || currentPreviewIndex < 0) {
+      return;
+    }
+    const nextIndex = (currentPreviewIndex + direction + previewSheets.length) % previewSheets.length;
+    switchToPreviewSheet(previewSheets[nextIndex].name);
+  };
+
   const onGenerate = async () => {
     if (!selectedFile) {
       setResult({
@@ -1297,10 +1549,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         file: selectedFile,
         targetJson: schema,
         userId: profile.skipped ? undefined : profile.id,
-        selectedSheet:
-          parsedFile?.extension === 'xlsx' || parsedFile?.extension === 'xls'
-            ? currentPreviewSheet?.name
-            : undefined,
+        selectedSheet: parsedFile?.sheets.length ? currentPreviewSheet?.name : undefined,
       });
 
       setParsedFile(generated.parsedFile ?? parsedFile);
@@ -1308,10 +1557,27 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setSaveMessage('');
       setCorrectionSaveError('');
 
+      const nextCorrectionBaseline =
+        !profile.skipped && generated.generationId ? buildCorrectionBaseline(generated.generationId, schema, generated) : null;
+      setSectionStateCache((current) => ({
+        ...current,
+        [currentSectionKey]: buildSectionWorkspaceState({
+          schema,
+          result: generated,
+          draftSuggestions: [],
+          draftJsonSaved: false,
+          generationConfirmed: false,
+          correctionBaseline: nextCorrectionBaseline,
+          mappingReviewNotes: {},
+          draftReviewNotes: {},
+        }),
+      }));
+      setAutoGenerateSectionKey(null);
+
       if (!profile.skipped) {
         if (generated.generationId) {
           setActiveHistoryId(generated.generationId);
-          setCorrectionBaseline(buildCorrectionBaseline(generated.generationId, schema, generated));
+          setCorrectionBaseline(nextCorrectionBaseline);
         }
         try {
           await onSaveHistory();
@@ -1328,6 +1594,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Не удалось выполнить генерацию.';
+      setAutoGenerateSectionKey(null);
       setResult({
         code: defaultCode,
         mappings: [],
@@ -1339,6 +1606,20 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setBusy(false);
     }
   };
+
+  useEffect(() => {
+    if (!autoGenerateSectionKey || busy || !selectedFile) {
+      return;
+    }
+    if (autoGenerateSectionKey !== currentSectionKey) {
+      return;
+    }
+    if (sectionStateCache[autoGenerateSectionKey]) {
+      setAutoGenerateSectionKey(null);
+      return;
+    }
+    void onGenerate();
+  }, [autoGenerateSectionKey, busy, currentSectionKey, sectionStateCache, selectedFile]);
 
   const onGenerateDraftJson = async () => {
     if (!selectedFile) {
@@ -1354,10 +1635,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       const generated = await generateDraftJsonFromBackend({
         file: selectedFile,
         userId: profile.skipped ? undefined : profile.id,
-        selectedSheet:
-          parsedFile?.extension === 'xlsx' || parsedFile?.extension === 'xls'
-            ? currentPreviewSheet?.name
-            : undefined,
+        selectedSheet: parsedFile?.sheets.length ? currentPreviewSheet?.name : undefined,
       });
 
       setParsedFile(generated.parsedFile ?? parsedFile);
@@ -1978,19 +2256,40 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     <FileSpreadsheet size={16} /> Preview файла
                   </div>
                   {previewSheets.length > 1 && (
-                    <div className="sheet-tab-row">
-                      {previewSheets.map((sheet) => (
-                        <button
-                          className={sheet.name === currentPreviewSheet?.name ? 'sheet-tab active' : 'sheet-tab'}
-                          key={sheet.name}
-                          onClick={() => setActivePreviewSheet(sheet.name)}
-                          type="button"
-                        >
-                          <span>{sheet.name}</span>
-                          <small>{sheet.rows.length} rows</small>
+                    <>
+                      <div className="preview-switcher">
+                        <button className="icon-btn preview-switch-btn" onClick={() => selectRelativePreviewSheet(-1)} title="Предыдущая таблица" type="button">
+                          <ChevronLeft size={16} />
                         </button>
-                      ))}
-                    </div>
+                        <div className="preview-switch-info">
+                          <span>{previewSectionLabel(parsedFile?.extension, previewSheets.length)}</span>
+                          <strong>
+                            {currentPreviewIndex + 1} / {previewSheets.length}
+                          </strong>
+                          <small>{currentPreviewSheet?.name}</small>
+                        </div>
+                        <button className="icon-btn preview-switch-btn" onClick={() => selectRelativePreviewSheet(1)} title="Следующая таблица" type="button">
+                          <ChevronRight size={16} />
+                        </button>
+                      </div>
+                      <div className="preview-status-row">
+                        {previewSheets.map((sheet, index) => {
+                          const status = getPreviewSectionStatus(sheet.name);
+                          return (
+                            <button
+                              className={sheet.name === currentPreviewSheet?.name ? 'preview-status-pill active' : 'preview-status-pill'}
+                              key={sheet.name}
+                              onClick={() => switchToPreviewSheet(sheet.name)}
+                              type="button"
+                            >
+                              <span className={`preview-status-dot preview-status-dot-${status}`} />
+                              <strong>{index + 1}</strong>
+                              <small>{previewSectionStatusLabel(status)}</small>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
                   )}
                   <div className="data-grid-wrap">
                     {currentPreviewSheet && (currentPreviewSheet.columns.length > 0 || currentPreviewSheet.rows.length > 0) ? (
@@ -2475,6 +2774,199 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </button>
                     ))}
                   </div>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
+                    <Sparkles size={16} /> Память системы
+                  </div>
+                  <div className="memory-layer-grid">
+                    <div className="memory-layer-card">
+                      <div className="memory-layer-top">
+                        <strong>Личная память</strong>
+                        <span>{learningMemory?.layers.personalMemory.counts.entries ?? 0}</span>
+                      </div>
+                      <div className="memory-layer-stats">
+                        <span>accept {learningMemory?.layers.personalMemory.counts.accepted ?? 0}</span>
+                        <span>reject {learningMemory?.layers.personalMemory.counts.rejected ?? 0}</span>
+                      </div>
+                      <div className="memory-layer-list">
+                        {personalMemoryHighlights.length === 0 && (
+                          <div className="empty-card compact">Подтверждённые пользовательские пары пока не накопились.</div>
+                        )}
+                        {personalMemoryHighlights.slice(0, 5).map((item) => (
+                          <div className="memory-layer-item" key={`${item.sourceFieldNorm}-${item.targetFieldNorm}`}>
+                            <div className="memory-layer-item-top">
+                              <strong>{item.sourceField ?? item.sourceFieldNorm} → {item.targetField}</strong>
+                              <span className="memory-band-chip">{item.confidenceBand}</span>
+                            </div>
+                            <div className="memory-layer-meta">
+                              <span>usage {item.usageCount}</span>
+                              <span>accept {item.acceptedCount}</span>
+                              <span>reject {item.rejectedCount}</span>
+                              <span>schemas {item.schemaFingerprintCount}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="memory-layer-card">
+                      <div className="memory-layer-top">
+                        <strong>Общие паттерны</strong>
+                        <span>{learningMemory?.layers.globalKnowledge.counts.patterns ?? 0}</span>
+                      </div>
+                      <div className="memory-layer-stats">
+                        <span>promoted {learningMemory?.layers.globalKnowledge.counts.shared_promoted ?? 0}</span>
+                        <span>candidate {learningMemory?.layers.globalKnowledge.counts.shared_candidate ?? 0}</span>
+                        <span>blocked {learningMemory?.layers.globalKnowledge.counts.blocked_sensitive ?? 0}</span>
+                      </div>
+                      <div className="memory-layer-list">
+                        {globalKnowledgeHighlights.length === 0 && (
+                          <div className="empty-card compact">Общие паттерны ещё не сформированы.</div>
+                        )}
+                        {globalKnowledgeHighlights.slice(0, 6).map((item) => (
+                          <div className="memory-layer-item memory-layer-item-global" key={`${item.candidateId}-${item.targetFieldNorm}`}>
+                            <div className="memory-layer-item-top">
+                              <strong>{item.sourceField ?? item.sourceFieldNorm} → {item.targetField ?? item.targetFieldNorm}</strong>
+                              <span className={`memory-status-chip memory-status-${memoryPatternStatusTone(item.status)}`}>
+                                {memoryPatternStatusLabel(item.status)}
+                              </span>
+                            </div>
+                            <div className="memory-layer-tags">
+                              {item.semanticRole && <span className="memory-tag">{item.semanticRole}</span>}
+                              {item.conceptCluster && <span className="memory-tag memory-tag-accent">{item.conceptCluster}</span>}
+                              {item.domainTags.slice(0, 3).map((tag) => (
+                                <span className="memory-tag memory-tag-muted" key={`${item.candidateId}-${tag}`}>
+                                  {tag}
+                                </span>
+                              ))}
+                            </div>
+                            <div className="memory-layer-metrics">
+                              <span>support {item.supportCount}</span>
+                              <span>users {item.uniqueUsers}</span>
+                              <span>accept rate {formatMetricScore(item.acceptanceRate)}</span>
+                              <span>drift {formatMetricScore(item.driftScore)}</span>
+                            </div>
+                            <div className="memory-layer-metrics">
+                              <span>sensitivity {formatMetricScore(item.sensitivityScore)}</span>
+                              <span>generalizability {formatMetricScore(item.generalizabilityScore)}</span>
+                              <span>conflict {formatMetricScore(item.semanticConflictRate)}</span>
+                            </div>
+                            {(item.promotionReason || item.rejectionReason) && (
+                              <small className="memory-layer-reason">
+                                {item.promotionReason
+                                  ? `promotion: ${item.promotionReason}`
+                                  : `reason: ${item.rejectionReason}`}
+                              </small>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
+                    <Sparkles size={16} /> Семантический граф
+                  </div>
+                  <div className="semantic-graph-stats">
+                    <div className="semantic-graph-stat">
+                      <strong>{learningMemory?.layers.semanticGraph.counts.nodes ?? 0}</strong>
+                      <span>узлов</span>
+                    </div>
+                    <div className="semantic-graph-stat">
+                      <strong>{learningMemory?.layers.semanticGraph.counts.edges ?? 0}</strong>
+                      <span>рёбер</span>
+                    </div>
+                    <div className="semantic-graph-stat">
+                      <strong>{learningMemory?.layers.semanticGraph.counts.accepted ?? 0}</strong>
+                      <span>accepted</span>
+                    </div>
+                    <div className="semantic-graph-stat">
+                      <strong>{learningMemory?.layers.semanticGraph.counts.rejected ?? 0}</strong>
+                      <span>rejected</span>
+                    </div>
+                  </div>
+                  <div className="profile-list semantic-graph-list">
+                    {semanticGraphClusters.length > 0 && (
+                      <div className="semantic-cluster-list">
+                        {semanticGraphClusters.map((cluster) => (
+                          <div className="semantic-cluster-card" key={cluster.clusterId}>
+                            <div className="semantic-cluster-top">
+                              <strong>Кластер из {cluster.size} полей</strong>
+                              <span>support {cluster.supportCount}</span>
+                            </div>
+                            <div className="semantic-cluster-tags">
+                              {cluster.sharedAttributes.map((attribute) => (
+                                <span className="semantic-cluster-tag" key={`${cluster.clusterId}-${attribute}`}>
+                                  {attribute}
+                                </span>
+                              ))}
+                              {cluster.sharedRoles.map((role) => (
+                                <span className="semantic-cluster-tag semantic-cluster-tag-role" key={`${cluster.clusterId}-${role}`}>
+                                  {semanticGraphRoleLabel(role)}
+                                </span>
+                              ))}
+                              {cluster.entities.map((entity) => (
+                                <span className="semantic-cluster-tag semantic-cluster-tag-entity" key={`${cluster.clusterId}-${entity}`}>
+                                  {entity}
+                                </span>
+                              ))}
+                            </div>
+                            <div className="semantic-cluster-fields">
+                              {cluster.fields.map((field) => (
+                                <div className="semantic-cluster-field" key={`${cluster.clusterId}-${field.fieldNorm}`}>
+                                  <strong>{field.field}</strong>
+                                  <span>
+                                    {field.entityToken ?? 'any'}.{field.attributeToken ?? 'field'} · {semanticGraphRoleLabel(field.roleLabel)}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {semanticGraphHighlights.length === 0 && (
+                      <div className="empty-card compact">
+                        Пока граф пуст. Он начнёт расти после подтверждённых и отклонённых сопоставлений.
+                      </div>
+                    )}
+                    {semanticGraphHighlights.map((edge) => (
+                      <div className="profile-list-item semantic-graph-item" key={`${edge.leftFieldNorm}-${edge.rightFieldNorm}-${edge.relationKind}`}>
+                        <div className="semantic-graph-main">
+                          <div className="semantic-graph-top">
+                            <strong>
+                              {edge.leftField} ↔ {edge.rightField}
+                            </strong>
+                            <span className={`semantic-graph-kind semantic-graph-kind-${edge.relationKind}`}>
+                              {semanticGraphRelationLabel(edge.relationKind)}
+                            </span>
+                          </div>
+                          <div className="semantic-graph-meta-row">
+                            <span>
+                              {edge.leftEntityToken ?? 'any'}.{edge.leftAttributeToken ?? 'field'} · {semanticGraphRoleLabel(edge.leftRoleLabel)}
+                            </span>
+                            <span>
+                              {edge.rightEntityToken ?? 'any'}.{edge.rightAttributeToken ?? 'field'} · {semanticGraphRoleLabel(edge.rightRoleLabel)}
+                            </span>
+                          </div>
+                          <div className="semantic-graph-meta-row semantic-graph-metrics">
+                            <span>support {edge.supportCount}</span>
+                            <span>accepted {edge.acceptedCount}</span>
+                            <span>rejected {edge.rejectedCount}</span>
+                            <span>{edge.confidenceBand}</span>
+                          </div>
+                        </div>
+                        <small>{edge.lastSeenAt ? new Date(edge.lastSeenAt).toLocaleString() : '—'}</small>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="subtle-text mapping-editor-note">
+                    Граф хранит не целые кейсы, а агрегированные semantic edges между полями с контекстом `entity + attribute + role`.
+                  </p>
                 </section>
 
                 <section className="insight-card profile-history-card">

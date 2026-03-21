@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import types
 import unittest
 import uuid
 from pathlib import Path
@@ -11,6 +12,56 @@ from unittest.mock import patch
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+
+try:
+    import pydantic  # type: ignore  # noqa: F401
+except ModuleNotFoundError:
+    pydantic_stub = types.ModuleType('pydantic')
+
+    class _FieldInfo:
+        def __init__(self, default=None, default_factory=None):
+            self.default = default
+            self.default_factory = default_factory
+
+    def Field(default=None, default_factory=None):
+        return _FieldInfo(default=default, default_factory=default_factory)
+
+    class BaseModel:
+        def __init__(self, **data):
+            annotations = {}
+            for cls in reversed(self.__class__.mro()):
+                annotations.update(getattr(cls, '__annotations__', {}))
+            for key in annotations:
+                if key in data:
+                    value = data[key]
+                else:
+                    class_value = getattr(self.__class__, key, None)
+                    if isinstance(class_value, _FieldInfo):
+                        if class_value.default_factory is not None:
+                            value = class_value.default_factory()
+                        else:
+                            value = class_value.default
+                    else:
+                        value = class_value
+                setattr(self, key, value)
+
+        def dict(self):
+            return dict(self.__dict__)
+
+        def model_dump(self):
+            return dict(self.__dict__)
+
+        def copy(self, update=None):
+            payload = dict(self.__dict__)
+            payload.update(update or {})
+            return self.__class__(**payload)
+
+        def model_copy(self, update=None):
+            return self.copy(update=update)
+
+    pydantic_stub.BaseModel = BaseModel
+    pydantic_stub.Field = Field
+    sys.modules['pydantic'] = pydantic_stub
 
 import storage
 
@@ -225,6 +276,7 @@ class StorageLearningTests(unittest.TestCase):
         staging = layers['layers']['staging']
         personal = layers['layers']['personal_memory']
         global_knowledge = layers['layers']['global_knowledge']
+        semantic_graph = layers['layers']['semantic_graph']
 
         self.assertEqual(staging['counts']['pending'], 1)
         self.assertEqual(staging['counts']['rejected'], 1)
@@ -238,6 +290,13 @@ class StorageLearningTests(unittest.TestCase):
 
         self.assertGreaterEqual(global_knowledge['counts']['patterns'], 1)
         self.assertTrue(any(item['target_field_norm'] == 'customername' for item in global_knowledge['items']))
+
+        self.assertGreaterEqual(semantic_graph['counts']['nodes'], 2)
+        self.assertGreaterEqual(semantic_graph['counts']['edges'], 2)
+        self.assertGreaterEqual(semantic_graph['counts']['accepted'], 1)
+        self.assertGreaterEqual(semantic_graph['counts']['rejected'], 1)
+        self.assertTrue(any(item['right_field_norm'] == 'customername' or item['left_field_norm'] == 'customername' for item in semantic_graph['items']))
+        self.assertGreaterEqual(len(semantic_graph['clusters']), 1)
 
     def test_confirmed_only_generation_requires_feedback_before_memory_promotion(self) -> None:
         generation_id = storage.save_generation(
@@ -498,6 +557,267 @@ class StorageLearningTests(unittest.TestCase):
         self.assertEqual(storage._count_rows(db, 'SELECT COUNT(*) AS value FROM draft_json_suggestions WHERE status = "accepted"'), 2)
         self.assertEqual(storage._count_rows(db, 'SELECT COUNT(*) AS value FROM user_templates'), 1)
         self.assertEqual(storage._count_rows(db, 'SELECT COUNT(*) AS value FROM frequent_djson'), 1)
+
+    def test_pattern_candidate_status_pipeline_moves_from_personal_to_shared(self) -> None:
+        for index, user_id in enumerate(('pipeline-user-1', 'pipeline-user-2', 'pipeline-user-1'), start=1):
+            generation_id = storage.save_generation(
+                user_id=user_id,
+                file_name=f'crm-{index}.csv',
+                file_path=f'/tmp/crm-{index}.csv',
+                file_type='csv',
+                target_json=json.dumps({'creationDate': ''}, ensure_ascii=False),
+                mappings_json=json.dumps([], ensure_ascii=False),
+                generated_typescript='export function transform() { return {}; }',
+                preview_json=json.dumps([], ensure_ascii=False),
+                warnings_json=json.dumps([], ensure_ascii=False),
+                parsed_file_json=json.dumps(
+                    {
+                        'file_name': f'crm-{index}.csv',
+                        'file_type': 'csv',
+                        'columns': ['Дата создания клиента'],
+                        'rows': [{'Дата создания клиента': '2026-03-21'}],
+                        'sheets': [],
+                        'warnings': [],
+                    },
+                    ensure_ascii=False,
+                ),
+                source_columns=['Дата создания клиента'],
+                promotion_mode='confirmed_only',
+            )
+            suggestions = storage.save_mapping_suggestions(
+                generation_id=generation_id,
+                user_id=user_id,
+                mappings=[
+                    {
+                        'source': 'Дата создания клиента',
+                        'target': 'creationDate',
+                        'confidence': 'high',
+                        'reason': 'model_suggestion',
+                        'status': 'suggested',
+                        'source_of_truth': 'model_suggestion',
+                    }
+                ],
+            )
+            storage.apply_mapping_feedback(
+                user_id=user_id,
+                generation_id=generation_id,
+                feedback=[
+                    {
+                        'suggestion_id': suggestions[0]['suggestion_id'],
+                        'target_field': 'creationDate',
+                        'status': 'accepted',
+                        'confidence_after': 1.0,
+                    }
+                ],
+            )
+
+        row = storage.get_db().get(
+            '''
+            SELECT status, acceptance_rate, distinct_users_count, support_count
+            FROM pattern_candidates
+            WHERE target_field_normalized = :target
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            {'target': 'creationdate'},
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row['status']), 'shared_promoted')
+        self.assertGreaterEqual(int(row['distinct_users_count'] or 0), 2)
+        self.assertGreaterEqual(int(row['support_count'] or 0), 3)
+        self.assertGreaterEqual(float(row['acceptance_rate'] or 0.0), 0.8)
+
+    def test_sensitive_pattern_stays_blocked_from_shared_layer(self) -> None:
+        for index, user_id in enumerate(('sensitive-user-1', 'sensitive-user-2', 'sensitive-user-1'), start=1):
+            generation_id = storage.save_generation(
+                user_id=user_id,
+                file_name=f'sensitive-{index}.csv',
+                file_path=f'/tmp/sensitive-{index}.csv',
+                file_type='csv',
+                target_json=json.dumps({'customerEmail': ''}, ensure_ascii=False),
+                mappings_json=json.dumps([], ensure_ascii=False),
+                generated_typescript='export function transform() { return {}; }',
+                preview_json=json.dumps([], ensure_ascii=False),
+                warnings_json=json.dumps([], ensure_ascii=False),
+                parsed_file_json=json.dumps(
+                    {
+                        'file_name': f'sensitive-{index}.csv',
+                        'file_type': 'csv',
+                        'columns': ['Email клиента'],
+                        'rows': [{'Email клиента': 'a@example.com'}],
+                        'sheets': [],
+                        'warnings': [],
+                    },
+                    ensure_ascii=False,
+                ),
+                source_columns=['Email клиента'],
+                promotion_mode='confirmed_only',
+            )
+            suggestions = storage.save_mapping_suggestions(
+                generation_id=generation_id,
+                user_id=user_id,
+                mappings=[
+                    {
+                        'source': 'Email клиента',
+                        'target': 'customerEmail',
+                        'confidence': 'high',
+                        'reason': 'model_suggestion',
+                        'status': 'suggested',
+                        'source_of_truth': 'model_suggestion',
+                    }
+                ],
+            )
+            storage.apply_mapping_feedback(
+                user_id=user_id,
+                generation_id=generation_id,
+                feedback=[
+                    {
+                        'suggestion_id': suggestions[0]['suggestion_id'],
+                        'target_field': 'customerEmail',
+                        'status': 'accepted',
+                        'confidence_after': 1.0,
+                    }
+                ],
+            )
+
+        row = storage.get_db().get(
+            '''
+            SELECT status, sensitivity_score
+            FROM pattern_candidates
+            WHERE target_field_normalized = :target
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            {'target': 'customeremail'},
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row['status']), 'blocked_sensitive')
+        self.assertGreaterEqual(float(row['sensitivity_score'] or 0.0), 0.6)
+
+    def test_guest_runtime_uses_only_shared_promoted_patterns(self) -> None:
+        generation_id = storage.save_generation(
+            user_id='guest-seed-user',
+            file_name='seed.csv',
+            file_path='/tmp/seed.csv',
+            file_type='csv',
+            target_json=json.dumps({'creationDate': ''}, ensure_ascii=False),
+            mappings_json=json.dumps([], ensure_ascii=False),
+            generated_typescript='export function transform() { return {}; }',
+            preview_json=json.dumps([], ensure_ascii=False),
+            warnings_json=json.dumps([], ensure_ascii=False),
+            parsed_file_json=json.dumps(
+                {
+                    'file_name': 'seed.csv',
+                    'file_type': 'csv',
+                    'columns': ['Дата создания клиента'],
+                    'rows': [{'Дата создания клиента': '2026-03-21'}],
+                    'sheets': [],
+                    'warnings': [],
+                },
+                ensure_ascii=False,
+            ),
+            source_columns=['Дата создания клиента'],
+            promotion_mode='confirmed_only',
+        )
+        suggestions = storage.save_mapping_suggestions(
+            generation_id=generation_id,
+            user_id='guest-seed-user',
+            mappings=[
+                {
+                    'source': 'Дата создания клиента',
+                    'target': 'creationDate',
+                    'confidence': 'high',
+                    'reason': 'model_suggestion',
+                    'status': 'suggested',
+                    'source_of_truth': 'model_suggestion',
+                }
+            ],
+        )
+        storage.apply_mapping_feedback(
+            user_id='guest-seed-user',
+            generation_id=generation_id,
+            feedback=[
+                {
+                    'suggestion_id': suggestions[0]['suggestion_id'],
+                    'target_field': 'creationDate',
+                    'status': 'accepted',
+                    'confidence_after': 1.0,
+                }
+            ],
+        )
+
+        guest_before = storage.get_global_mapping_pattern_candidates(
+            user_id=None,
+            source_columns=['Дата создания клиента'],
+            target_fields=['creationDate'],
+        )
+        auth_before = storage.get_global_mapping_pattern_candidates(
+            user_id='guest-seed-user',
+            source_columns=['Дата создания клиента'],
+            target_fields=['creationDate'],
+        )
+
+        self.assertEqual(guest_before, [])
+        self.assertEqual(auth_before, [])
+
+        for index, user_id in enumerate(('guest-seed-user-2', 'guest-seed-user-1'), start=2):
+            generation_id = storage.save_generation(
+                user_id=user_id,
+                file_name=f'seed-{index}.csv',
+                file_path=f'/tmp/seed-{index}.csv',
+                file_type='csv',
+                target_json=json.dumps({'creationDate': ''}, ensure_ascii=False),
+                mappings_json=json.dumps([], ensure_ascii=False),
+                generated_typescript='export function transform() { return {}; }',
+                preview_json=json.dumps([], ensure_ascii=False),
+                warnings_json=json.dumps([], ensure_ascii=False),
+                parsed_file_json=json.dumps(
+                    {
+                        'file_name': f'seed-{index}.csv',
+                        'file_type': 'csv',
+                        'columns': ['Дата создания клиента'],
+                        'rows': [{'Дата создания клиента': '2026-03-21'}],
+                        'sheets': [],
+                        'warnings': [],
+                    },
+                    ensure_ascii=False,
+                ),
+                source_columns=['Дата создания клиента'],
+                promotion_mode='confirmed_only',
+            )
+            suggestions = storage.save_mapping_suggestions(
+                generation_id=generation_id,
+                user_id=user_id,
+                mappings=[
+                    {
+                        'source': 'Дата создания клиента',
+                        'target': 'creationDate',
+                        'confidence': 'high',
+                        'reason': 'model_suggestion',
+                        'status': 'suggested',
+                        'source_of_truth': 'model_suggestion',
+                    }
+                ],
+            )
+            storage.apply_mapping_feedback(
+                user_id=user_id,
+                generation_id=generation_id,
+                feedback=[
+                    {
+                        'suggestion_id': suggestions[0]['suggestion_id'],
+                        'target_field': 'creationDate',
+                        'status': 'accepted',
+                        'confidence_after': 1.0,
+                    }
+                ],
+            )
+
+        guest_after = storage.get_global_mapping_pattern_candidates(
+            user_id=None,
+            source_columns=['Дата создания клиента'],
+            target_fields=['creationDate'],
+        )
+        self.assertTrue(guest_after)
 
     def test_pattern_promotion_and_training_snapshot_flow(self) -> None:
         storage.save_correction_session(

@@ -41,7 +41,7 @@ export type MappingInfo = {
   confidence: 'high' | 'medium' | 'low' | 'none';
   reason?: string;
   status?: 'suggested' | 'accepted' | 'rejected';
-  sourceOfTruth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'position_fallback' | 'unresolved';
+  sourceOfTruth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'semantic_graph' | 'position_fallback' | 'unresolved';
   suggestionId?: number | null;
   schemaFingerprintId?: number | null;
 };
@@ -91,6 +91,150 @@ export type LearningSummary = {
   frequentDjson: number;
   globalPatternCandidates: number;
   globalCuratedDatasetItems: number;
+};
+
+export type LearningMemoryStagingItem = {
+  sourceField?: string | null;
+  sourceFieldNorm?: string | null;
+  targetField: string;
+  targetFieldNorm: string;
+  status: 'suggested' | 'rejected';
+  sourceOfTruth: string;
+  seenCount: number;
+  averageConfidence?: number | null;
+  confidenceBand: 'high' | 'medium' | 'low' | 'none';
+  lastSeenAt?: string | null;
+};
+
+export type LearningMemoryPersonalItem = {
+  sourceField?: string | null;
+  sourceFieldNorm?: string | null;
+  targetField: string;
+  targetFieldNorm: string;
+  acceptedCount: number;
+  rejectedCount: number;
+  usageCount: number;
+  schemaFingerprintCount: number;
+  rowCount: number;
+  averageConfidence?: number | null;
+  confidenceBand: 'high' | 'medium' | 'low' | 'none';
+  sourceOfTruths: string[];
+  lastSeenAt?: string | null;
+};
+
+export type LearningMemoryGlobalItem = {
+  candidateId: number;
+  sourceField?: string | null;
+  sourceFieldNorm: string;
+  targetField?: string | null;
+  targetFieldNorm: string;
+  status: 'personal_only' | 'shared_candidate' | 'shared_promoted' | 'blocked_sensitive';
+  semanticRole?: string | null;
+  conceptCluster?: string | null;
+  domainTags: string[];
+  sensitivityScore?: number | null;
+  generalizabilityScore?: number | null;
+  supportCount: number;
+  uniqueUsers: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  acceptanceRate?: number | null;
+  stabilityScore?: number | null;
+  driftScore?: number | null;
+  semanticConflictRate?: number | null;
+  averageConfidence?: number | null;
+  confidenceBand: 'high' | 'medium' | 'low' | 'none';
+  promotionReason?: string | null;
+  rejectionReason?: string | null;
+  lastSeenAt?: string | null;
+};
+
+export type LearningSemanticGraphItem = {
+  leftField: string;
+  leftFieldNorm: string;
+  leftEntityToken?: string | null;
+  leftAttributeToken?: string | null;
+  leftRoleLabel?: string | null;
+  rightField: string;
+  rightFieldNorm: string;
+  rightEntityToken?: string | null;
+  rightAttributeToken?: string | null;
+  rightRoleLabel?: string | null;
+  relationKind: 'mapping_synonym' | 'semantic_conflict';
+  acceptedCount: number;
+  rejectedCount: number;
+  supportCount: number;
+  averageConfidence?: number | null;
+  confidenceBand: 'high' | 'medium' | 'low' | 'none';
+  lastOutcome?: 'accepted' | 'rejected' | null;
+  sourceOfTruth?: string | null;
+  lastSeenAt?: string | null;
+};
+
+export type LearningSemanticGraphCluster = {
+  clusterId: string;
+  size: number;
+  supportCount: number;
+  sharedAttributes: string[];
+  sharedRoles: string[];
+  entities: string[];
+  fields: Array<{
+    field: string;
+    fieldNorm: string;
+    entityToken?: string | null;
+    attributeToken?: string | null;
+    roleLabel?: string | null;
+  }>;
+  edges: Array<{
+    leftFieldNorm: string;
+    rightFieldNorm: string;
+    supportCount: number;
+  }>;
+};
+
+export type LearningMemory = {
+  userId: string;
+  layers: {
+    staging: {
+      counts: {
+        pending: number;
+        rejected: number;
+        total: number;
+      };
+      items: LearningMemoryStagingItem[];
+    };
+    personalMemory: {
+      counts: {
+        entries: number;
+        accepted: number;
+        rejected: number;
+      };
+      items: LearningMemoryPersonalItem[];
+    };
+    globalKnowledge: {
+      counts: {
+        patterns: number;
+        promoted: number;
+        accepted: number;
+        reviewing: number;
+        personal_only: number;
+        shared_candidate: number;
+        shared_promoted: number;
+        blocked_sensitive: number;
+      };
+      items: LearningMemoryGlobalItem[];
+    };
+    semanticGraph: {
+      counts: {
+        nodes: number;
+        edges: number;
+        accepted: number;
+        rejected: number;
+      };
+      items: LearningSemanticGraphItem[];
+      clusters: LearningSemanticGraphCluster[];
+    };
+  };
 };
 
 export type ManualCorrectionInput = {

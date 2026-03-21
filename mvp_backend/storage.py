@@ -14,6 +14,7 @@ from typing import Any
 
 from infra.database import DatabaseClient, create_database
 from infra.security import hash_password, verify_password
+from matcher import prepare_field_name
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_DIR / '.runtime'
@@ -30,9 +31,55 @@ DEFAULT_PATTERN_PROMOTION_MIN_SUPPORT = 3
 DEFAULT_PATTERN_PROMOTION_MIN_USERS = 2
 DEFAULT_PATTERN_PROMOTION_MIN_STABILITY = 0.75
 DEFAULT_PATTERN_PROMOTION_MAX_DRIFT = 0.25
+DEFAULT_PATTERN_PROMOTION_MIN_ACCEPTANCE_RATE = 0.8
+DEFAULT_PATTERN_PROMOTION_MAX_SEMANTIC_CONFLICT = 0.15
+DEFAULT_PATTERN_PROMOTION_MAX_SENSITIVITY = 0.6
+DEFAULT_PATTERN_PROMOTION_MIN_GENERALIZABILITY = 0.5
 LEARNING_VECTOR_PROVIDER = 'local'
 LEARNING_VECTOR_MODEL = 'heuristic-v1'
 FEATURE_TOKEN_LIMIT = 48
+
+PATTERN_STATUS_PERSONAL_ONLY = 'personal_only'
+PATTERN_STATUS_SHARED_CANDIDATE = 'shared_candidate'
+PATTERN_STATUS_SHARED_PROMOTED = 'shared_promoted'
+PATTERN_STATUS_BLOCKED_SENSITIVE = 'blocked_sensitive'
+
+EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+', re.IGNORECASE)
+PHONE_RE = re.compile(r'(?:\+?\d[\d\-\s()]{8,}\d)')
+URL_RE = re.compile(r'https?://|www\.', re.IGNORECASE)
+ID_LIKE_RE = re.compile(r'(?=.*[A-Za-zА-Яа-я])(?=.*\d)[A-Za-zА-Яа-я0-9_-]{6,}')
+UPPER_CODE_RE = re.compile(r'^[A-ZА-Я0-9_-]{4,}$')
+
+PROMOTION_STATUS_ORDER = {
+    PATTERN_STATUS_BLOCKED_SENSITIVE: 0,
+    PATTERN_STATUS_PERSONAL_ONLY: 1,
+    PATTERN_STATUS_SHARED_CANDIDATE: 2,
+    PATTERN_STATUS_SHARED_PROMOTED: 3,
+}
+
+SENSITIVE_TOKEN_DEFAULTS = (
+    ('client', 'client', 'global', None, 0.8),
+    ('customer', 'client', 'global', None, 0.75),
+    ('project', 'project', 'global', None, 0.7),
+    ('internal', 'internal_term', 'global', None, 0.55),
+    ('account', 'pii_like', 'global', None, 0.7),
+    ('email', 'pii_like', 'global', None, 1.0),
+    ('phone', 'pii_like', 'global', None, 1.0),
+    ('url', 'pii_like', 'global', None, 0.7),
+)
+
+CONCEPT_SYNONYM_DEFAULTS = (
+    ('temporal.creation', 'created_at', 'дата создания', 'ru', 1.0, 'curated'),
+    ('temporal.creation', 'created_at', 'creation date', 'en', 1.0, 'curated'),
+    ('temporal.update', 'updated_at', 'дата обновления', 'ru', 1.0, 'curated'),
+    ('temporal.update', 'updated_at', 'last update date', 'en', 0.95, 'curated'),
+    ('identity.identifier', 'identifier', 'id', 'multilingual', 1.0, 'curated'),
+    ('identity.identifier', 'identifier', 'идентификатор', 'ru', 1.0, 'curated'),
+    ('finance.revenue', 'revenue', 'выручка', 'ru', 1.0, 'curated'),
+    ('finance.amount', 'amount', 'сумма', 'ru', 1.0, 'curated'),
+    ('entity.organization', 'organization', 'организация', 'ru', 1.0, 'curated'),
+    ('entity.customer', 'customer', 'клиент', 'ru', 1.0, 'curated'),
+)
 
 FIELD_NORMALIZE_RE = re.compile(r'[^a-zA-Zа-яА-Я0-9]+')
 
@@ -113,9 +160,366 @@ def get_db() -> DatabaseClient:
 def init_db() -> None:
     ensure_dirs()
     get_db()
+    _ensure_semantic_graph_tables()
+    _ensure_pattern_promotion_schema()
     _migrate_mapping_suggestions_source_of_truth_constraint()
     _migrate_model_deployments_provider_constraint()
+    _seed_sensitive_token_registry()
+    _seed_concept_synonyms()
     migrate_legacy_history()
+
+
+def _ensure_semantic_graph_tables() -> None:
+    get_db().executescript(
+        '''
+        CREATE TABLE IF NOT EXISTS semantic_field_nodes (
+          id INTEGER PRIMARY KEY,
+          field_name TEXT NOT NULL,
+          field_normalized TEXT NOT NULL,
+          canonical_name TEXT,
+          entity_token TEXT,
+          attribute_token TEXT,
+          role_label TEXT,
+          context_json TEXT,
+          metadata_json TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          CHECK (context_json IS NULL OR json_valid(context_json)),
+          CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+          UNIQUE (field_normalized)
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_field_edges (
+          id INTEGER PRIMARY KEY,
+          user_id INTEGER,
+          user_scope_key INTEGER GENERATED ALWAYS AS (coalesce(user_id, 0)) STORED,
+          schema_fingerprint_id INTEGER,
+          fingerprint_scope_key INTEGER GENERATED ALWAYS AS (coalesce(schema_fingerprint_id, 0)) STORED,
+          left_node_id INTEGER NOT NULL,
+          right_node_id INTEGER NOT NULL,
+          relation_kind TEXT NOT NULL DEFAULT 'mapping_synonym',
+          accepted_count INTEGER NOT NULL DEFAULT 0,
+          rejected_count INTEGER NOT NULL DEFAULT 0,
+          support_count INTEGER NOT NULL DEFAULT 0,
+          mean_confidence REAL,
+          last_outcome TEXT,
+          source_of_truth TEXT,
+          metadata_json TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          CHECK (relation_kind IN ('mapping_synonym', 'semantic_conflict')),
+          CHECK (last_outcome IS NULL OR last_outcome IN ('accepted', 'rejected')),
+          CHECK (source_of_truth IS NULL OR source_of_truth IN ('user_correction', 'accepted_generation', 'model_suggestion', 'personal_memory', 'global_pattern')),
+          CHECK (accepted_count >= 0),
+          CHECK (rejected_count >= 0),
+          CHECK (support_count >= 0),
+          CHECK (mean_confidence IS NULL OR (mean_confidence >= 0 AND mean_confidence <= 1)),
+          CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+          UNIQUE (user_scope_key, fingerprint_scope_key, left_node_id, right_node_id),
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (schema_fingerprint_id) REFERENCES schema_fingerprints(id) ON DELETE SET NULL,
+          FOREIGN KEY (left_node_id) REFERENCES semantic_field_nodes(id) ON DELETE CASCADE,
+          FOREIGN KEY (right_node_id) REFERENCES semantic_field_nodes(id) ON DELETE CASCADE
+        );
+        '''
+    )
+
+
+def _ensure_pattern_promotion_schema() -> None:
+    db = get_db()
+    pattern_index_sql = '''
+        CREATE INDEX IF NOT EXISTS idx_pattern_candidates_status
+          ON pattern_candidates (status, support_count DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_pattern_candidates_fields
+          ON pattern_candidates (source_field_normalized, target_field_normalized);
+        CREATE INDEX IF NOT EXISTS idx_pattern_candidates_cluster
+          ON pattern_candidates (concept_cluster, semantic_role, status);
+        CREATE INDEX IF NOT EXISTS idx_sensitive_token_registry_lookup
+          ON sensitive_token_registry (token, scope, user_id, is_active);
+        CREATE INDEX IF NOT EXISTS idx_concept_synonyms_lookup
+          ON concept_synonyms (concept_cluster, canonical_form, synonym);
+        CREATE INDEX IF NOT EXISTS idx_pattern_promotion_events_candidate
+          ON pattern_promotion_events (pattern_candidate_id, created_at DESC);
+    '''
+    row = db.get(
+        '''
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'pattern_candidates'
+        '''
+    )
+    if row is None:
+        return
+
+    table_sql = str(row['sql'] or '')
+    if 'shared_promoted' in table_sql and 'sensitivity_score' in table_sql and 'generalizability_score' in table_sql:
+        db.executescript(pattern_index_sql)
+        return
+
+    db.executescript(
+        '''
+        BEGIN;
+        CREATE TABLE pattern_candidates__new (
+          id INTEGER PRIMARY KEY,
+          candidate_key TEXT NOT NULL,
+          pattern_type TEXT NOT NULL DEFAULT 'mapping_rule',
+          source_field_normalized TEXT,
+          target_field_normalized TEXT,
+          schema_hint_hash TEXT,
+          proposed_rule_json TEXT NOT NULL,
+          evidence_json TEXT,
+          semantic_role TEXT,
+          concept_cluster TEXT,
+          domain_tags_json TEXT,
+          source_hash TEXT,
+          status TEXT NOT NULL DEFAULT 'personal_only',
+          sensitivity_score REAL,
+          generalizability_score REAL,
+          support_count INTEGER NOT NULL DEFAULT 0,
+          distinct_users_count INTEGER NOT NULL DEFAULT 0,
+          mean_confidence REAL,
+          acceptance_rate REAL,
+          semantic_conflict_rate REAL,
+          last_promoted_at TEXT,
+          promotion_reason TEXT,
+          rejection_reason TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          CHECK (pattern_type IN ('mapping_rule', 'template_rule', 'correction_rule', 'schema_rule')),
+          CHECK (json_valid(proposed_rule_json)),
+          CHECK (evidence_json IS NULL OR json_valid(evidence_json)),
+          CHECK (domain_tags_json IS NULL OR json_valid(domain_tags_json)),
+          CHECK (status IN ('personal_only', 'shared_candidate', 'shared_promoted', 'blocked_sensitive')),
+          CHECK (sensitivity_score IS NULL OR (sensitivity_score >= 0 AND sensitivity_score <= 1)),
+          CHECK (generalizability_score IS NULL OR (generalizability_score >= 0 AND generalizability_score <= 1)),
+          CHECK (support_count >= 0),
+          CHECK (distinct_users_count >= 0),
+          CHECK (mean_confidence IS NULL OR (mean_confidence >= 0 AND mean_confidence <= 1)),
+          CHECK (acceptance_rate IS NULL OR (acceptance_rate >= 0 AND acceptance_rate <= 1)),
+          CHECK (semantic_conflict_rate IS NULL OR (semantic_conflict_rate >= 0 AND semantic_conflict_rate <= 1)),
+          UNIQUE (candidate_key)
+        );
+        INSERT INTO pattern_candidates__new (
+          id,
+          candidate_key,
+          pattern_type,
+          source_field_normalized,
+          target_field_normalized,
+          schema_hint_hash,
+          proposed_rule_json,
+          evidence_json,
+          semantic_role,
+          concept_cluster,
+          domain_tags_json,
+          source_hash,
+          status,
+          sensitivity_score,
+          generalizability_score,
+          support_count,
+          distinct_users_count,
+          mean_confidence,
+          acceptance_rate,
+          semantic_conflict_rate,
+          last_promoted_at,
+          promotion_reason,
+          rejection_reason,
+          created_at,
+          updated_at
+        )
+        SELECT
+          id,
+          candidate_key,
+          pattern_type,
+          source_field_normalized,
+          target_field_normalized,
+          schema_hint_hash,
+          proposed_rule_json,
+          evidence_json,
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          CASE status
+            WHEN 'promoted' THEN 'shared_promoted'
+            WHEN 'accepted' THEN 'shared_candidate'
+            WHEN 'reviewing' THEN 'shared_candidate'
+            ELSE 'personal_only'
+          END,
+          NULL,
+          NULL,
+          support_count,
+          distinct_users_count,
+          mean_confidence,
+          NULL,
+          NULL,
+          CASE WHEN status = 'promoted' THEN updated_at ELSE NULL END,
+          CASE WHEN status = 'promoted' THEN 'legacy_promoted_status' ELSE NULL END,
+          CASE WHEN status = 'rejected' THEN 'legacy_rejected_status' ELSE NULL END,
+          created_at,
+          updated_at
+        FROM pattern_candidates;
+        DROP TABLE pattern_candidates;
+        ALTER TABLE pattern_candidates__new RENAME TO pattern_candidates;
+        COMMIT;
+        '''
+    )
+    db.executescript(pattern_index_sql)
+
+
+def _seed_sensitive_token_registry() -> None:
+    db = get_db()
+    now = _timestamp()
+    with db.transaction():
+        for token, token_type, scope, user_id, risk_weight in SENSITIVE_TOKEN_DEFAULTS:
+            existing = db.get(
+                '''
+                SELECT id
+                FROM sensitive_token_registry
+                WHERE token = :token
+                  AND token_type = :token_type
+                  AND scope = :scope
+                  AND (
+                    (user_id IS NULL AND :user_id IS NULL)
+                    OR user_id = :user_id
+                  )
+                ''',
+                {
+                    'token': token,
+                    'token_type': token_type,
+                    'scope': scope,
+                    'user_id': user_id,
+                },
+            )
+            if existing is None:
+                db.run(
+                    '''
+                    INSERT INTO sensitive_token_registry (
+                        token,
+                        token_type,
+                        scope,
+                        user_id,
+                        risk_weight,
+                        is_active,
+                        metadata_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :token,
+                        :token_type,
+                        :scope,
+                        :user_id,
+                        :risk_weight,
+                        1,
+                        NULL,
+                        :created_at,
+                        :updated_at
+                    )
+                    ''',
+                    {
+                        'token': token,
+                        'token_type': token_type,
+                        'scope': scope,
+                        'user_id': user_id,
+                        'risk_weight': risk_weight,
+                        'created_at': now,
+                        'updated_at': now,
+                    },
+                )
+                continue
+            db.run(
+                '''
+                UPDATE sensitive_token_registry
+                SET
+                    risk_weight = :risk_weight,
+                    is_active = 1,
+                    updated_at = :updated_at
+                WHERE id = :id
+                ''',
+                {
+                    'id': int(existing['id']),
+                    'risk_weight': risk_weight,
+                    'updated_at': now,
+                },
+            )
+
+
+def _seed_concept_synonyms() -> None:
+    db = get_db()
+    now = _timestamp()
+    with db.transaction():
+        for concept_cluster, canonical_form, synonym, language, weight, source in CONCEPT_SYNONYM_DEFAULTS:
+            existing = db.get(
+                '''
+                SELECT id
+                FROM concept_synonyms
+                WHERE concept_cluster = :concept_cluster
+                  AND canonical_form = :canonical_form
+                  AND synonym = :synonym
+                  AND language = :language
+                ''',
+                {
+                    'concept_cluster': concept_cluster,
+                    'canonical_form': canonical_form,
+                    'synonym': synonym,
+                    'language': language,
+                },
+            )
+            if existing is None:
+                db.run(
+                    '''
+                    INSERT INTO concept_synonyms (
+                        concept_cluster,
+                        canonical_form,
+                        synonym,
+                        language,
+                        weight,
+                        source,
+                        metadata_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :concept_cluster,
+                        :canonical_form,
+                        :synonym,
+                        :language,
+                        :weight,
+                        :source,
+                        NULL,
+                        :created_at,
+                        :updated_at
+                    )
+                    ''',
+                    {
+                        'concept_cluster': concept_cluster,
+                        'canonical_form': canonical_form,
+                        'synonym': synonym,
+                        'language': language,
+                        'weight': weight,
+                        'source': source,
+                        'created_at': now,
+                        'updated_at': now,
+                    },
+                )
+                continue
+            db.run(
+                '''
+                UPDATE concept_synonyms
+                SET
+                    weight = :weight,
+                    source = :source,
+                    updated_at = :updated_at
+                WHERE id = :id
+                ''',
+                {
+                    'id': int(existing['id']),
+                    'weight': weight,
+                    'source': source,
+                    'updated_at': now,
+                },
+            )
 
 
 def _migrate_mapping_suggestions_source_of_truth_constraint() -> None:
@@ -131,7 +535,7 @@ def _migrate_mapping_suggestions_source_of_truth_constraint() -> None:
         return
 
     table_sql = str(row['sql'] or '')
-    if 'global_pattern' in table_sql:
+    if 'global_pattern' in table_sql and 'semantic_graph' in table_sql:
         return
 
     db.executescript(
@@ -159,7 +563,7 @@ def _migrate_mapping_suggestions_source_of_truth_constraint() -> None:
           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
           CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
           CHECK (status IN ('suggested', 'accepted', 'rejected')),
-          CHECK (source_of_truth IN ('deterministic_rule', 'personal_memory', 'model_suggestion', 'global_pattern', 'position_fallback', 'unresolved')),
+          CHECK (source_of_truth IN ('deterministic_rule', 'personal_memory', 'model_suggestion', 'global_pattern', 'semantic_graph', 'position_fallback', 'unresolved')),
           CHECK (feedback_payload_json IS NULL OR json_valid(feedback_payload_json)),
           CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
           FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -1030,7 +1434,20 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
         'layers': {
             'staging': {'counts': {'pending': 0, 'rejected': 0, 'total': 0}, 'items': []},
             'personal_memory': {'counts': {'entries': 0, 'accepted': 0, 'rejected': 0}, 'items': []},
-            'global_knowledge': {'counts': {'patterns': 0, 'promoted': 0, 'accepted': 0, 'reviewing': 0}, 'items': []},
+            'global_knowledge': {
+                'counts': {
+                    'patterns': 0,
+                    'promoted': 0,
+                    'accepted': 0,
+                    'reviewing': 0,
+                    'personal_only': 0,
+                    'shared_candidate': 0,
+                    'shared_promoted': 0,
+                    'blocked_sensitive': 0,
+                },
+                'items': [],
+            },
+            'semantic_graph': {'counts': {'nodes': 0, 'edges': 0, 'accepted': 0, 'rejected': 0}, 'items': [], 'clusters': []},
         },
     }
     if internal_user_id is None:
@@ -1118,9 +1535,10 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
         '''
         SELECT
             COUNT(*) AS pattern_count,
-            COALESCE(SUM(CASE WHEN status = 'promoted' THEN 1 ELSE 0 END), 0) AS promoted_count,
-            COALESCE(SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END), 0) AS accepted_count,
-            COALESCE(SUM(CASE WHEN status = 'reviewing' THEN 1 ELSE 0 END), 0) AS reviewing_count
+            COALESCE(SUM(CASE WHEN status = 'shared_promoted' THEN 1 ELSE 0 END), 0) AS promoted_count,
+            COALESCE(SUM(CASE WHEN status = 'shared_candidate' THEN 1 ELSE 0 END), 0) AS candidate_count,
+            COALESCE(SUM(CASE WHEN status = 'personal_only' THEN 1 ELSE 0 END), 0) AS personal_only_count,
+            COALESCE(SUM(CASE WHEN status = 'blocked_sensitive' THEN 1 ELSE 0 END), 0) AS blocked_sensitive_count
         FROM pattern_candidates
         ''',
         {},
@@ -1132,9 +1550,18 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
             pc.source_field_normalized,
             pc.target_field_normalized,
             pc.status,
+            pc.semantic_role,
+            pc.concept_cluster,
+            pc.domain_tags_json,
+            pc.sensitivity_score,
+            pc.generalizability_score,
             pc.support_count,
             pc.distinct_users_count,
             pc.mean_confidence,
+            pc.acceptance_rate,
+            pc.semantic_conflict_rate,
+            pc.promotion_reason,
+            pc.rejection_reason,
             pc.proposed_rule_json,
             ps.accept_count,
             ps.reject_count,
@@ -1148,9 +1575,9 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
             ON ps.candidate_id = pc.id
         ORDER BY
             CASE pc.status
-                WHEN 'promoted' THEN 3
-                WHEN 'accepted' THEN 2
-                WHEN 'reviewing' THEN 1
+                WHEN 'shared_promoted' THEN 3
+                WHEN 'shared_candidate' THEN 2
+                WHEN 'personal_only' THEN 1
                 ELSE 0
             END DESC,
             COALESCE(ps.stability_score, 0) DESC,
@@ -1160,6 +1587,61 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
         LIMIT :limit
         ''',
         {'limit': safe_limit},
+    )
+    graph_counts_row = db.get(
+        '''
+        SELECT
+            COUNT(*) AS edge_count,
+            COALESCE(SUM(accepted_count), 0) AS accepted_count,
+            COALESCE(SUM(rejected_count), 0) AS rejected_count
+        FROM semantic_field_edges
+        WHERE user_scope_key = :user_scope_key
+        ''',
+        {'user_scope_key': internal_user_id},
+    )
+    graph_node_counts_row = db.get(
+        '''
+        SELECT COUNT(*) AS node_count
+        FROM semantic_field_nodes
+        WHERE id IN (
+            SELECT left_node_id FROM semantic_field_edges WHERE user_scope_key = :user_scope_key
+            UNION
+            SELECT right_node_id FROM semantic_field_edges WHERE user_scope_key = :user_scope_key
+        )
+        ''',
+        {'user_scope_key': internal_user_id},
+    )
+    graph_rows = db.all(
+        '''
+        SELECT
+            ln.field_name AS left_field,
+            ln.field_normalized AS left_field_normalized,
+            ln.entity_token AS left_entity_token,
+            ln.attribute_token AS left_attribute_token,
+            ln.role_label AS left_role_label,
+            rn.field_name AS right_field,
+            rn.field_normalized AS right_field_normalized,
+            rn.entity_token AS right_entity_token,
+            rn.attribute_token AS right_attribute_token,
+            rn.role_label AS right_role_label,
+            e.relation_kind,
+            e.accepted_count,
+            e.rejected_count,
+            e.support_count,
+            e.mean_confidence,
+            e.last_outcome,
+            e.source_of_truth,
+            e.last_seen_at
+        FROM semantic_field_edges e
+        JOIN semantic_field_nodes ln
+          ON ln.id = e.left_node_id
+        JOIN semantic_field_nodes rn
+          ON rn.id = e.right_node_id
+        WHERE e.user_scope_key = :user_scope_key
+        ORDER BY e.accepted_count DESC, e.support_count DESC, e.last_seen_at DESC
+        LIMIT :limit
+        ''',
+        {'user_scope_key': internal_user_id, 'limit': safe_limit},
     )
 
     staging_items = [
@@ -1211,17 +1693,52 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
                 'target_field': proposed_rule.get('target_field'),
                 'target_field_norm': row['target_field_normalized'],
                 'status': str(row['status']),
+                'semantic_role': row['semantic_role'],
+                'concept_cluster': row['concept_cluster'],
+                'domain_tags': _ensure_json_value(row['domain_tags_json'], []) if row['domain_tags_json'] else [],
+                'sensitivity_score': float(row['sensitivity_score']) if row['sensitivity_score'] is not None else None,
+                'generalizability_score': float(row['generalizability_score']) if row['generalizability_score'] is not None else None,
                 'support_count': int(row['support_count'] or row['recurrence_count'] or 0),
                 'unique_users': int(row['distinct_users_count'] or row['unique_users'] or 0),
                 'accepted_count': int(row['accept_count'] or 0),
                 'rejected_count': int(row['reject_count'] or 0),
+                'acceptance_rate': float(row['acceptance_rate']) if row['acceptance_rate'] is not None else None,
                 'stability_score': float(row['stability_score']) if row['stability_score'] is not None else None,
                 'drift_score': float(row['drift_score']) if row['drift_score'] is not None else None,
+                'semantic_conflict_rate': float(row['semantic_conflict_rate']) if row['semantic_conflict_rate'] is not None else None,
                 'average_confidence': average_confidence,
                 'confidence_band': _score_to_confidence(average_confidence) if average_confidence is not None else 'none',
+                'promotion_reason': row['promotion_reason'],
+                'rejection_reason': row['rejection_reason'],
                 'last_seen_at': row['last_seen_at'],
             }
         )
+
+    graph_items = [
+        {
+            'left_field': row['left_field'],
+            'left_field_norm': row['left_field_normalized'],
+            'left_entity_token': row['left_entity_token'],
+            'left_attribute_token': row['left_attribute_token'],
+            'left_role_label': row['left_role_label'],
+            'right_field': row['right_field'],
+            'right_field_norm': row['right_field_normalized'],
+            'right_entity_token': row['right_entity_token'],
+            'right_attribute_token': row['right_attribute_token'],
+            'right_role_label': row['right_role_label'],
+            'relation_kind': row['relation_kind'],
+            'accepted_count': int(row['accepted_count'] or 0),
+            'rejected_count': int(row['rejected_count'] or 0),
+            'support_count': int(row['support_count'] or 0),
+            'average_confidence': float(row['mean_confidence']) if row['mean_confidence'] is not None else None,
+            'confidence_band': _score_to_confidence(float(row['mean_confidence'])) if row['mean_confidence'] is not None else 'none',
+            'last_outcome': row['last_outcome'],
+            'source_of_truth': row['source_of_truth'],
+            'last_seen_at': row['last_seen_at'],
+        }
+        for row in graph_rows
+    ]
+    graph_clusters = _build_semantic_graph_clusters(graph_rows)
 
     return {
         'user_id': user_id,
@@ -1246,13 +1763,530 @@ def get_learning_memory_layers(user_id: str, limit: int = 20) -> dict[str, Any]:
                 'counts': {
                     'patterns': int(global_counts_row['pattern_count'] or 0) if global_counts_row else 0,
                     'promoted': int(global_counts_row['promoted_count'] or 0) if global_counts_row else 0,
-                    'accepted': int(global_counts_row['accepted_count'] or 0) if global_counts_row else 0,
-                    'reviewing': int(global_counts_row['reviewing_count'] or 0) if global_counts_row else 0,
+                    'accepted': int(global_counts_row['promoted_count'] or 0) if global_counts_row else 0,
+                    'reviewing': int(global_counts_row['candidate_count'] or 0) if global_counts_row else 0,
+                    'personal_only': int(global_counts_row['personal_only_count'] or 0) if global_counts_row else 0,
+                    'shared_candidate': int(global_counts_row['candidate_count'] or 0) if global_counts_row else 0,
+                    'shared_promoted': int(global_counts_row['promoted_count'] or 0) if global_counts_row else 0,
+                    'blocked_sensitive': int(global_counts_row['blocked_sensitive_count'] or 0) if global_counts_row else 0,
                 },
                 'items': global_items,
             },
+            'semantic_graph': {
+                'counts': {
+                    'nodes': int(graph_node_counts_row['node_count'] or 0) if graph_node_counts_row else 0,
+                    'edges': int(graph_counts_row['edge_count'] or 0) if graph_counts_row else 0,
+                    'accepted': int(graph_counts_row['accepted_count'] or 0) if graph_counts_row else 0,
+                    'rejected': int(graph_counts_row['rejected_count'] or 0) if graph_counts_row else 0,
+                },
+                'items': graph_items,
+                'clusters': graph_clusters,
+            },
         },
     }
+
+
+def get_semantic_graph_mapping_candidates(
+    *,
+    user_id: str | None,
+    source_columns: list[str],
+    target_field: str,
+    schema_fingerprint_id: int | None = None,
+) -> list[dict[str, Any]]:
+    if not source_columns or not target_field:
+        return []
+
+    db = get_db()
+    internal_user_id = _lookup_internal_user_id(user_id) if user_id else None
+    target_prepared = prepare_field_name(target_field)
+    target_normalized = _normalize_field_name(target_field)
+    if not target_normalized:
+        return []
+
+    target_node = _get_semantic_field_node_by_normalized(db, target_normalized)
+    if target_node is None:
+        return []
+
+    source_by_normalized = {
+        _normalize_field_name(column): column
+        for column in source_columns
+        if _normalize_field_name(column)
+    }
+    if not source_by_normalized:
+        return []
+
+    direct_rows = db.all(
+        '''
+        SELECT
+            e.left_node_id,
+            e.right_node_id,
+            e.user_id,
+            e.accepted_count,
+            e.rejected_count,
+            e.support_count,
+            e.mean_confidence,
+            ln.field_normalized AS left_field_normalized,
+            rn.field_normalized AS right_field_normalized
+        FROM semantic_field_edges e
+        JOIN semantic_field_nodes ln
+          ON ln.id = e.left_node_id
+        JOIN semantic_field_nodes rn
+          ON rn.id = e.right_node_id
+        WHERE (e.left_node_id = :target_node_id OR e.right_node_id = :target_node_id)
+        ''',
+        {'target_node_id': int(target_node['id'])},
+    )
+
+    graph_scores: dict[str, dict[str, Any]] = {}
+    target_neighbors: set[int] = set()
+    for row in direct_rows:
+        other_node_id = int(row['right_node_id']) if int(row['left_node_id']) == int(target_node['id']) else int(row['left_node_id'])
+        target_neighbors.add(other_node_id)
+        candidate_norm = str(row['right_field_normalized']) if int(row['left_node_id']) == int(target_node['id']) else str(row['left_field_normalized'])
+        if candidate_norm not in source_by_normalized:
+            continue
+        graph_scores[candidate_norm] = _merge_graph_evidence(
+            current=graph_scores.get(candidate_norm),
+            evidence=_build_graph_evidence_from_row(row=row, path='direct', preferred_user_id=internal_user_id),
+        )
+
+    if target_neighbors:
+        placeholders = ','.join('?' for _ in target_neighbors)
+        transitive_rows = db.all(
+            f'''
+            SELECT
+                e.left_node_id,
+                e.right_node_id,
+                e.user_id,
+                e.accepted_count,
+                e.rejected_count,
+                e.support_count,
+                e.mean_confidence,
+                ln.field_normalized AS left_field_normalized,
+                rn.field_normalized AS right_field_normalized
+            FROM semantic_field_edges e
+            JOIN semantic_field_nodes ln
+              ON ln.id = e.left_node_id
+            JOIN semantic_field_nodes rn
+              ON rn.id = e.right_node_id
+            WHERE (e.left_node_id IN ({placeholders}) OR e.right_node_id IN ({placeholders}))
+            ''',
+            tuple(target_neighbors) + tuple(target_neighbors),
+        )
+        for row in transitive_rows:
+            left_id = int(row['left_node_id'])
+            right_id = int(row['right_node_id'])
+            if left_id in target_neighbors:
+                candidate_norm = str(row['right_field_normalized'])
+            elif right_id in target_neighbors:
+                candidate_norm = str(row['left_field_normalized'])
+            else:
+                continue
+            if candidate_norm == target_normalized or candidate_norm not in source_by_normalized:
+                continue
+            graph_scores[candidate_norm] = _merge_graph_evidence(
+                current=graph_scores.get(candidate_norm),
+                evidence=_build_graph_evidence_from_row(row=row, path='transitive', preferred_user_id=internal_user_id),
+            )
+
+    results: list[dict[str, Any]] = []
+    for normalized_source, source_column in source_by_normalized.items():
+        prepared_source = prepare_field_name(source_column)
+        evidence = graph_scores.get(normalized_source)
+        context_score, context_reason = _semantic_graph_context_score(target_prepared, prepared_source)
+        if evidence is None and context_score <= 0:
+            continue
+
+        direct_score = float(evidence['score']) if evidence is not None else 0.0
+        total_score = min(max(direct_score + context_score, 0.0), 1.0)
+        if total_score <= 0:
+            continue
+
+        results.append(
+            {
+                'source_field': source_column,
+                'target_field': target_field,
+                'score': round(total_score, 4),
+                'reason': evidence['reason'] if evidence is not None else context_reason,
+                'path': evidence['path'] if evidence is not None else 'context',
+                'relation_support': evidence['support_count'] if evidence is not None else 0,
+                'accepted_count': evidence['accepted_count'] if evidence is not None else 0,
+                'rejected_count': evidence['rejected_count'] if evidence is not None else 0,
+                'context_reason': context_reason,
+                'graph_score': round(direct_score, 4),
+                'context_score': round(context_score, 4),
+                'entity_token': prepared_source.get('entity_token'),
+                'attribute_token': prepared_source.get('attribute_token'),
+                'role_label': prepared_source.get('role_label'),
+                'schema_match': schema_fingerprint_id is not None,
+            }
+        )
+
+    results.sort(key=lambda item: (float(item['score']), int(item['accepted_count'])), reverse=True)
+    return results
+
+
+def _build_graph_evidence_from_row(*, row: dict[str, Any], path: str, preferred_user_id: int | None) -> dict[str, Any]:
+    accepted_count = int(row['accepted_count'] or 0)
+    rejected_count = int(row['rejected_count'] or 0)
+    support_count = int(row['support_count'] or 0)
+    success_rate = accepted_count / max(1, accepted_count + rejected_count)
+    average_confidence = float(row['mean_confidence']) if row['mean_confidence'] is not None else 0.0
+    base_score = success_rate * 0.7 + average_confidence * 0.3
+    if preferred_user_id is not None and row['user_id'] is not None and int(row['user_id']) == preferred_user_id:
+        base_score += 0.08
+    if path == 'transitive':
+        base_score *= 0.72
+    return {
+        'score': min(max(base_score, 0.0), 1.0),
+        'reason': 'semantic_graph_direct' if path == 'direct' else 'semantic_graph_transitive',
+        'path': path,
+        'accepted_count': accepted_count,
+        'rejected_count': rejected_count,
+        'support_count': support_count,
+    }
+
+
+def _merge_graph_evidence(*, current: dict[str, Any] | None, evidence: dict[str, Any]) -> dict[str, Any]:
+    if current is None:
+        return evidence
+    if float(evidence['score']) > float(current['score']):
+        return evidence
+    return current
+
+
+def _build_semantic_graph_clusters(graph_rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    node_meta: dict[str, dict[str, Any]] = {}
+    adjacency: dict[str, set[str]] = {}
+    edge_support: dict[frozenset[str], int] = {}
+
+    for row in graph_rows:
+        if str(row['relation_kind']) != 'mapping_synonym' or int(row['accepted_count'] or 0) <= 0:
+            continue
+
+        left_norm = str(row['left_field_normalized'])
+        right_norm = str(row['right_field_normalized'])
+        node_meta[left_norm] = {
+            'field': row['left_field'],
+            'field_norm': left_norm,
+            'entity_token': row['left_entity_token'],
+            'attribute_token': row['left_attribute_token'],
+            'role_label': row['left_role_label'],
+        }
+        node_meta[right_norm] = {
+            'field': row['right_field'],
+            'field_norm': right_norm,
+            'entity_token': row['right_entity_token'],
+            'attribute_token': row['right_attribute_token'],
+            'role_label': row['right_role_label'],
+        }
+        adjacency.setdefault(left_norm, set()).add(right_norm)
+        adjacency.setdefault(right_norm, set()).add(left_norm)
+        edge_support[frozenset({left_norm, right_norm})] = int(row['support_count'] or 0)
+
+    clusters: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    for start in adjacency:
+        if start in visited:
+            continue
+        stack = [start]
+        component: list[str] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(sorted(adjacency.get(current, set()) - visited))
+
+        if len(component) < 2:
+            continue
+
+        component_nodes = [node_meta[field_norm] for field_norm in component if field_norm in node_meta]
+        component_edges: list[dict[str, Any]] = []
+        total_support = 0
+        for left in component:
+            for right in adjacency.get(left, set()):
+                if left >= right:
+                    continue
+                if right not in component:
+                    continue
+                support = edge_support.get(frozenset({left, right}), 0)
+                total_support += support
+                component_edges.append(
+                    {
+                        'left_field_norm': left,
+                        'right_field_norm': right,
+                        'support_count': support,
+                    }
+                )
+
+        shared_attributes = sorted({str(node.get('attribute_token')) for node in component_nodes if node.get('attribute_token')})
+        shared_roles = sorted({str(node.get('role_label')) for node in component_nodes if node.get('role_label')})
+        entities = sorted({str(node.get('entity_token')) for node in component_nodes if node.get('entity_token')})
+        clusters.append(
+            {
+                'cluster_id': f'cluster-{"-".join(sorted(component))}',
+                'size': len(component_nodes),
+                'fields': component_nodes,
+                'shared_attributes': shared_attributes,
+                'shared_roles': shared_roles,
+                'entities': entities,
+                'support_count': total_support,
+                'edges': component_edges,
+            }
+        )
+
+    clusters.sort(key=lambda item: (int(item['size']), int(item['support_count'])), reverse=True)
+    return clusters
+
+
+def _semantic_graph_context_score(prepared_target: dict[str, Any], prepared_source: dict[str, Any]) -> tuple[float, str]:
+    target_attribute = prepared_target.get('attribute_token')
+    source_attribute = prepared_source.get('attribute_token')
+    target_role = prepared_target.get('role_label')
+    source_role = prepared_source.get('role_label')
+    target_entity = prepared_target.get('entity_token')
+    source_entity = prepared_source.get('entity_token')
+
+    if target_attribute and source_attribute and target_attribute == source_attribute:
+        if target_entity and source_entity and target_entity == source_entity:
+            return 0.28, 'graph_entity_attribute_match'
+        if target_entity is None or source_entity is None:
+            return 0.12, 'graph_attribute_match_without_entity'
+        return -0.18, 'graph_attribute_match_entity_conflict'
+
+    if target_role and source_role and target_role == source_role:
+        if target_entity and source_entity and target_entity == source_entity:
+            return 0.16, 'graph_role_match_same_entity'
+        if target_entity and source_entity and target_entity != source_entity:
+            return -0.14, 'graph_role_match_entity_conflict'
+        return 0.08, 'graph_role_match'
+
+    return 0.0, 'graph_no_context_match'
+
+
+def _get_semantic_field_node_by_normalized(db: DatabaseClient, field_normalized: str) -> sqlite3.Row | None:
+    return db.get(
+        '''
+        SELECT *
+        FROM semantic_field_nodes
+        WHERE field_normalized = :field_normalized
+        ''',
+        {'field_normalized': field_normalized},
+    )
+
+
+def _upsert_semantic_graph_edge(
+    *,
+    db: DatabaseClient,
+    user_id: int | None,
+    schema_fingerprint_id: int | None,
+    source_field: str,
+    target_field: str,
+    accepted: bool,
+    confidence: float | None,
+    source_of_truth: str | None,
+) -> None:
+    source_node_id = _upsert_semantic_field_node(db, source_field)
+    target_node_id = _upsert_semantic_field_node(db, target_field)
+    left_node_id, right_node_id = sorted((source_node_id, target_node_id))
+    now = _timestamp()
+
+    existing = db.get(
+        '''
+        SELECT id, accepted_count, rejected_count, support_count, mean_confidence
+        FROM semantic_field_edges
+        WHERE user_scope_key = :user_scope_key
+          AND fingerprint_scope_key = :fingerprint_scope_key
+          AND left_node_id = :left_node_id
+          AND right_node_id = :right_node_id
+        ''',
+        {
+            'user_scope_key': user_id or 0,
+            'fingerprint_scope_key': schema_fingerprint_id or 0,
+            'left_node_id': left_node_id,
+            'right_node_id': right_node_id,
+        },
+    )
+    confidence_value = min(max(float(confidence or 0.0), 0.0), 1.0)
+    relation_kind = 'mapping_synonym' if accepted else 'semantic_conflict'
+    metadata_payload = {
+        'left_node_id': left_node_id,
+        'right_node_id': right_node_id,
+    }
+
+    if existing is None:
+        db.run(
+            '''
+            INSERT INTO semantic_field_edges (
+                user_id,
+                schema_fingerprint_id,
+                left_node_id,
+                right_node_id,
+                relation_kind,
+                accepted_count,
+                rejected_count,
+                support_count,
+                mean_confidence,
+                last_outcome,
+                source_of_truth,
+                metadata_json,
+                created_at,
+                updated_at,
+                last_seen_at
+            )
+            VALUES (
+                :user_id,
+                :schema_fingerprint_id,
+                :left_node_id,
+                :right_node_id,
+                :relation_kind,
+                :accepted_count,
+                :rejected_count,
+                1,
+                :mean_confidence,
+                :last_outcome,
+                :source_of_truth,
+                :metadata_json,
+                :created_at,
+                :updated_at,
+                :last_seen_at
+            )
+            ''',
+            {
+                'user_id': user_id,
+                'schema_fingerprint_id': schema_fingerprint_id,
+                'left_node_id': left_node_id,
+                'right_node_id': right_node_id,
+                'relation_kind': relation_kind,
+                'accepted_count': 1 if accepted else 0,
+                'rejected_count': 0 if accepted else 1,
+                'mean_confidence': confidence_value,
+                'last_outcome': 'accepted' if accepted else 'rejected',
+                'source_of_truth': source_of_truth,
+                'metadata_json': _json_or_none(metadata_payload),
+                'created_at': now,
+                'updated_at': now,
+                'last_seen_at': now,
+            },
+        )
+        return
+
+    support_count = int(existing['support_count'] or 0)
+    mean_confidence = float(existing['mean_confidence']) if existing['mean_confidence'] is not None else 0.0
+    next_support = support_count + 1
+    next_mean_confidence = ((mean_confidence * support_count) + confidence_value) / max(1, next_support)
+    db.run(
+        '''
+        UPDATE semantic_field_edges
+        SET
+            relation_kind = :relation_kind,
+            accepted_count = accepted_count + :accepted_increment,
+            rejected_count = rejected_count + :rejected_increment,
+            support_count = support_count + 1,
+            mean_confidence = :mean_confidence,
+            last_outcome = :last_outcome,
+            source_of_truth = coalesce(:source_of_truth, source_of_truth),
+            metadata_json = :metadata_json,
+            updated_at = :updated_at,
+            last_seen_at = :last_seen_at
+        WHERE id = :id
+        ''',
+        {
+            'id': int(existing['id']),
+            'relation_kind': relation_kind,
+            'accepted_increment': 1 if accepted else 0,
+            'rejected_increment': 0 if accepted else 1,
+            'mean_confidence': next_mean_confidence,
+            'last_outcome': 'accepted' if accepted else 'rejected',
+            'source_of_truth': source_of_truth,
+            'metadata_json': _json_or_none(metadata_payload),
+            'updated_at': now,
+            'last_seen_at': now,
+        },
+    )
+
+
+def _upsert_semantic_field_node(db: DatabaseClient, field_name: str) -> int:
+    normalized_name = _normalize_field_name(field_name)
+    if not normalized_name:
+        raise ValueError('Нельзя создать semantic graph node без normalized field name.')
+
+    prepared = prepare_field_name(field_name)
+    existing = _get_semantic_field_node_by_normalized(db, normalized_name)
+    payload = {
+        'field_name': field_name,
+        'field_normalized': normalized_name,
+        'canonical_name': prepared.get('canonical_name'),
+        'entity_token': prepared.get('entity_token'),
+        'attribute_token': prepared.get('attribute_token'),
+        'role_label': prepared.get('role_label'),
+        'context_json': _json_or_none(prepared.get('context_tokens') or []),
+        'metadata_json': _json_or_none(
+            {
+                'tokens': prepared.get('canonical_tokens') or [],
+                'entity_tokens': prepared.get('entity_tokens') or [],
+            }
+        ),
+        'updated_at': _timestamp(),
+    }
+
+    if existing is None:
+        cursor = db.run(
+            '''
+            INSERT INTO semantic_field_nodes (
+                field_name,
+                field_normalized,
+                canonical_name,
+                entity_token,
+                attribute_token,
+                role_label,
+                context_json,
+                metadata_json,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :field_name,
+                :field_normalized,
+                :canonical_name,
+                :entity_token,
+                :attribute_token,
+                :role_label,
+                :context_json,
+                :metadata_json,
+                :created_at,
+                :updated_at
+            )
+            ''',
+            {
+                **payload,
+                'created_at': payload['updated_at'],
+            },
+        )
+        return int(cursor.lastrowid)
+
+    db.run(
+        '''
+        UPDATE semantic_field_nodes
+        SET
+            field_name = :field_name,
+            canonical_name = :canonical_name,
+            entity_token = :entity_token,
+            attribute_token = :attribute_token,
+            role_label = :role_label,
+            context_json = :context_json,
+            metadata_json = :metadata_json,
+            updated_at = :updated_at
+        WHERE id = :id
+        ''',
+        {
+            'id': int(existing['id']),
+            **payload,
+        },
+    )
+    return int(existing['id'])
 
 
 def list_learning_events(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -1498,7 +2532,7 @@ def list_learning_events(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
         FROM pattern_candidates pc
         LEFT JOIN pattern_stats ps
             ON ps.candidate_id = pc.id
-        WHERE pc.status IN ('reviewing', 'accepted', 'promoted')
+        WHERE pc.status IN ('shared_candidate', 'shared_promoted')
           AND (
               EXISTS (
                   SELECT 1
@@ -1698,21 +2732,32 @@ def get_personal_mapping_memory_candidates(
 
 def get_global_mapping_pattern_candidates(
     *,
+    user_id: str | None = None,
     source_columns: list[str],
     target_fields: list[str],
     schema_fingerprint_id: int | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    normalized_sources = list(dict.fromkeys(_normalize_field_name(column) for column in source_columns if _normalize_field_name(column)))
+    internal_user_id = _lookup_internal_user_id(user_id) if user_id else None
+    db = get_db()
+    normalized_sources = list(
+        dict.fromkeys(
+            value
+            for value in (
+                _normalize_pattern_source_label(db=db, user_id=internal_user_id, source_label=column)
+                for column in source_columns
+            )
+            if value
+        )
+    )
     normalized_targets = list(dict.fromkeys(_normalize_field_name(field) for field in target_fields if _normalize_field_name(field)))
     if not normalized_sources or not normalized_targets:
         return []
-
-    db = get_db()
     schema_hash = _get_schema_fingerprint_hash(db, schema_fingerprint_id)
     params: dict[str, Any] = {
         'schema_hash': schema_hash,
         'limit': max(limit, 1),
+        'allow_shared_candidate': 1 if user_id else 0,
     }
     sources_clause = _build_in_clause_params('pattern_source_norm', normalized_sources, params)
     targets_clause = _build_in_clause_params('pattern_target_norm', normalized_targets, params)
@@ -1743,17 +2788,20 @@ def get_global_mapping_pattern_candidates(
             ON ps.candidate_id = pc.id
         WHERE pc.source_field_normalized IN ({sources_clause})
           AND pc.target_field_normalized IN ({targets_clause})
-          AND pc.status <> 'rejected'
+          AND (
+              pc.status = 'shared_promoted'
+              OR (:allow_shared_candidate = 1 AND pc.status = 'shared_candidate')
+          )
           AND (
               coalesce(ps.recurrence_count, 0) > 0
-              OR pc.status IN ('accepted', 'promoted')
+              OR pc.status = 'shared_promoted'
+              OR (:allow_shared_candidate = 1 AND pc.status = 'shared_candidate')
           )
         ORDER BY
             schema_match DESC,
             CASE pc.status
-                WHEN 'promoted' THEN 3
-                WHEN 'accepted' THEN 2
-                WHEN 'reviewing' THEN 1
+                WHEN 'shared_promoted' THEN 3
+                WHEN 'shared_candidate' THEN 2
                 ELSE 0
             END DESC,
             coalesce(ps.stability_score, 0) DESC,
@@ -1888,19 +2936,30 @@ def get_personal_field_naming_candidates(
 
 def get_global_field_naming_candidates(
     *,
+    user_id: str | None = None,
     source_columns: list[str],
     schema_fingerprint_id: int | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    normalized_sources = list(dict.fromkeys(_normalize_field_name(column) for column in source_columns if _normalize_field_name(column)))
+    internal_user_id = _lookup_internal_user_id(user_id) if user_id else None
+    db = get_db()
+    normalized_sources = list(
+        dict.fromkeys(
+            value
+            for value in (
+                _normalize_pattern_source_label(db=db, user_id=internal_user_id, source_label=column)
+                for column in source_columns
+            )
+            if value
+        )
+    )
     if not normalized_sources:
         return []
-
-    db = get_db()
     schema_hash = _get_schema_fingerprint_hash(db, schema_fingerprint_id)
     params: dict[str, Any] = {
         'schema_hash': schema_hash,
         'limit': max(limit, 1),
+        'allow_shared_candidate': 1 if user_id else 0,
     }
     sources_clause = _build_in_clause_params('global_source_norm', normalized_sources, params)
     rows = db.all(
@@ -1929,7 +2988,10 @@ def get_global_field_naming_candidates(
         LEFT JOIN pattern_stats ps
             ON ps.candidate_id = pc.id
         WHERE pc.source_field_normalized IN ({sources_clause})
-          AND pc.status IN ('reviewing', 'accepted', 'promoted')
+          AND (
+              pc.status = 'shared_promoted'
+              OR (:allow_shared_candidate = 1 AND pc.status = 'shared_candidate')
+          )
         ORDER BY
             schema_match DESC,
             coalesce(ps.stability_score, 0) DESC,
@@ -2672,6 +3734,10 @@ def promote_stable_pattern_candidates(
     min_distinct_users: int = DEFAULT_PATTERN_PROMOTION_MIN_USERS,
     min_stability_score: float = DEFAULT_PATTERN_PROMOTION_MIN_STABILITY,
     max_drift_score: float = DEFAULT_PATTERN_PROMOTION_MAX_DRIFT,
+    min_acceptance_rate: float = DEFAULT_PATTERN_PROMOTION_MIN_ACCEPTANCE_RATE,
+    max_semantic_conflict_rate: float = DEFAULT_PATTERN_PROMOTION_MAX_SEMANTIC_CONFLICT,
+    max_sensitivity_score: float = DEFAULT_PATTERN_PROMOTION_MAX_SENSITIVITY,
+    min_generalizability_score: float = DEFAULT_PATTERN_PROMOTION_MIN_GENERALIZABILITY,
 ) -> dict[str, Any]:
     db = get_db()
     rows = db.all(
@@ -2687,6 +3753,12 @@ def promote_stable_pattern_candidates(
             pc.support_count,
             pc.distinct_users_count,
             pc.mean_confidence,
+            pc.acceptance_rate,
+            pc.semantic_conflict_rate,
+            pc.sensitivity_score,
+            pc.generalizability_score,
+            pc.promotion_reason,
+            pc.rejection_reason,
             ps.recurrence_count,
             ps.unique_users,
             ps.accept_count,
@@ -2696,7 +3768,7 @@ def promote_stable_pattern_candidates(
         FROM pattern_candidates pc
         INNER JOIN pattern_stats ps
             ON ps.candidate_id = pc.id
-        WHERE pc.status <> 'rejected'
+        WHERE pc.status IN ('shared_candidate', 'shared_promoted')
           AND coalesce(ps.recurrence_count, pc.support_count) >= :min_support_count
           AND coalesce(ps.unique_users, pc.distinct_users_count) >= :min_distinct_users
           AND coalesce(ps.stability_score, 0) >= :min_stability_score
@@ -2718,6 +3790,77 @@ def promote_stable_pattern_candidates(
             unique_users = int(row['unique_users'] or row['distinct_users_count'] or 0)
             stability_score = float(row['stability_score']) if row['stability_score'] is not None else 0.0
             mean_confidence = float(row['mean_confidence']) if row['mean_confidence'] is not None else 0.55
+            acceptance_rate = float(row['acceptance_rate']) if row['acceptance_rate'] is not None else 0.0
+            semantic_conflict_rate = float(row['semantic_conflict_rate']) if row['semantic_conflict_rate'] is not None else 0.0
+            sensitivity_score = float(row['sensitivity_score']) if row['sensitivity_score'] is not None else 0.0
+            generalizability_score = float(row['generalizability_score']) if row['generalizability_score'] is not None else 0.0
+            decision = _evaluate_promotion_to_shared(
+                support_count=recurrence_count,
+                distinct_users_count=unique_users,
+                accept_count=int(row['accept_count'] or 0),
+                reject_count=int(row['reject_count'] or 0),
+                acceptance_rate=acceptance_rate,
+                mean_confidence=mean_confidence,
+                drift_score=float(row['drift_score']) if row['drift_score'] is not None else None,
+                semantic_conflict_rate=semantic_conflict_rate,
+                sensitivity_score=sensitivity_score,
+                generalizability_score=generalizability_score,
+            )
+            if (
+                recurrence_count >= min_support_count
+                and unique_users >= min_distinct_users
+                and stability_score >= min_stability_score
+                and (float(row['drift_score']) if row['drift_score'] is not None else 0.0) <= max_drift_score
+                and acceptance_rate >= min_acceptance_rate
+                and semantic_conflict_rate <= max_semantic_conflict_rate
+                and sensitivity_score < max_sensitivity_score
+                and generalizability_score >= min_generalizability_score
+            ):
+                decision = {'status': PATTERN_STATUS_SHARED_PROMOTED, 'decision': 'promote', 'reason': 'manual_threshold_promotion'}
+            if acceptance_rate < min_acceptance_rate:
+                decision = {'status': PATTERN_STATUS_SHARED_CANDIDATE, 'decision': 'hold', 'reason': 'low_acceptance_rate'}
+            if semantic_conflict_rate > max_semantic_conflict_rate:
+                decision = {'status': PATTERN_STATUS_PERSONAL_ONLY, 'decision': 'reject', 'reason': 'semantic_instability'}
+            if sensitivity_score >= max_sensitivity_score:
+                decision = {'status': PATTERN_STATUS_BLOCKED_SENSITIVE, 'decision': 'reject', 'reason': 'sensitive_context'}
+            if generalizability_score < min_generalizability_score:
+                decision = {'status': PATTERN_STATUS_PERSONAL_ONLY, 'decision': 'hold', 'reason': 'not_generalizable'}
+            if decision['status'] != PATTERN_STATUS_SHARED_PROMOTED:
+                db.run(
+                    '''
+                    UPDATE pattern_candidates
+                    SET
+                        status = :status,
+                        promotion_reason = :promotion_reason,
+                        rejection_reason = :rejection_reason,
+                        updated_at = :updated_at
+                    WHERE id = :id
+                    ''',
+                    {
+                        'id': int(row['id']),
+                        'status': decision['status'],
+                        'promotion_reason': None,
+                        'rejection_reason': decision['reason'],
+                        'updated_at': _timestamp(),
+                    },
+                )
+                _record_pattern_promotion_event(
+                    db=db,
+                    candidate_id=int(row['id']),
+                    old_status=str(row['status']),
+                    new_status=decision['status'],
+                    decision=decision['decision'],
+                    reason=decision['reason'],
+                    metrics={
+                        'support_count': recurrence_count,
+                        'distinct_users_count': unique_users,
+                        'acceptance_rate': row['acceptance_rate'],
+                        'semantic_conflict_rate': row['semantic_conflict_rate'],
+                        'sensitivity_score': row['sensitivity_score'],
+                        'generalizability_score': row['generalizability_score'],
+                    },
+                )
+                continue
             quality_score = min(
                 1.0,
                 stability_score * 0.55
@@ -2759,13 +3902,32 @@ def promote_stable_pattern_candidates(
                 UPDATE pattern_candidates
                 SET
                     status = :status,
+                    last_promoted_at = :last_promoted_at,
+                    promotion_reason = :promotion_reason,
+                    rejection_reason = NULL,
                     updated_at = :updated_at
                 WHERE id = :id
                 ''',
                 {
                     'id': int(row['id']),
-                    'status': 'promoted' if dataset_item_id is not None else 'accepted',
+                    'status': PATTERN_STATUS_SHARED_PROMOTED,
+                    'last_promoted_at': _timestamp(),
+                    'promotion_reason': decision['reason'],
                     'updated_at': _timestamp(),
+                },
+            )
+            _record_pattern_promotion_event(
+                db=db,
+                candidate_id=int(row['id']),
+                old_status=str(row['status']),
+                new_status=PATTERN_STATUS_SHARED_PROMOTED,
+                decision='promote',
+                reason=decision['reason'],
+                metrics={
+                    'support_count': recurrence_count,
+                    'distinct_users_count': unique_users,
+                    'stability_score': stability_score,
+                    'quality_score': quality_score,
                 },
             )
             promoted_items.append(
@@ -2787,6 +3949,10 @@ def promote_stable_pattern_candidates(
             'min_distinct_users': min_distinct_users,
             'min_stability_score': min_stability_score,
             'max_drift_score': max_drift_score,
+            'min_acceptance_rate': min_acceptance_rate,
+            'max_semantic_conflict_rate': max_semantic_conflict_rate,
+            'max_sensitivity_score': max_sensitivity_score,
+            'min_generalizability_score': min_generalizability_score,
         },
     }
 
@@ -4588,11 +5754,22 @@ def _register_mapping_feedback_outcome(
         db=db,
         schema_fingerprint_id=schema_fingerprint_id,
         schema_hash=_get_schema_fingerprint_hash(db, schema_fingerprint_id),
+        user_id=user_id,
         source_field=source_field,
         target_field=target_field,
         source_field_normalized=normalized_source,
         target_field_normalized=normalized_target,
         confidence=1.0 if accepted else 0.0,
+    )
+    _upsert_semantic_graph_edge(
+        db=db,
+        user_id=user_id,
+        schema_fingerprint_id=schema_fingerprint_id,
+        source_field=source_field,
+        target_field=target_field,
+        accepted=accepted,
+        confidence=1.0 if accepted else 0.0,
+        source_of_truth='personal_memory',
     )
 
 
@@ -4761,11 +5938,22 @@ def _upsert_mapping_memory_entries(
             db=db,
             schema_fingerprint_id=schema_fingerprint_id,
             schema_hash=schema_hash,
+            user_id=user_id,
             source_field=str(source),
             target_field=str(target),
             source_field_normalized=normalized_source,
             target_field_normalized=normalized_target,
             confidence=confidence,
+        )
+        _upsert_semantic_graph_edge(
+            db=db,
+            user_id=user_id,
+            schema_fingerprint_id=schema_fingerprint_id,
+            source_field=str(source),
+            target_field=str(target),
+            accepted=True,
+            confidence=confidence,
+            source_of_truth=source_of_truth,
         )
 
 
@@ -4774,13 +5962,20 @@ def _upsert_pattern_candidate(
     db: DatabaseClient,
     schema_fingerprint_id: int | None,
     schema_hash: str | None,
+    user_id: int | None = None,
     source_field: str,
     target_field: str,
     source_field_normalized: str,
     target_field_normalized: str,
     confidence: float | None,
 ) -> None:
-    candidate_key = f'mapping_rule:{schema_hash or "global"}:{source_field_normalized}:{target_field_normalized}'
+    normalized_payload = _normalize_mapping_pair(
+        db=db,
+        user_id=user_id,
+        source_label=source_field,
+        target_field=target_field,
+    )
+    candidate_key = f'mapping_rule:{source_field_normalized}:{target_field_normalized}:{normalized_payload.get("semantic_role") or "none"}'
     existing = db.get(
         '''
         SELECT id
@@ -4802,10 +5997,21 @@ def _upsert_pattern_candidate(
                 schema_hint_hash,
                 proposed_rule_json,
                 evidence_json,
+                semantic_role,
+                concept_cluster,
+                domain_tags_json,
+                source_hash,
                 status,
+                sensitivity_score,
+                generalizability_score,
                 support_count,
                 distinct_users_count,
                 mean_confidence,
+                acceptance_rate,
+                semantic_conflict_rate,
+                last_promoted_at,
+                promotion_reason,
+                rejection_reason,
                 created_at,
                 updated_at
             )
@@ -4817,10 +6023,21 @@ def _upsert_pattern_candidate(
                 :schema_hint_hash,
                 :proposed_rule_json,
                 :evidence_json,
-                'new',
+                :semantic_role,
+                :concept_cluster,
+                :domain_tags_json,
+                :source_hash,
+                :status,
+                :sensitivity_score,
+                :generalizability_score,
                 0,
                 0,
                 :mean_confidence,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
                 :created_at,
                 :updated_at
             )
@@ -4835,10 +6052,28 @@ def _upsert_pattern_candidate(
                         'source_field': source_field,
                         'target_field': target_field,
                         'schema_fingerprint_id': schema_fingerprint_id,
+                        'semantic_role': normalized_payload.get('semantic_role'),
+                        'concept_cluster': normalized_payload.get('concept_cluster'),
+                        'domain_tags': normalized_payload.get('domain_tags', []),
                     },
                     {},
                 ),
-                'evidence_json': _ensure_json_text({'source': source_field, 'target': target_field}, {}),
+                'evidence_json': _ensure_json_text(
+                    {
+                        'source': source_field,
+                        'target': target_field,
+                        'normalized_source': normalized_payload.get('normalized_source'),
+                        'normalized_target': normalized_payload.get('normalized_target'),
+                    },
+                    {},
+                ),
+                'semantic_role': normalized_payload.get('semantic_role'),
+                'concept_cluster': normalized_payload.get('concept_cluster'),
+                'domain_tags_json': _ensure_json_text(normalized_payload.get('domain_tags', []), []),
+                'source_hash': normalized_payload.get('source_hash'),
+                'status': PATTERN_STATUS_PERSONAL_ONLY,
+                'sensitivity_score': None,
+                'generalizability_score': None,
                 'mean_confidence': confidence,
                 'created_at': now,
                 'updated_at': now,
@@ -4852,6 +6087,9 @@ def _upsert_pattern_candidate(
         db=db,
         candidate_id=candidate_id,
         schema_fingerprint_id=schema_fingerprint_id,
+        user_id=user_id,
+        source_field=source_field,
+        target_field=target_field,
         source_field_normalized=source_field_normalized,
         target_field_normalized=target_field_normalized,
     )
@@ -4862,6 +6100,9 @@ def _refresh_pattern_candidate_stats(
     db: DatabaseClient,
     candidate_id: int,
     schema_fingerprint_id: int | None,
+    user_id: int | None,
+    source_field: str,
+    target_field: str,
     source_field_normalized: str,
     target_field_normalized: str,
 ) -> None:
@@ -4876,12 +6117,10 @@ def _refresh_pattern_candidate_stats(
         FROM user_corrections
         WHERE source_field_normalized = :source_field_normalized
           AND target_field_normalized = :target_field_normalized
-          AND (:schema_fingerprint_id IS NULL OR schema_fingerprint_id = :schema_fingerprint_id)
         ''',
         {
             'source_field_normalized': source_field_normalized,
             'target_field_normalized': target_field_normalized,
-            'schema_fingerprint_id': schema_fingerprint_id,
         },
     )
     memory_stats = db.get(
@@ -4896,12 +6135,10 @@ def _refresh_pattern_candidate_stats(
         FROM mapping_memory
         WHERE source_field_normalized = :source_field_normalized
           AND target_field_normalized = :target_field_normalized
-          AND (:schema_fingerprint_id IS NULL OR schema_fingerprint_id = :schema_fingerprint_id)
         ''',
         {
             'source_field_normalized': source_field_normalized,
             'target_field_normalized': target_field_normalized,
-            'schema_fingerprint_id': schema_fingerprint_id,
         },
     )
     if memory_stats is None:
@@ -4928,30 +6165,88 @@ def _refresh_pattern_candidate_stats(
     total_feedback = success_total + failure_total
     stability_score = (success_total / total_feedback) if total_feedback else None
     drift_score = (failure_total / total_feedback) if total_feedback else None
+    acceptance_rate = (success_total / total_feedback) if total_feedback else None
+    semantic_conflict_rate = _semantic_conflict_rate_for_pair(source_field, target_field)
+    normalized_payload = _normalize_mapping_pair(
+        db=db,
+        user_id=user_id,
+        source_label=source_field,
+        target_field=target_field,
+    )
+    risk_features = _extract_risk_features(
+        db=db,
+        user_id=user_id,
+        source_label=source_field,
+        normalized_source=str(normalized_payload.get('normalized_source') or ''),
+        prepared_source=normalized_payload['prepared_source'],
+    )
+    sensitivity_score = float(risk_features['sensitivity_score'])
+    generalizability_score = _compute_generalizability_score(
+        normalized_source=str(normalized_payload.get('normalized_source') or ''),
+        concept_cluster=normalized_payload.get('concept_cluster'),
+        semantic_role=normalized_payload.get('semantic_role'),
+        domain_tags=list(normalized_payload.get('domain_tags') or []),
+    )
     now = _timestamp()
-    candidate_row = db.get('SELECT status FROM pattern_candidates WHERE id = :id', {'id': candidate_id})
-    current_status = str(candidate_row['status']) if candidate_row is not None else 'new'
-    next_status = current_status
-    if current_status not in {'accepted', 'promoted', 'rejected'} and usage_total > 0:
-        next_status = 'reviewing'
+    candidate_row = db.get('SELECT status, promotion_reason, rejection_reason FROM pattern_candidates WHERE id = :id', {'id': candidate_id})
+    current_status = str(candidate_row['status']) if candidate_row is not None else PATTERN_STATUS_PERSONAL_ONLY
+    decision = _evaluate_promotion_to_shared(
+        support_count=usage_total,
+        distinct_users_count=distinct_users,
+        accept_count=success_total,
+        reject_count=failure_total,
+        acceptance_rate=acceptance_rate,
+        mean_confidence=float(average_confidence) if average_confidence is not None else None,
+        drift_score=drift_score,
+        semantic_conflict_rate=semantic_conflict_rate,
+        sensitivity_score=sensitivity_score,
+        generalizability_score=generalizability_score,
+    )
+    next_status = decision['status']
 
     db.run(
         '''
         UPDATE pattern_candidates
         SET
+            source_field_normalized = :source_field_normalized,
+            target_field_normalized = :target_field_normalized,
+            semantic_role = :semantic_role,
+            concept_cluster = :concept_cluster,
+            domain_tags_json = :domain_tags_json,
+            source_hash = :source_hash,
             support_count = :support_count,
             distinct_users_count = :distinct_users_count,
             mean_confidence = :mean_confidence,
+            acceptance_rate = :acceptance_rate,
+            semantic_conflict_rate = :semantic_conflict_rate,
+            sensitivity_score = :sensitivity_score,
+            generalizability_score = :generalizability_score,
             status = :status,
+            last_promoted_at = CASE WHEN :status = :shared_promoted THEN coalesce(last_promoted_at, :updated_at) ELSE last_promoted_at END,
+            promotion_reason = :promotion_reason,
+            rejection_reason = :rejection_reason,
             updated_at = :updated_at
         WHERE id = :id
         ''',
         {
             'id': candidate_id,
+            'source_field_normalized': normalized_payload.get('normalized_source') or source_field_normalized,
+            'target_field_normalized': normalized_payload.get('normalized_target') or target_field_normalized,
+            'semantic_role': normalized_payload.get('semantic_role'),
+            'concept_cluster': normalized_payload.get('concept_cluster'),
+            'domain_tags_json': _ensure_json_text(normalized_payload.get('domain_tags', []), []),
+            'source_hash': normalized_payload.get('source_hash'),
             'support_count': usage_total,
             'distinct_users_count': distinct_users,
             'mean_confidence': average_confidence,
+            'acceptance_rate': acceptance_rate,
+            'semantic_conflict_rate': semantic_conflict_rate,
+            'sensitivity_score': sensitivity_score,
+            'generalizability_score': generalizability_score,
             'status': next_status,
+            'shared_promoted': PATTERN_STATUS_SHARED_PROMOTED,
+            'promotion_reason': decision['reason'] if next_status == PATTERN_STATUS_SHARED_PROMOTED else None,
+            'rejection_reason': decision['reason'] if next_status != PATTERN_STATUS_SHARED_PROMOTED else None,
             'updated_at': now,
         },
     )
@@ -5030,6 +6325,30 @@ def _refresh_pattern_candidate_stats(
         WHERE candidate_id = :candidate_id
         ''',
         payload,
+    )
+
+    _record_pattern_promotion_event(
+        db=db,
+        candidate_id=candidate_id,
+        old_status=current_status,
+        new_status=next_status,
+        decision=decision['decision'],
+        reason=decision['reason'],
+        metrics={
+            'support_count': usage_total,
+            'distinct_users_count': distinct_users,
+            'accept_count': success_total,
+            'reject_count': failure_total,
+            'acceptance_rate': acceptance_rate,
+            'mean_confidence': average_confidence,
+            'drift_score': drift_score,
+            'semantic_conflict_rate': semantic_conflict_rate,
+            'sensitivity_score': sensitivity_score,
+            'generalizability_score': generalizability_score,
+            'risk_matches': risk_features.get('risk_matches', []),
+            'semantic_role': normalized_payload.get('semantic_role'),
+            'concept_cluster': normalized_payload.get('concept_cluster'),
+        },
     )
 
 
@@ -5608,6 +6927,371 @@ def _mappings_are_confirmed(mappings_json: str) -> bool:
         if str(mapping.get('source_of_truth') or 'deterministic_rule') in {'model_suggestion', 'position_fallback', 'unresolved'}:
             return False
     return True
+
+
+def _pattern_status_rank(status: str | None) -> int:
+    return PROMOTION_STATUS_ORDER.get(str(status or PATTERN_STATUS_PERSONAL_ONLY), 0)
+
+
+def _canonical_domain_tags(prepared: dict[str, Any]) -> list[str]:
+    canonical_tokens = [str(token) for token in prepared.get('canonical_tokens') or []]
+    return sorted({token for token in canonical_tokens if token in {'deal', 'customer', 'organization', 'product', 'revenue', 'amount', 'quantity', 'name', 'description', 'creator', 'responsible', 'source', 'partner', 'license', 'gross', 'net', 'id', 'date', 'created', 'updated', 'unit'}})
+
+
+def _infer_semantic_role(prepared_source: dict[str, Any], prepared_target: dict[str, Any]) -> str | None:
+    canonical_tokens = list(dict.fromkeys([*prepared_target.get('canonical_tokens', []), *prepared_source.get('canonical_tokens', [])]))
+    canonical_set = set(canonical_tokens)
+    if {'created', 'date'} <= canonical_set:
+        return 'created_at'
+    if {'updated', 'date'} <= canonical_set:
+        return 'updated_at'
+    if 'id' in canonical_set:
+        return 'identifier'
+    if 'revenue' in canonical_set:
+        return 'revenue'
+    if 'amount' in canonical_set:
+        return 'amount'
+    if 'quantity' in canonical_set:
+        return 'quantity'
+    if 'name' in canonical_set:
+        return 'label'
+    if 'description' in canonical_set:
+        return 'description'
+    if 'boolean' in canonical_set:
+        return 'flag'
+    return str(prepared_target.get('role_label') or prepared_source.get('role_label') or '') or None
+
+
+def _infer_concept_cluster(prepared_source: dict[str, Any], prepared_target: dict[str, Any]) -> str | None:
+    canonical_tokens = set(prepared_target.get('canonical_tokens') or []) | set(prepared_source.get('canonical_tokens') or [])
+    if {'created', 'date'} <= canonical_tokens:
+        return 'temporal.creation'
+    if {'updated', 'date'} <= canonical_tokens:
+        return 'temporal.update'
+    if 'id' in canonical_tokens:
+        return 'identity.identifier'
+    if 'revenue' in canonical_tokens:
+        return 'finance.revenue'
+    if 'amount' in canonical_tokens:
+        if 'gross' in canonical_tokens:
+            return 'finance.amount.gross'
+        if 'net' in canonical_tokens:
+            return 'finance.amount.net'
+        return 'finance.amount'
+    if 'quantity' in canonical_tokens:
+        return 'inventory.quantity'
+    if 'organization' in canonical_tokens:
+        return 'entity.organization'
+    if 'customer' in canonical_tokens:
+        return 'entity.customer'
+    if 'product' in canonical_tokens:
+        return 'entity.product'
+    if 'name' in canonical_tokens:
+        return 'identity.name'
+    if 'description' in canonical_tokens:
+        return 'text.description'
+    if 'creator' in canonical_tokens:
+        return 'ownership.creator'
+    if 'responsible' in canonical_tokens:
+        return 'ownership.responsible'
+    if 'source' in canonical_tokens:
+        return 'channel.source'
+    if 'partner' in canonical_tokens:
+        return 'entity.partner'
+    return None
+
+
+def _strip_sensitive_noise_tokens(tokens: list[str], *, registry_tokens: set[str]) -> list[str]:
+    cleaned: list[str] = []
+    for token in tokens:
+        lowered = str(token or '').strip().lower()
+        if not lowered:
+            continue
+        if lowered in registry_tokens:
+            continue
+        if EMAIL_RE.search(lowered) or PHONE_RE.search(lowered) or URL_RE.search(lowered):
+            continue
+        if ID_LIKE_RE.fullmatch(lowered):
+            continue
+        if lowered.isdigit():
+            continue
+        cleaned.append(lowered)
+    return cleaned
+
+
+def _normalize_mapping_pair(
+    *,
+    db: DatabaseClient,
+    user_id: int | None,
+    source_label: str,
+    target_field: str,
+) -> dict[str, Any]:
+    prepared_source = prepare_field_name(source_label)
+    prepared_target = prepare_field_name(target_field)
+    registry_tokens = _load_sensitive_registry_tokens(db=db, user_id=user_id)
+    cleaned_tokens = _strip_sensitive_noise_tokens(list(prepared_source.get('canonical_tokens') or []), registry_tokens=registry_tokens)
+    normalized_source = ' '.join(cleaned_tokens) or _normalize_field_name(source_label)
+    normalized_target = _normalize_field_name(target_field)
+    semantic_role = _infer_semantic_role(prepared_source, prepared_target)
+    concept_cluster = _infer_concept_cluster(prepared_source, prepared_target)
+    domain_tags = sorted(set(_canonical_domain_tags(prepared_source) + _canonical_domain_tags(prepared_target)))
+    return {
+        'normalized_source': normalized_source,
+        'normalized_target': normalized_target,
+        'semantic_role': semantic_role,
+        'concept_cluster': concept_cluster,
+        'domain_tags': domain_tags,
+        'source_hash': _make_hash(f'{normalized_source}|{normalized_target}|{semantic_role or ""}|{concept_cluster or ""}'),
+        'prepared_source': prepared_source,
+        'prepared_target': prepared_target,
+    }
+
+
+def _normalize_pattern_source_label(
+    *,
+    db: DatabaseClient,
+    user_id: int | None,
+    source_label: str,
+) -> str:
+    prepared_source = prepare_field_name(source_label)
+    registry_tokens = _load_sensitive_registry_tokens(db=db, user_id=user_id)
+    cleaned_tokens = _strip_sensitive_noise_tokens(list(prepared_source.get('canonical_tokens') or []), registry_tokens=registry_tokens)
+    return ' '.join(cleaned_tokens) or _normalize_field_name(source_label)
+
+
+def _load_sensitive_registry_tokens(*, db: DatabaseClient, user_id: int | None) -> set[str]:
+    rows = db.all(
+        '''
+        SELECT token
+        FROM sensitive_token_registry
+        WHERE is_active = 1
+          AND (
+            scope = 'global'
+            OR (scope = 'user' AND user_id = :user_id)
+          )
+        ''',
+        {'user_id': user_id},
+    )
+    return {str(row['token']).strip().lower() for row in rows if row['token']}
+
+
+def _count_distinct_users_for_source_token(*, db: DatabaseClient, token: str) -> int:
+    if not token:
+        return 0
+    row = db.get(
+        '''
+        SELECT COUNT(DISTINCT user_id) AS user_count
+        FROM mapping_memory
+        WHERE source_field_normalized LIKE :token_like
+        ''',
+        {'token_like': f'%{token}%'},
+    )
+    return int(row['user_count'] or 0) if row is not None else 0
+
+
+def _extract_risk_features(
+    *,
+    db: DatabaseClient,
+    user_id: int | None,
+    source_label: str,
+    normalized_source: str,
+    prepared_source: dict[str, Any],
+) -> dict[str, Any]:
+    raw_tokens = [str(token).strip().lower() for token in prepared_source.get('tokens') or [] if str(token).strip()]
+    normalized_tokens = [str(token).strip().lower() for token in prepared_source.get('canonical_tokens') or [] if str(token).strip()]
+    registry_tokens = _load_sensitive_registry_tokens(db=db, user_id=user_id)
+    generic_tokens = {
+        'date',
+        'created',
+        'updated',
+        'id',
+        'amount',
+        'revenue',
+        'name',
+        'description',
+        'product',
+        'quantity',
+        'organization',
+        'creator',
+        'responsible',
+        'deal',
+        'source',
+        'partner',
+        'license',
+        'gross',
+        'net',
+        'customer',
+        'boolean',
+        'unit',
+    }
+    features: dict[str, Any] = {'matches': []}
+    score = 0.0
+
+    if EMAIL_RE.search(source_label):
+        score += 1.0
+        features['matches'].append('email')
+    if PHONE_RE.search(source_label):
+        score += 1.0
+        features['matches'].append('phone')
+    if URL_RE.search(source_label):
+        score += 0.7
+        features['matches'].append('url')
+
+    for token in raw_tokens:
+        if token in registry_tokens:
+            score += 0.8
+            features['matches'].append(f'registry:{token}')
+        if UPPER_CODE_RE.fullmatch(token) and any(char.isdigit() or char in '_-' for char in token):
+            score += 0.5
+            features['matches'].append(f'upper_code:{token}')
+        if ID_LIKE_RE.fullmatch(token):
+            score += 0.8
+            features['matches'].append(f'id_like:{token}')
+
+    for token in normalized_tokens:
+        if token in generic_tokens:
+            continue
+        if _count_distinct_users_for_source_token(db=db, token=token) <= 1 and len(token) >= 8:
+            score += 0.25
+            features['matches'].append(f'rare_token:{token}')
+
+    if any(char.isdigit() for char in normalized_source) and any(char.isalpha() for char in normalized_source):
+        score += 0.3
+        features['matches'].append('mixed_alnum_label')
+    if len(normalized_tokens) == 1 and len(normalized_tokens[0]) >= 12:
+        score += 0.25
+        features['matches'].append('single_long_token')
+
+    return {
+        'risk_matches': features['matches'],
+        'sensitivity_score': min(round(score, 4), 1.0),
+    }
+
+
+def _compute_generalizability_score(
+    *,
+    normalized_source: str,
+    concept_cluster: str | None,
+    semantic_role: str | None,
+    domain_tags: list[str],
+) -> float:
+    score = 0.0
+    if normalized_source:
+        score += 0.2
+    token_count = len([part for part in normalized_source.split() if part])
+    if 1 <= token_count <= 5:
+        score += 0.2
+    if concept_cluster:
+        score += 0.25
+    if semantic_role:
+        score += 0.15
+    if domain_tags:
+        score += min(len(domain_tags), 3) * 0.08
+    if token_count == 0:
+        score = 0.0
+    return min(round(score, 4), 1.0)
+
+
+def _semantic_conflict_rate_for_pair(source_field: str, target_field: str) -> float:
+    prepared_source = prepare_field_name(source_field)
+    prepared_target = prepare_field_name(target_field)
+    source_set = set(prepared_source.get('canonical_tokens') or [])
+    target_set = set(prepared_target.get('canonical_tokens') or [])
+    conflict_pairs = (
+        ({'created', 'updated'}, 1.0),
+        ({'id', 'date'}, 0.95),
+        ({'amount', 'revenue'}, 0.72),
+        ({'name', 'description'}, 0.65),
+        ({'organization', 'customer'}, 0.7),
+        ({'organization', 'partner'}, 0.62),
+        ({'creator', 'responsible'}, 0.55),
+        ({'gross', 'net'}, 0.92),
+    )
+    highest = 0.0
+    for pair, penalty in conflict_pairs:
+        if len(pair & source_set) == 1 and len(pair & target_set) == 1 and (pair & source_set) != (pair & target_set):
+            highest = max(highest, penalty)
+    return min(round(highest, 4), 1.0)
+
+
+def _evaluate_promotion_to_shared(
+    *,
+    support_count: int,
+    distinct_users_count: int,
+    accept_count: int,
+    reject_count: int,
+    acceptance_rate: float | None,
+    mean_confidence: float | None,
+    drift_score: float | None,
+    semantic_conflict_rate: float | None,
+    sensitivity_score: float | None,
+    generalizability_score: float | None,
+) -> dict[str, str]:
+    if (sensitivity_score or 0.0) >= DEFAULT_PATTERN_PROMOTION_MAX_SENSITIVITY:
+        return {'status': PATTERN_STATUS_BLOCKED_SENSITIVE, 'decision': 'reject', 'reason': 'sensitive_context'}
+    if (generalizability_score or 0.0) < DEFAULT_PATTERN_PROMOTION_MIN_GENERALIZABILITY:
+        return {'status': PATTERN_STATUS_PERSONAL_ONLY, 'decision': 'hold', 'reason': 'not_generalizable'}
+    if accept_count < 2 or support_count < 2:
+        return {'status': PATTERN_STATUS_PERSONAL_ONLY, 'decision': 'hold', 'reason': 'insufficient_accepts'}
+    if accept_count < DEFAULT_PATTERN_PROMOTION_MIN_SUPPORT:
+        return {'status': PATTERN_STATUS_SHARED_CANDIDATE, 'decision': 'hold', 'reason': 'insufficient_accepts'}
+    if distinct_users_count < DEFAULT_PATTERN_PROMOTION_MIN_USERS:
+        return {'status': PATTERN_STATUS_SHARED_CANDIDATE, 'decision': 'hold', 'reason': 'insufficient_cross_user_support'}
+    if (acceptance_rate or 0.0) < DEFAULT_PATTERN_PROMOTION_MIN_ACCEPTANCE_RATE:
+        return {'status': PATTERN_STATUS_SHARED_CANDIDATE, 'decision': 'hold', 'reason': 'low_acceptance_rate'}
+    if (semantic_conflict_rate or 0.0) > DEFAULT_PATTERN_PROMOTION_MAX_SEMANTIC_CONFLICT:
+        return {'status': PATTERN_STATUS_PERSONAL_ONLY, 'decision': 'reject', 'reason': 'semantic_instability'}
+    if (drift_score or 0.0) > DEFAULT_PATTERN_PROMOTION_MAX_DRIFT:
+        return {'status': PATTERN_STATUS_SHARED_CANDIDATE, 'decision': 'hold', 'reason': 'high_drift'}
+    if (mean_confidence or 0.0) < 0.55:
+        return {'status': PATTERN_STATUS_SHARED_CANDIDATE, 'decision': 'hold', 'reason': 'low_mean_confidence'}
+    return {'status': PATTERN_STATUS_SHARED_PROMOTED, 'decision': 'promote', 'reason': 'stable_generalized_pattern'}
+
+
+def _record_pattern_promotion_event(
+    *,
+    db: DatabaseClient,
+    candidate_id: int,
+    old_status: str | None,
+    new_status: str,
+    decision: str,
+    reason: str,
+    metrics: dict[str, Any],
+) -> None:
+    if old_status == new_status and decision == 'hold':
+        return
+
+    db.run(
+        '''
+        INSERT INTO pattern_promotion_events (
+            pattern_candidate_id,
+            old_status,
+            new_status,
+            decision,
+            reason,
+            metrics_json,
+            created_at
+        )
+        VALUES (
+            :pattern_candidate_id,
+            :old_status,
+            :new_status,
+            :decision,
+            :reason,
+            :metrics_json,
+            :created_at
+        )
+        ''',
+        {
+            'pattern_candidate_id': candidate_id,
+            'old_status': old_status,
+            'new_status': new_status,
+            'decision': decision,
+            'reason': reason,
+            'metrics_json': _ensure_json_text(metrics, {}),
+            'created_at': _timestamp(),
+        },
+    )
 
 
 def _lookup_internal_user_id(external_id: str | None) -> int | None:

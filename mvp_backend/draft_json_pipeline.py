@@ -41,6 +41,7 @@ def generate_draft_json_for_source(
     )
     global_candidates = _group_by_source(
         get_global_field_naming_candidates(
+            user_id=user_id,
             source_columns=source_columns,
             schema_fingerprint_id=schema_fingerprint_id,
         )

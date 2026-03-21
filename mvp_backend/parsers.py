@@ -49,7 +49,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         columns, rows, extra_warnings, sheets = _parse_excel(file_path)
         warnings.extend(extra_warnings)
     elif ext in {'pdf', 'docx'}:
-        columns, rows, extra_warnings = _parse_document(file_path)
+        columns, rows, extra_warnings, sheets = _parse_document(file_path)
         warnings.extend(extra_warnings)
     else:
         raise ParseError(f'Unsupported file type: {ext}')
@@ -80,7 +80,7 @@ def resolve_generation_source(
     parsed_file: ParsedFile,
     selected_sheet: str | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
-    if parsed_file.file_type not in {'xlsx', 'xls'} or not parsed_file.sheets:
+    if not parsed_file.sheets:
         return parsed_file.columns, parsed_file.rows, []
 
     if selected_sheet is None or selected_sheet.strip() == '':
@@ -96,7 +96,8 @@ def resolve_generation_source(
             )
 
     available_sheets = ', '.join(sheet.name for sheet in parsed_file.sheets)
-    raise ParseError(f'Worksheet "{selected_sheet}" not found. Available sheets: {available_sheets}')
+    label = 'Worksheet' if parsed_file.file_type in {'xlsx', 'xls'} else 'Table'
+    raise ParseError(f'{label} "{selected_sheet}" not found. Available: {available_sheets}')
 
 
 
@@ -288,7 +289,7 @@ def _has_visible_value(value: Any) -> bool:
     return True
 
 
-def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], list[str], list[ParsedSheet]]:
     try:
         parsed = parse_document(file_path)
         content_type = str(parsed.get('content_type', 'unknown'))
@@ -296,6 +297,23 @@ def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], l
         raw_rows = parsed.get('rows', [])
         rows = [dict(row) for row in raw_rows if isinstance(row, dict)]
         warnings = [str(warning) for warning in parsed.get('warnings', [])]
+        sheets: list[ParsedSheet] = []
+        raw_tables = parsed.get('tables', [])
+        if isinstance(raw_tables, list):
+            for index, table in enumerate(raw_tables, start=1):
+                if not isinstance(table, dict):
+                    continue
+                table_columns = [str(column) for column in table.get('columns', [])]
+                table_rows = [dict(row) for row in table.get('rows', []) if isinstance(row, dict)]
+                if not table_columns and not table_rows:
+                    continue
+                sheets.append(
+                    ParsedSheet(
+                        name=str(table.get('name') or f'Table {index}'),
+                        columns=table_columns,
+                        rows=table_rows[:PREVIEW_ROW_LIMIT],
+                    )
+                )
         original_row_count = len(rows)
 
         rows = _filter_sparse_rows(columns, rows)
@@ -331,7 +349,22 @@ def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], l
                 len(rows),
             )
 
-        return columns, rows, warnings
+        if sheets:
+            filtered_sheets: list[ParsedSheet] = []
+            for sheet in sheets:
+                filtered_rows = _filter_sparse_rows(sheet.columns, [dict(row) for row in sheet.rows])
+                if not sheet.columns and not filtered_rows:
+                    continue
+                filtered_sheets.append(
+                    ParsedSheet(
+                        name=sheet.name,
+                        columns=sheet.columns,
+                        rows=filtered_rows[:PREVIEW_ROW_LIMIT],
+                    )
+                )
+            sheets = filtered_sheets
+
+        return columns, rows, warnings, sheets
     except Exception as exc:  # noqa: BLE001
         logger.exception('document parser failed: file=%s error=%s', file_path.name, exc)
         raise ParseError(f'Failed to parse document: {exc}') from exc

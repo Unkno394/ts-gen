@@ -17,11 +17,12 @@ def clean_text(value: Any) -> str:
 
 
 
-def extract_tables_from_pdf(path: str | Path) -> tuple[list[str], list[dict[str, str]]] | None:
+def extract_tables_from_pdf(path: str | Path) -> list[dict[str, Any]]:
+    found_tables: list[dict[str, Any]] = []
     with pdfplumber.open(str(path)) as pdf:
-        for page in pdf.pages:
+        for page_index, page in enumerate(pdf.pages, start=1):
             tables = page.extract_tables()
-            for table in tables:
+            for table_index, table in enumerate(tables, start=1):
                 if not table or len(table) < 2:
                     continue
 
@@ -47,9 +48,15 @@ def extract_tables_from_pdf(path: str | Path) -> tuple[list[str], list[dict[str,
                         rows.append(row_obj)
 
                 if rows:
-                    return columns, rows
+                    found_tables.append(
+                        {
+                            "name": f"Page {page_index} · Table {table_index}",
+                            "columns": columns,
+                            "rows": rows,
+                        }
+                    )
 
-    return None
+    return found_tables
 
 
 
@@ -68,16 +75,20 @@ def extract_text_from_pdf(path: str | Path) -> str:
 def parse_pdf(path: str | Path) -> dict[str, Any]:
     warnings: list[str] = []
 
-    table_result = extract_tables_from_pdf(path)
-    if table_result is not None:
-        columns, rows = table_result
+    tables = extract_tables_from_pdf(path)
+    if tables:
+        columns = tables[0]["columns"]
+        rows = tables[0]["rows"]
         extracted_text = extract_text_from_pdf(path)
+        if len(tables) > 1:
+            warnings.append(f"Found {len(tables)} tables in PDF.")
         return {
             "file_name": Path(path).name,
             "file_type": "pdf",
             "content_type": "table",
             "columns": columns,
             "rows": rows,
+            "tables": tables,
             "text": extracted_text,
             "blocks": [],
             "warnings": warnings,
@@ -92,6 +103,7 @@ def parse_pdf(path: str | Path) -> dict[str, Any]:
             "content_type": "text",
             "columns": [],
             "rows": [],
+            "tables": [],
             "text": direct_text,
             "blocks": [{"type": "paragraph", "text": direct_text}],
             "warnings": warnings,
@@ -104,6 +116,7 @@ def parse_pdf(path: str | Path) -> dict[str, Any]:
         "content_type": "text",
         "columns": [],
         "rows": [],
+        "tables": [],
         "text": "",
         "blocks": [],
         "warnings": warnings,

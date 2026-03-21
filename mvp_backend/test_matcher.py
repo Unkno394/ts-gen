@@ -100,6 +100,23 @@ class MatcherTests(unittest.TestCase):
         self.assertIn('name', prepared['canonical_tokens'])
         self.assertIn('customer', prepared['canonical_tokens'])
 
+    def test_prepare_field_name_extracts_entity_attribute_and_role(self) -> None:
+        user_id = prepare_field_name('user_id')
+        product_id = prepare_field_name('productId')
+        plain_id = prepare_field_name('id')
+
+        self.assertEqual(user_id['entity_token'], 'user')
+        self.assertEqual(user_id['attribute_token'], 'id')
+        self.assertEqual(user_id['role_label'], 'identifier')
+
+        self.assertEqual(product_id['entity_token'], 'product')
+        self.assertEqual(product_id['attribute_token'], 'id')
+        self.assertEqual(product_id['role_label'], 'identifier')
+
+        self.assertIsNone(plain_id['entity_token'])
+        self.assertEqual(plain_id['attribute_token'], 'id')
+        self.assertEqual(plain_id['role_label'], 'identifier')
+
 
 if __name__ == '__main__':
     unittest.main()

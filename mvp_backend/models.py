@@ -36,6 +36,7 @@ class FieldMapping(BaseModel):
         'personal_memory',
         'model_suggestion',
         'global_pattern',
+        'semantic_graph',
         'position_fallback',
         'unresolved',
     ] = 'deterministic_rule'
@@ -188,6 +189,10 @@ class PatternPromotionPayload(BaseModel):
     min_distinct_users: int = 2
     min_stability_score: float = 0.75
     max_drift_score: float = 0.25
+    min_acceptance_rate: float = 0.8
+    max_semantic_conflict_rate: float = 0.15
+    max_sensitivity_score: float = 0.6
+    min_generalizability_score: float = 0.5
 
 
 class TrainingSnapshotPayload(BaseModel):

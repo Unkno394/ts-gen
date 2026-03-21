@@ -58,15 +58,21 @@ def parse_docx(path: str | Path) -> dict[str, Any]:
     if tables_data:
         columns, rows = tables_data[0]
         if len(tables_data) > 1:
-            warnings.append(
-                f"Found {len(tables_data)} tables in DOCX, returned only the first table."
-            )
+            warnings.append(f"Found {len(tables_data)} tables in DOCX.")
         return {
             "file_name": Path(path).name,
             "file_type": "docx",
             "content_type": "table",
             "columns": columns,
             "rows": rows,
+            "tables": [
+                {
+                    "name": f"Table {index + 1}",
+                    "columns": item_columns,
+                    "rows": item_rows,
+                }
+                for index, (item_columns, item_rows) in enumerate(tables_data)
+            ],
             "text": "\n".join(paragraphs),
             "blocks": [{"type": "paragraph", "text": text} for text in paragraphs],
             "warnings": warnings,
@@ -79,6 +85,7 @@ def parse_docx(path: str | Path) -> dict[str, Any]:
         "content_type": "text",
         "columns": [],
         "rows": [],
+        "tables": [],
         "text": "\n".join(paragraphs),
         "blocks": [{"type": "paragraph", "text": text} for text in paragraphs],
         "warnings": warnings,

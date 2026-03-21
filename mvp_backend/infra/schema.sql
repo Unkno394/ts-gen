@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS mapping_suggestions (
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
   CHECK (status IN ('suggested', 'accepted', 'rejected')),
-  CHECK (source_of_truth IN ('deterministic_rule', 'personal_memory', 'model_suggestion', 'global_pattern', 'position_fallback', 'unresolved')),
+  CHECK (source_of_truth IN ('deterministic_rule', 'personal_memory', 'model_suggestion', 'global_pattern', 'semantic_graph', 'position_fallback', 'unresolved')),
   CHECK (feedback_payload_json IS NULL OR json_valid(feedback_payload_json)),
   CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -329,6 +329,57 @@ CREATE TABLE IF NOT EXISTS mapping_memory (
   FOREIGN KEY (session_id) REFERENCES correction_sessions(id) ON DELETE SET NULL,
   FOREIGN KEY (correction_id) REFERENCES user_corrections(id) ON DELETE SET NULL,
   FOREIGN KEY (last_generation_id) REFERENCES generations(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS semantic_field_nodes (
+  id INTEGER PRIMARY KEY,
+  field_name TEXT NOT NULL,
+  field_normalized TEXT NOT NULL,
+  canonical_name TEXT,
+  entity_token TEXT,
+  attribute_token TEXT,
+  role_label TEXT,
+  context_json TEXT,
+  metadata_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (context_json IS NULL OR json_valid(context_json)),
+  CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+  UNIQUE (field_normalized)
+);
+
+CREATE TABLE IF NOT EXISTS semantic_field_edges (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER,
+  user_scope_key INTEGER GENERATED ALWAYS AS (coalesce(user_id, 0)) STORED,
+  schema_fingerprint_id INTEGER,
+  fingerprint_scope_key INTEGER GENERATED ALWAYS AS (coalesce(schema_fingerprint_id, 0)) STORED,
+  left_node_id INTEGER NOT NULL,
+  right_node_id INTEGER NOT NULL,
+  relation_kind TEXT NOT NULL DEFAULT 'mapping_synonym',
+  accepted_count INTEGER NOT NULL DEFAULT 0,
+  rejected_count INTEGER NOT NULL DEFAULT 0,
+  support_count INTEGER NOT NULL DEFAULT 0,
+  mean_confidence REAL,
+  last_outcome TEXT,
+  source_of_truth TEXT,
+  metadata_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (relation_kind IN ('mapping_synonym', 'semantic_conflict')),
+  CHECK (last_outcome IS NULL OR last_outcome IN ('accepted', 'rejected')),
+  CHECK (source_of_truth IS NULL OR source_of_truth IN ('user_correction', 'accepted_generation', 'model_suggestion', 'personal_memory', 'global_pattern')),
+  CHECK (accepted_count >= 0),
+  CHECK (rejected_count >= 0),
+  CHECK (support_count >= 0),
+  CHECK (mean_confidence IS NULL OR (mean_confidence >= 0 AND mean_confidence <= 1)),
+  CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+  UNIQUE (user_scope_key, fingerprint_scope_key, left_node_id, right_node_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (schema_fingerprint_id) REFERENCES schema_fingerprints(id) ON DELETE SET NULL,
+  FOREIGN KEY (left_node_id) REFERENCES semantic_field_nodes(id) ON DELETE CASCADE,
+  FOREIGN KEY (right_node_id) REFERENCES semantic_field_nodes(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS few_shot_examples (
@@ -432,19 +483,35 @@ CREATE TABLE IF NOT EXISTS pattern_candidates (
   schema_hint_hash TEXT,
   proposed_rule_json TEXT NOT NULL,
   evidence_json TEXT,
-  status TEXT NOT NULL DEFAULT 'new',
+  semantic_role TEXT,
+  concept_cluster TEXT,
+  domain_tags_json TEXT,
+  source_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'personal_only',
+  sensitivity_score REAL,
+  generalizability_score REAL,
   support_count INTEGER NOT NULL DEFAULT 0,
   distinct_users_count INTEGER NOT NULL DEFAULT 0,
   mean_confidence REAL,
+  acceptance_rate REAL,
+  semantic_conflict_rate REAL,
+  last_promoted_at TEXT,
+  promotion_reason TEXT,
+  rejection_reason TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   CHECK (pattern_type IN ('mapping_rule', 'template_rule', 'correction_rule', 'schema_rule')),
   CHECK (json_valid(proposed_rule_json)),
   CHECK (evidence_json IS NULL OR json_valid(evidence_json)),
-  CHECK (status IN ('new', 'reviewing', 'accepted', 'rejected', 'promoted')),
+  CHECK (domain_tags_json IS NULL OR json_valid(domain_tags_json)),
+  CHECK (status IN ('personal_only', 'shared_candidate', 'shared_promoted', 'blocked_sensitive')),
+  CHECK (sensitivity_score IS NULL OR (sensitivity_score >= 0 AND sensitivity_score <= 1)),
+  CHECK (generalizability_score IS NULL OR (generalizability_score >= 0 AND generalizability_score <= 1)),
   CHECK (support_count >= 0),
   CHECK (distinct_users_count >= 0),
   CHECK (mean_confidence IS NULL OR (mean_confidence >= 0 AND mean_confidence <= 1)),
+  CHECK (acceptance_rate IS NULL OR (acceptance_rate >= 0 AND acceptance_rate <= 1)),
+  CHECK (semantic_conflict_rate IS NULL OR (semantic_conflict_rate >= 0 AND semantic_conflict_rate <= 1)),
   UNIQUE (candidate_key)
 );
 
@@ -470,6 +537,54 @@ CREATE TABLE IF NOT EXISTS pattern_stats (
   CHECK (stats_json IS NULL OR json_valid(stats_json)),
   UNIQUE (candidate_id),
   FOREIGN KEY (candidate_id) REFERENCES pattern_candidates(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sensitive_token_registry (
+  id INTEGER PRIMARY KEY,
+  token TEXT NOT NULL,
+  token_type TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'global',
+  user_id INTEGER,
+  risk_weight REAL NOT NULL DEFAULT 0.5,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  metadata_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (scope IN ('global', 'user')),
+  CHECK (risk_weight >= 0 AND risk_weight <= 1.5),
+  CHECK (is_active IN (0, 1)),
+  CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+  UNIQUE (token, token_type, scope, user_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS concept_synonyms (
+  id INTEGER PRIMARY KEY,
+  concept_cluster TEXT NOT NULL,
+  canonical_form TEXT NOT NULL,
+  synonym TEXT NOT NULL,
+  language TEXT NOT NULL DEFAULT 'multilingual',
+  weight REAL NOT NULL DEFAULT 1.0,
+  source TEXT NOT NULL DEFAULT 'curated',
+  metadata_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (weight >= 0 AND weight <= 2),
+  CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+  UNIQUE (concept_cluster, canonical_form, synonym, language)
+);
+
+CREATE TABLE IF NOT EXISTS pattern_promotion_events (
+  id INTEGER PRIMARY KEY,
+  pattern_candidate_id INTEGER NOT NULL,
+  old_status TEXT,
+  new_status TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT,
+  metrics_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (metrics_json IS NULL OR json_valid(metrics_json)),
+  FOREIGN KEY (pattern_candidate_id) REFERENCES pattern_candidates(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS curated_dataset_items (
@@ -737,6 +852,18 @@ CREATE INDEX IF NOT EXISTS idx_pattern_candidates_status
 
 CREATE INDEX IF NOT EXISTS idx_pattern_candidates_fields
   ON pattern_candidates (source_field_normalized, target_field_normalized);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_candidates_cluster
+  ON pattern_candidates (concept_cluster, semantic_role, status);
+
+CREATE INDEX IF NOT EXISTS idx_sensitive_token_registry_lookup
+  ON sensitive_token_registry (token, scope, user_id, is_active);
+
+CREATE INDEX IF NOT EXISTS idx_concept_synonyms_lookup
+  ON concept_synonyms (concept_cluster, canonical_form, synonym);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_promotion_events_candidate
+  ON pattern_promotion_events (pattern_candidate_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_curated_dataset_items_status_split
   ON curated_dataset_items (status, split, quality_score DESC);

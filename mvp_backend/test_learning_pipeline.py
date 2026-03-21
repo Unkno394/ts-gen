@@ -199,6 +199,50 @@ class LearningPipelineTests(unittest.TestCase):
         self.assertIn('confidence_band', metadata)
         self.assertEqual(result['explainability']['unresolved_fields'], ['dealCreationDate'])
 
+    def test_semantic_graph_can_resolve_transitive_identifier_match_before_llm(self) -> None:
+        storage.save_correction_session(
+            user_id='graph-user',
+            session_type='feedback_loop',
+            corrections=[
+                {
+                    'correction_type': 'mapping_override',
+                    'source_field': 'user_id',
+                    'target_field': 'accountId',
+                    'confidence_after': 1.0,
+                    'accepted': True,
+                }
+            ],
+        )
+        storage.save_correction_session(
+            user_id='graph-user',
+            session_type='feedback_loop',
+            corrections=[
+                {
+                    'correction_type': 'mapping_override',
+                    'source_field': 'id',
+                    'target_field': 'user_id',
+                    'confidence_after': 1.0,
+                    'accepted': True,
+                }
+            ],
+        )
+
+        with patch('learning_pipeline.rank_mapping_candidate') as rank_mock:
+            result = resolve_generation_mappings_detailed(
+                source_columns=['id', 'comment'],
+                source_rows=[{'id': '42', 'comment': 'hello'}],
+                target_fields=[TargetField(name='accountId', type='string')],
+                user_id='graph-user',
+                schema_fingerprint_id=None,
+            )
+
+        rank_mock.assert_not_called()
+        mapping = result['mappings'][0]
+        self.assertEqual(mapping.source, 'id')
+        self.assertEqual(mapping.source_of_truth, 'semantic_graph')
+        self.assertEqual(result['explainability']['mapping_stats']['semantic_graph'], 1)
+        self.assertIn(mapping.reason, {'semantic_graph_direct', 'semantic_graph_transitive'})
+
     def test_semantic_conflict_assessment_flags_typical_mistakes(self) -> None:
         cases = [
             ('creator_vs_responsible', 'creator', 'responsiblePerson', 'semantic_conflict_creator_vs_responsible'),

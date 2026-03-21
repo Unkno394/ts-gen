@@ -6,6 +6,7 @@ import type {
   GenerationResult,
   HistoryItem,
   LearningEvent,
+  LearningMemory,
   LearningSummary,
   ManualCorrectionInput,
   MappingFeedbackResult,
@@ -41,7 +42,7 @@ type BackendGenerateResponse = {
     confidence: 'high' | 'medium' | 'low' | 'none';
     reason: string;
     status?: 'suggested' | 'accepted' | 'rejected';
-    source_of_truth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'position_fallback' | 'unresolved';
+    source_of_truth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'semantic_graph' | 'position_fallback' | 'unresolved';
     suggestion_id?: number | null;
     schema_fingerprint_id?: number | null;
   }>;
@@ -76,7 +77,7 @@ type BackendHistoryResponse = {
       confidence: 'high' | 'medium' | 'low' | 'none';
       reason: string;
       status?: 'suggested' | 'accepted' | 'rejected';
-      source_of_truth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'position_fallback' | 'unresolved';
+      source_of_truth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'semantic_graph' | 'position_fallback' | 'unresolved';
       suggestion_id?: number | null;
       schema_fingerprint_id?: number | null;
     }>;
@@ -113,6 +114,140 @@ type BackendLearningEventsResponse = {
     created_at: string;
     metadata?: Record<string, unknown>;
   }>;
+};
+
+type BackendLearningMemoryResponse = {
+  user_id: string;
+  layers: {
+    staging: {
+      counts: {
+        pending: number;
+        rejected: number;
+        total: number;
+      };
+      items: Array<{
+        source_field?: string | null;
+        source_field_norm?: string | null;
+        target_field: string;
+        target_field_norm: string;
+        status: 'suggested' | 'rejected';
+        source_of_truth: string;
+        seen_count: number;
+        average_confidence?: number | null;
+        confidence_band: 'high' | 'medium' | 'low' | 'none';
+        last_seen_at?: string | null;
+      }>;
+    };
+    personal_memory: {
+      counts: {
+        entries: number;
+        accepted: number;
+        rejected: number;
+      };
+      items: Array<{
+        source_field?: string | null;
+        source_field_norm?: string | null;
+        target_field: string;
+        target_field_norm: string;
+        accepted_count: number;
+        rejected_count: number;
+        usage_count: number;
+        schema_fingerprint_count: number;
+        row_count: number;
+        average_confidence?: number | null;
+        confidence_band: 'high' | 'medium' | 'low' | 'none';
+        source_of_truths: string[];
+        last_seen_at?: string | null;
+      }>;
+    };
+    global_knowledge: {
+      counts: {
+        patterns: number;
+        promoted: number;
+        accepted: number;
+        reviewing: number;
+        personal_only: number;
+        shared_candidate: number;
+        shared_promoted: number;
+        blocked_sensitive: number;
+      };
+      items: Array<{
+        candidate_id: number;
+        source_field?: string | null;
+        source_field_norm: string;
+        target_field?: string | null;
+        target_field_norm: string;
+        status: 'personal_only' | 'shared_candidate' | 'shared_promoted' | 'blocked_sensitive';
+        semantic_role?: string | null;
+        concept_cluster?: string | null;
+        domain_tags?: string[] | null;
+        sensitivity_score?: number | null;
+        generalizability_score?: number | null;
+        support_count: number;
+        unique_users: number;
+        accepted_count: number;
+        rejected_count: number;
+        acceptance_rate?: number | null;
+        stability_score?: number | null;
+        drift_score?: number | null;
+        semantic_conflict_rate?: number | null;
+        average_confidence?: number | null;
+        confidence_band: 'high' | 'medium' | 'low' | 'none';
+        promotion_reason?: string | null;
+        rejection_reason?: string | null;
+        last_seen_at?: string | null;
+      }>;
+    };
+    semantic_graph: {
+      counts: {
+        nodes: number;
+        edges: number;
+        accepted: number;
+        rejected: number;
+      };
+      items: Array<{
+        left_field: string;
+        left_field_norm: string;
+        left_entity_token?: string | null;
+        left_attribute_token?: string | null;
+        left_role_label?: string | null;
+        right_field: string;
+        right_field_norm: string;
+        right_entity_token?: string | null;
+        right_attribute_token?: string | null;
+        right_role_label?: string | null;
+        relation_kind: 'mapping_synonym' | 'semantic_conflict';
+        accepted_count: number;
+        rejected_count: number;
+        support_count: number;
+        average_confidence?: number | null;
+        confidence_band: 'high' | 'medium' | 'low' | 'none';
+        last_outcome?: 'accepted' | 'rejected' | null;
+        source_of_truth?: string | null;
+        last_seen_at?: string | null;
+      }>;
+      clusters: Array<{
+        cluster_id: string;
+        size: number;
+        support_count: number;
+        shared_attributes: string[];
+        shared_roles: string[];
+        entities: string[];
+        fields: Array<{
+          field: string;
+          field_norm: string;
+          entity_token?: string | null;
+          attribute_token?: string | null;
+          role_label?: string | null;
+        }>;
+        edges: Array<{
+          left_field_norm: string;
+          right_field_norm: string;
+          support_count: number;
+        }>;
+      }>;
+    };
+  };
 };
 
 type BackendCorrectionSessionResponse = {
@@ -571,6 +706,128 @@ export async function fetchLearningEvents(userId: string, limit = 20): Promise<L
     createdAt: item.created_at,
     metadata: item.metadata ?? {},
   }));
+}
+
+export async function fetchLearningMemory(userId: string, limit = 20): Promise<LearningMemory> {
+  const response = await fetchWithTimeout(
+    buildApiUrl(`/api/learning/memory/${encodeURIComponent(userId)}?limit=${encodeURIComponent(String(limit))}`),
+    {
+      method: 'GET',
+    },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+  const payload = await parseJson<BackendLearningMemoryResponse>(response);
+  return {
+    userId: payload.user_id,
+    layers: {
+      staging: {
+        counts: payload.layers.staging.counts,
+        items: payload.layers.staging.items.map((item) => ({
+          sourceField: item.source_field ?? null,
+          sourceFieldNorm: item.source_field_norm ?? null,
+          targetField: item.target_field,
+          targetFieldNorm: item.target_field_norm,
+          status: item.status,
+          sourceOfTruth: item.source_of_truth,
+          seenCount: item.seen_count,
+          averageConfidence: item.average_confidence ?? null,
+          confidenceBand: item.confidence_band,
+          lastSeenAt: item.last_seen_at ?? null,
+        })),
+      },
+      personalMemory: {
+        counts: payload.layers.personal_memory.counts,
+        items: payload.layers.personal_memory.items.map((item) => ({
+          sourceField: item.source_field ?? null,
+          sourceFieldNorm: item.source_field_norm ?? null,
+          targetField: item.target_field,
+          targetFieldNorm: item.target_field_norm,
+          acceptedCount: item.accepted_count,
+          rejectedCount: item.rejected_count,
+          usageCount: item.usage_count,
+          schemaFingerprintCount: item.schema_fingerprint_count,
+          rowCount: item.row_count,
+          averageConfidence: item.average_confidence ?? null,
+          confidenceBand: item.confidence_band,
+          sourceOfTruths: item.source_of_truths,
+          lastSeenAt: item.last_seen_at ?? null,
+        })),
+      },
+      globalKnowledge: {
+        counts: payload.layers.global_knowledge.counts,
+        items: payload.layers.global_knowledge.items.map((item) => ({
+          candidateId: item.candidate_id,
+          sourceField: item.source_field ?? null,
+          sourceFieldNorm: item.source_field_norm,
+          targetField: item.target_field ?? null,
+          targetFieldNorm: item.target_field_norm,
+          status: item.status,
+          semanticRole: item.semantic_role ?? null,
+          conceptCluster: item.concept_cluster ?? null,
+          domainTags: Array.isArray(item.domain_tags) ? item.domain_tags : [],
+          sensitivityScore: item.sensitivity_score ?? null,
+          generalizabilityScore: item.generalizability_score ?? null,
+          supportCount: item.support_count,
+          uniqueUsers: item.unique_users,
+          acceptedCount: item.accepted_count,
+          rejectedCount: item.rejected_count,
+          acceptanceRate: item.acceptance_rate ?? null,
+          stabilityScore: item.stability_score ?? null,
+          driftScore: item.drift_score ?? null,
+          semanticConflictRate: item.semantic_conflict_rate ?? null,
+          averageConfidence: item.average_confidence ?? null,
+          confidenceBand: item.confidence_band,
+          promotionReason: item.promotion_reason ?? null,
+          rejectionReason: item.rejection_reason ?? null,
+          lastSeenAt: item.last_seen_at ?? null,
+        })),
+      },
+      semanticGraph: {
+        counts: payload.layers.semantic_graph.counts,
+        items: payload.layers.semantic_graph.items.map((item) => ({
+          leftField: item.left_field,
+          leftFieldNorm: item.left_field_norm,
+          leftEntityToken: item.left_entity_token ?? null,
+          leftAttributeToken: item.left_attribute_token ?? null,
+          leftRoleLabel: item.left_role_label ?? null,
+          rightField: item.right_field,
+          rightFieldNorm: item.right_field_norm,
+          rightEntityToken: item.right_entity_token ?? null,
+          rightAttributeToken: item.right_attribute_token ?? null,
+          rightRoleLabel: item.right_role_label ?? null,
+          relationKind: item.relation_kind,
+          acceptedCount: item.accepted_count,
+          rejectedCount: item.rejected_count,
+          supportCount: item.support_count,
+          averageConfidence: item.average_confidence ?? null,
+          confidenceBand: item.confidence_band,
+          lastOutcome: item.last_outcome ?? null,
+          sourceOfTruth: item.source_of_truth ?? null,
+          lastSeenAt: item.last_seen_at ?? null,
+        })),
+        clusters: payload.layers.semantic_graph.clusters.map((cluster) => ({
+          clusterId: cluster.cluster_id,
+          size: cluster.size,
+          supportCount: cluster.support_count,
+          sharedAttributes: cluster.shared_attributes,
+          sharedRoles: cluster.shared_roles,
+          entities: cluster.entities,
+          fields: cluster.fields.map((field) => ({
+            field: field.field,
+            fieldNorm: field.field_norm,
+            entityToken: field.entity_token ?? null,
+            attributeToken: field.attribute_token ?? null,
+            roleLabel: field.role_label ?? null,
+          })),
+          edges: cluster.edges.map((edge) => ({
+            leftFieldNorm: edge.left_field_norm,
+            rightFieldNorm: edge.right_field_norm,
+            supportCount: edge.support_count,
+          })),
+        })),
+      },
+    },
+  };
 }
 
 export async function saveLearningCorrections(params: {

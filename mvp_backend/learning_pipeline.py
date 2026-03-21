@@ -14,10 +14,15 @@ from matcher import (
 )
 from model_client import rank_mapping_candidate
 from models import FieldMapping, TargetField
-from storage import get_global_mapping_pattern_candidates, get_personal_mapping_memory_candidates
+from storage import (
+    get_global_mapping_pattern_candidates,
+    get_personal_mapping_memory_candidates,
+    get_semantic_graph_mapping_candidates,
+)
 
 PERSONAL_MEMORY_MIN_SCORE = 0.5
 GLOBAL_PATTERN_MIN_SCORE = 0.72
+SEMANTIC_GRAPH_MIN_SCORE = 0.74
 MODEL_RANK_ACCEPTANCE_THRESHOLD = 0.68
 CANDIDATE_SCORE_MIN_THRESHOLD = 0.16
 CANDIDATE_TOP_K = 5
@@ -122,6 +127,7 @@ def resolve_generation_mappings_detailed(
     )
     global_candidates = _group_candidates_by_target(
         get_global_mapping_pattern_candidates(
+            user_id=user_id,
             source_columns=source_columns,
             target_fields=target_names,
             schema_fingerprint_id=schema_fingerprint_id,
@@ -147,6 +153,7 @@ def resolve_generation_mappings_detailed(
         'deterministic_rule': 0,
         'personal_memory': 0,
         'global_pattern': 0,
+        'semantic_graph': 0,
         'model_suggestion': 0,
         'position_fallback': 0,
         'unresolved': 0,
@@ -236,6 +243,45 @@ def resolve_generation_mappings_detailed(
             explain_rows.append(_build_explain_row(resolved_mapping))
             continue
 
+        graph_candidates = get_semantic_graph_mapping_candidates(
+            user_id=user_id,
+            source_columns=source_columns,
+            target_field=target.name,
+            schema_fingerprint_id=schema_fingerprint_id,
+        )
+        graph_match = _pick_candidate(
+            graph_candidates,
+            used_sources=used_sources,
+            min_score=SEMANTIC_GRAPH_MIN_SCORE,
+        )
+        if graph_match is not None and graph_match.get('source_field'):
+            resolved_mapping = FieldMapping(
+                source=str(graph_match['source_field']),
+                target=target.name,
+                confidence=_score_to_confidence(float(graph_match['score'])),
+                reason=str(graph_match.get('reason') or 'semantic_graph'),
+                status='suggested',
+                source_of_truth='semantic_graph',
+                schema_fingerprint_id=schema_fingerprint_id,
+                candidate_metadata={
+                    'graph_score': graph_match.get('graph_score'),
+                    'context_score': graph_match.get('context_score'),
+                    'graph_path': graph_match.get('path'),
+                    'relation_support': graph_match.get('relation_support'),
+                    'accepted_count': graph_match.get('accepted_count'),
+                    'rejected_count': graph_match.get('rejected_count'),
+                    'context_reason': graph_match.get('context_reason'),
+                },
+            )
+            resolved_by_target[target.name] = resolved_mapping
+            used_sources.add(str(resolved_mapping.source))
+            stats['semantic_graph'] += 1
+            warnings.append(
+                f'Проверьте сопоставление для "{target.name}": использован semantic graph candidate "{resolved_mapping.source}".'
+            )
+            explain_rows.append(_build_explain_row(resolved_mapping))
+            continue
+
         candidate_shortlist = build_candidates_for_unresolved_field(
             target_field=target,
             source_columns=source_columns,
@@ -244,6 +290,7 @@ def resolve_generation_mappings_detailed(
             used_sources=used_sources,
             personal_hints=personal_candidates.get(target_key, []),
             global_hints=global_candidates.get(target_key, []),
+            graph_hints=graph_candidates,
             sample_value_by_source=sample_value_by_source,
         )
         if not candidate_shortlist:
@@ -404,6 +451,7 @@ def resolve_generation_mappings_detailed(
         stats['deterministic_rule'] = 0
         stats['personal_memory'] = 0
         stats['global_pattern'] = 0
+        stats['semantic_graph'] = 0
         stats['model_suggestion'] = 0
         return {
             'mappings': fallback_mappings,
@@ -450,10 +498,11 @@ def build_candidates_for_unresolved_field(
     used_sources: set[str],
     personal_hints: list[dict[str, Any]],
     global_hints: list[dict[str, Any]],
+    graph_hints: list[dict[str, Any]],
     sample_value_by_source: dict[str, Any],
 ) -> list[dict[str, Any]]:
     prepared_target = prepare_field_name(target_field.name, field_type=target_field.type)
-    hint_scores = _build_hint_score_map(personal_hints, global_hints)
+    hint_scores = _build_hint_score_map(personal_hints, global_hints, graph_hints)
     scored_candidates: list[dict[str, Any]] = []
 
     for source_column in source_columns:
@@ -623,7 +672,11 @@ def _pattern_alignment_score(prepared_target: dict[str, Any], prepared_source: d
     return min(score, 1.0)
 
 
-def _build_hint_score_map(personal_hints: list[dict[str, Any]], global_hints: list[dict[str, Any]]) -> dict[str, float]:
+def _build_hint_score_map(
+    personal_hints: list[dict[str, Any]],
+    global_hints: list[dict[str, Any]],
+    graph_hints: list[dict[str, Any]],
+) -> dict[str, float]:
     score_map: dict[str, float] = {}
     for hint in personal_hints:
         source_field = hint.get('source_field')
@@ -635,6 +688,12 @@ def _build_hint_score_map(personal_hints: list[dict[str, Any]], global_hints: li
         if not source_field:
             continue
         score_map[str(source_field)] = max(score_map.get(str(source_field), 0.0), float(hint.get('score', 0.0)) * 0.9)
+    for hint in graph_hints:
+        source_field = hint.get('source_field')
+        if not source_field:
+            continue
+        graph_score = float(hint.get('score', 0.0))
+        score_map[str(source_field)] = max(score_map.get(str(source_field), 0.0), min(graph_score, 1.0))
     return score_map
 
 

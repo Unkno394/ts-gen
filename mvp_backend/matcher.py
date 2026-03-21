@@ -116,6 +116,32 @@ IMPORTANT_DOMAIN_TOKENS = {
     'unit',
 }
 
+ROLE_LABEL_BY_TOKEN = {
+    'id': 'identifier',
+    'name': 'label',
+    'description': 'description',
+    'date': 'timestamp',
+    'created': 'timestamp',
+    'updated': 'timestamp',
+    'amount': 'numeric_value',
+    'revenue': 'numeric_value',
+    'quantity': 'numeric_value',
+    'boolean': 'flag',
+    'unit': 'unit',
+}
+
+ATTRIBUTE_STOPWORDS = {
+    'deal',
+    'customer',
+    'organization',
+    'product',
+    'creator',
+    'responsible',
+    'source',
+    'partner',
+    'license',
+}
+
 
 def map_fields(
     source_columns: list[str],
@@ -197,6 +223,7 @@ def prepare_field_name(value: str, *, field_type: str | None = None) -> dict[str
     raw_tokens = _raw_tokens(original)
     transliterated_tokens = [_transliterate_token(token) for token in raw_tokens]
     canonical_tokens = [_canonicalize_token(token) for token in transliterated_tokens]
+    semantic_parts = _extract_semantic_parts(canonical_tokens)
 
     normalized_name = ' '.join(transliterated_tokens)
     canonical_name = ' '.join(canonical_tokens)
@@ -211,6 +238,11 @@ def prepare_field_name(value: str, *, field_type: str | None = None) -> dict[str
         'canonical_set': set(canonical_tokens),
         'field_type': field_type,
         'type_hints': _infer_name_type_hints(canonical_tokens),
+        'entity_token': semantic_parts['entity_token'],
+        'entity_tokens': semantic_parts['entity_tokens'],
+        'attribute_token': semantic_parts['attribute_token'],
+        'role_label': semantic_parts['role_label'],
+        'context_tokens': semantic_parts['context_tokens'],
     }
 
 
@@ -380,6 +412,45 @@ def _infer_name_type_hints(tokens: list[str]) -> set[str]:
     if 'name' in token_set or 'description' in token_set:
         hints.add('string')
     return hints
+
+
+def _extract_semantic_parts(canonical_tokens: list[str]) -> dict[str, Any]:
+    if not canonical_tokens:
+        return {
+            'entity_token': None,
+            'entity_tokens': [],
+            'attribute_token': None,
+            'role_label': None,
+            'context_tokens': [],
+        }
+
+    attribute_token = _pick_attribute_token(canonical_tokens)
+    role_label = ROLE_LABEL_BY_TOKEN.get(attribute_token) if attribute_token else None
+
+    entity_tokens = [
+        token
+        for token in canonical_tokens
+        if token != attribute_token and token not in ATTRIBUTE_STOPWORDS and token not in {'with', 'without'}
+    ]
+    if not entity_tokens:
+        entity_tokens = [token for token in canonical_tokens if token != attribute_token]
+
+    entity_token = entity_tokens[0] if entity_tokens else None
+    context_tokens = sorted({token for token in canonical_tokens if token != attribute_token})
+    return {
+        'entity_token': entity_token,
+        'entity_tokens': entity_tokens,
+        'attribute_token': attribute_token,
+        'role_label': role_label,
+        'context_tokens': context_tokens,
+    }
+
+
+def _pick_attribute_token(canonical_tokens: list[str]) -> str | None:
+    for token in reversed(canonical_tokens):
+        if token in ROLE_LABEL_BY_TOKEN:
+            return token
+    return canonical_tokens[-1] if canonical_tokens else None
 
 
 def _looks_like_date(value: str) -> bool:
