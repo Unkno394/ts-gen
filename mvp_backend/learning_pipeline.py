@@ -79,6 +79,7 @@ def resolve_generation_mappings(
     source_rows: list[dict[str, Any]] | None = None,
     user_id: str | None = None,
     schema_fingerprint_id: int | None = None,
+    enable_semantic_graph: bool = True,
 ) -> tuple[list[FieldMapping], list[str]]:
     result = resolve_generation_mappings_detailed(
         source_columns=source_columns,
@@ -86,6 +87,7 @@ def resolve_generation_mappings(
         source_rows=source_rows,
         user_id=user_id,
         schema_fingerprint_id=schema_fingerprint_id,
+        enable_semantic_graph=enable_semantic_graph,
     )
     return result['mappings'], result['warnings']
 
@@ -97,6 +99,7 @@ def resolve_generation_mappings_detailed(
     source_rows: list[dict[str, Any]] | None = None,
     user_id: str | None = None,
     schema_fingerprint_id: int | None = None,
+    enable_semantic_graph: bool = True,
 ) -> dict[str, Any]:
     logger.info(
         'mapping pipeline start: source_columns=%d target_fields=%d user_id=%s schema_fingerprint_id=%s sample_rows=%d',
@@ -243,11 +246,15 @@ def resolve_generation_mappings_detailed(
             explain_rows.append(_build_explain_row(resolved_mapping))
             continue
 
-        graph_candidates = get_semantic_graph_mapping_candidates(
-            user_id=user_id,
-            source_columns=source_columns,
-            target_field=target.name,
-            schema_fingerprint_id=schema_fingerprint_id,
+        graph_candidates = (
+            get_semantic_graph_mapping_candidates(
+                user_id=user_id,
+                source_columns=source_columns,
+                target_field=target.name,
+                schema_fingerprint_id=schema_fingerprint_id,
+            )
+            if enable_semantic_graph
+            else []
         )
         graph_match = _pick_candidate(
             graph_candidates,

@@ -1,0 +1,260 @@
+[
+  {
+    "case_id": "transitive_identifier_match",
+    "category": "transitive_link",
+    "focus": "transitive_graph_reuse",
+    "expected_graph_behavior": "improves_exact_match_and_reduces_unresolved",
+    "user_id": "benchmark-graph-user-1",
+    "seed_corrections": [
+      {
+        "source_field": "user_id",
+        "target_field": "accountId",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "id",
+        "target_field": "user_id",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["id", "comment"],
+    "source_rows": [{"id": "42", "comment": "hello"}],
+    "target_fields": [{"name": "accountId", "type": "string"}],
+    "expected_sources": {
+      "accountId": "id"
+    }
+  },
+  {
+    "case_id": "concept_cluster_amount_fallback",
+    "category": "cold_start",
+    "focus": "concept_fallback_recall",
+    "expected_graph_behavior": "currently_no_gain_documented",
+    "user_id": "benchmark-graph-user-2",
+    "seed_corrections": [
+      {
+        "source_field": "invoice_amount",
+        "target_field": "dealAmount",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "net_amount",
+        "target_field": "invoice_amount",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["net_amount", "comment"],
+    "source_rows": [{"net_amount": "1200", "comment": "paid"}],
+    "target_fields": [{"name": "contractAmount", "type": "number"}],
+    "expected_sources": {
+      "contractAmount": "net_amount"
+    }
+  },
+  {
+    "case_id": "purchaser_identifier_cold_start",
+    "category": "cold_start",
+    "focus": "role_neighbor_identifier_recall",
+    "expected_graph_behavior": "desired_gain_not_achieved_yet",
+    "notes": "stricter proxy for buyer_identifier because buyerIdentifier already resolves deterministically",
+    "user_id": "benchmark-graph-user-8",
+    "seed_corrections": [
+      {
+        "source_field": "customer_id",
+        "target_field": "customerId",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "client_id",
+        "target_field": "clientId",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["client_id", "comment"],
+    "source_rows": [{"client_id": "c-1", "comment": "new buyer"}],
+    "target_fields": [{"name": "purchaserIdentifier", "type": "string"}],
+    "expected_sources": {
+      "purchaserIdentifier": "client_id"
+    }
+  },
+  {
+    "case_id": "signup_timestamp_cold_start",
+    "category": "cold_start",
+    "focus": "timestamp_neighbor_recall",
+    "expected_graph_behavior": "desired_gain_not_achieved_yet",
+    "user_id": "benchmark-graph-user-9",
+    "seed_corrections": [
+      {
+        "source_field": "created_at",
+        "target_field": "createdAt",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "registration_date",
+        "target_field": "registeredAt",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["registration_date", "comment"],
+    "source_rows": [{"registration_date": "2026-03-21", "comment": "signed"}],
+    "target_fields": [{"name": "signupTimestamp", "type": "string"}],
+    "expected_sources": {
+      "signupTimestamp": "registration_date"
+    }
+  },
+  {
+    "case_id": "payment_gross_cold_start",
+    "category": "cold_start",
+    "focus": "amount_cluster_recall",
+    "expected_graph_behavior": "desired_gain_not_achieved_yet",
+    "user_id": "benchmark-graph-user-10",
+    "seed_corrections": [
+      {
+        "source_field": "amount_total",
+        "target_field": "grossAmount",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "payment_sum",
+        "target_field": "totalAmount",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["payment_sum", "comment"],
+    "source_rows": [{"payment_sum": "120", "comment": "paid"}],
+    "target_fields": [{"name": "paymentGross", "type": "number"}],
+    "expected_sources": {
+      "paymentGross": "payment_sum"
+    }
+  },
+  {
+    "case_id": "timestamp_conflict_should_stay_unresolved",
+    "category": "conflict_guard",
+    "focus": "fallback_should_not_force_match",
+    "expected_graph_behavior": "must_stay_unresolved_without_false_positive",
+    "user_id": "benchmark-graph-user-3",
+    "seed_corrections": [
+      {
+        "source_field": "created_at",
+        "target_field": "createdAt",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "updated_at",
+        "target_field": "updatedAt",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["updated_on", "comment"],
+    "source_rows": [{"updated_on": "2026-03-21", "comment": "done"}],
+    "target_fields": [{"name": "createdAt", "type": "string"}],
+    "expected_sources": {
+      "createdAt": null
+    }
+  },
+  {
+    "case_id": "amount_vs_revenue_should_stay_unresolved",
+    "category": "concept_fallback_guard",
+    "focus": "adjacent_numeric_concepts_must_not_collapse",
+    "expected_graph_behavior": "must_stay_unresolved_without_false_positive",
+    "user_id": "benchmark-graph-user-5",
+    "seed_corrections": [
+      {
+        "source_field": "amount",
+        "target_field": "dealAmount",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "revenue",
+        "target_field": "dealRevenue",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["amount", "comment"],
+    "source_rows": [{"amount": "100", "comment": "booked"}],
+    "target_fields": [{"name": "dealRevenue", "type": "number"}],
+    "expected_sources": {
+      "dealRevenue": null
+    }
+  },
+  {
+    "case_id": "customer_vs_company_should_stay_unresolved",
+    "category": "role_fallback_guard",
+    "focus": "entity_name_similarity_must_not_collapse",
+    "expected_graph_behavior": "must_stay_unresolved_without_false_positive",
+    "user_id": "benchmark-graph-user-6",
+    "seed_corrections": [
+      {
+        "source_field": "customer_name",
+        "target_field": "customerName",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "company_name",
+        "target_field": "companyName",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["company_name", "comment"],
+    "source_rows": [{"company_name": "Acme LLC", "comment": "active"}],
+    "target_fields": [{"name": "customerName", "type": "string"}],
+    "expected_sources": {
+      "customerName": null
+    }
+  },
+  {
+    "case_id": "owner_vs_product_id_should_stay_unresolved",
+    "category": "role_fallback_guard",
+    "focus": "identifier_entity_similarity_must_not_collapse",
+    "expected_graph_behavior": "must_stay_unresolved_without_false_positive",
+    "user_id": "benchmark-graph-user-7",
+    "seed_corrections": [
+      {
+        "source_field": "owner_id",
+        "target_field": "ownerId",
+        "confidence_after": 1.0,
+        "accepted": true
+      },
+      {
+        "source_field": "product_id",
+        "target_field": "productId",
+        "confidence_after": 1.0,
+        "accepted": true
+      }
+    ],
+    "source_columns": ["product_id", "comment"],
+    "source_rows": [{"product_id": "p-1", "comment": "active"}],
+    "target_fields": [{"name": "ownerId", "type": "string"}],
+    "expected_sources": {
+      "ownerId": null
+    }
+  },
+  {
+    "case_id": "baseline_exact_match_without_graph",
+    "category": "deterministic_baseline",
+    "focus": "graph_should_not_change_good_deterministic_match",
+    "expected_graph_behavior": "should_stay_unchanged",
+    "user_id": "benchmark-graph-user-4",
+    "seed_corrections": [],
+    "source_columns": ["customer_name", "amount"],
+    "source_rows": [{"customer_name": "Acme", "amount": "10"}],
+    "target_fields": [{"name": "customerName", "type": "string"}],
+    "expected_sources": {
+      "customerName": "customer_name"
+    }
+  }
+]

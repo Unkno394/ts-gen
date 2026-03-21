@@ -432,6 +432,27 @@ class StorageLearningTests(unittest.TestCase):
             generation_id=generation_id,
         )
         self.assertTrue(result['promoted'])
+        self.assertTrue(result['canonical_state']['updated'])
+
+        db = storage.get_db()
+        current_version = db.get(
+            '''
+            SELECT version_number
+            FROM generation_versions
+            WHERE id = (
+                SELECT current_version_id
+                FROM generations
+                WHERE id = :generation_id
+            )
+            ''',
+            {'generation_id': generation_id},
+        )
+        self.assertEqual(int(current_version['version_number']), 2)
+
+        history_item = storage.get_history('user-confirm-generation')[0]
+        current_mappings = json.loads(history_item['mappings_json'])
+        self.assertEqual(current_mappings[0]['status'], 'accepted')
+        self.assertEqual(current_mappings[0]['source_of_truth'], 'model_suggestion')
 
         second_result = storage.confirm_generation_learning(
             user_id='user-confirm-generation',
@@ -439,6 +460,7 @@ class StorageLearningTests(unittest.TestCase):
         )
         self.assertTrue(second_result['promoted'])
         self.assertTrue(second_result['already_promoted'])
+        self.assertFalse(second_result['canonical_state']['updated'])
 
     def test_save_mapping_suggestions_allows_global_pattern_source(self) -> None:
         generation_id = storage.save_generation(

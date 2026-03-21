@@ -51,6 +51,52 @@ type BackendGenerateResponse = {
   generated_typescript: string;
   preview: Record<string, unknown>[];
   warnings: string[];
+  target_schema?: Record<string, unknown> | unknown[] | null;
+  required_fields?: string[];
+  ts_valid?: boolean;
+  ts_diagnostics?: Array<{
+    path?: string;
+    code?: string;
+    expected?: string;
+    actual?: string;
+    message: string;
+    source?: string;
+  }>;
+  preview_diagnostics?: Array<{
+    path?: string;
+    code?: string;
+    expected?: string;
+    actual?: string;
+    message: string;
+    source?: string;
+  }>;
+  mapping_operational_status?: {
+    status: 'high' | 'medium' | 'low';
+    resolved_count: number;
+    unresolved_count: number;
+    resolved_ratio: number;
+    review_ratio: number;
+    stats: Record<string, number>;
+  };
+  mapping_quality?: {
+    status: 'high' | 'medium' | 'low';
+    resolved_count: number;
+    unresolved_count: number;
+    resolved_ratio: number;
+    review_ratio: number;
+    stats: Record<string, number>;
+  };
+  mapping_eval_metrics?: {
+    available: boolean;
+    exact_match_rate?: number | null;
+    false_positive_rate?: number | null;
+    unresolved_rate?: number | null;
+    accepted_after_review_rate?: number | null;
+    notes?: string | null;
+  } | null;
+  ts_syntax_valid?: boolean;
+  ts_runtime_preview_valid?: boolean;
+  output_schema_valid?: boolean;
 };
 
 type BackendSourcePreviewResponse = {
@@ -90,6 +136,69 @@ type BackendHistoryResponse = {
     generated_typescript: string;
     preview: Record<string, unknown>[];
     warnings: string[];
+    validation?: {
+      target_schema?: Record<string, unknown> | unknown[] | null;
+      target_schema_summary?: {
+        root_type?: string;
+        required_fields?: string[];
+        field_count?: number;
+        root_is_array?: boolean;
+      } | null;
+      ts_validation?: {
+        valid?: boolean;
+        compiler_available?: boolean;
+        diagnostics?: Array<{
+          path?: string;
+          code?: string;
+          expected?: string;
+          actual?: string;
+          message: string;
+          source?: string;
+        }>;
+      } | null;
+      preview_validation?: {
+        runtime_valid?: boolean;
+        schema_valid?: boolean;
+        diagnostics?: Array<{
+          path?: string;
+          code?: string;
+          expected?: string;
+          actual?: string;
+          message: string;
+          source?: string;
+        }>;
+        validated_rows?: number;
+      } | null;
+      quality_summary?: {
+        operational_mapping_status?: {
+          status: 'high' | 'medium' | 'low';
+          resolved_count: number;
+          unresolved_count: number;
+          resolved_ratio: number;
+          review_ratio: number;
+          stats: Record<string, number>;
+        } | null;
+        mapping_quality?: {
+          status: 'high' | 'medium' | 'low';
+          resolved_count: number;
+          unresolved_count: number;
+          resolved_ratio: number;
+          review_ratio: number;
+          stats: Record<string, number>;
+        } | null;
+        true_quality_metrics?: {
+          available: boolean;
+          exact_match_rate?: number | null;
+          false_positive_rate?: number | null;
+          unresolved_rate?: number | null;
+          accepted_after_review_rate?: number | null;
+          notes?: string | null;
+        } | null;
+        ts_syntax_valid?: boolean;
+        ts_runtime_preview_valid?: boolean;
+        output_schema_valid?: boolean;
+      } | null;
+    } | null;
     created_at: string;
   }>;
 };
@@ -489,6 +598,58 @@ function parseConfidence(value: 'high' | 'medium' | 'low' | 'none'): 'high' | 'm
   return value;
 }
 
+function normalizeOperationalMappingStatus(
+  payload:
+    | {
+        status: 'high' | 'medium' | 'low';
+        resolved_count: number;
+        unresolved_count: number;
+        resolved_ratio: number;
+        review_ratio: number;
+        stats: Record<string, number>;
+      }
+    | null
+    | undefined
+) {
+  if (!payload) {
+    return null;
+  }
+  return {
+    status: payload.status,
+    resolvedCount: payload.resolved_count,
+    unresolvedCount: payload.unresolved_count,
+    resolvedRatio: payload.resolved_ratio,
+    reviewRatio: payload.review_ratio,
+    stats: payload.stats,
+  };
+}
+
+function normalizeTrueQualityMetrics(
+  payload:
+    | {
+        available: boolean;
+        exact_match_rate?: number | null;
+        false_positive_rate?: number | null;
+        unresolved_rate?: number | null;
+        accepted_after_review_rate?: number | null;
+        notes?: string | null;
+      }
+    | null
+    | undefined
+) {
+  if (!payload) {
+    return null;
+  }
+  return {
+    available: payload.available,
+    exactMatchRate: payload.exact_match_rate ?? null,
+    falsePositiveRate: payload.false_positive_rate ?? null,
+    unresolvedRate: payload.unresolved_rate ?? null,
+    acceptedAfterReviewRate: payload.accepted_after_review_rate ?? null,
+    notes: payload.notes ?? null,
+  };
+}
+
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -709,6 +870,16 @@ export async function generateFromBackend({ file, targetJson, userId: _userId, s
     })),
     preview: payload.preview,
     warnings: payload.warnings,
+    targetSchema: payload.target_schema ?? null,
+    requiredFields: payload.required_fields ?? [],
+    tsValid: payload.ts_valid ?? false,
+    tsDiagnostics: payload.ts_diagnostics ?? [],
+    previewDiagnostics: payload.preview_diagnostics ?? [],
+    mappingOperationalStatus: normalizeOperationalMappingStatus(payload.mapping_operational_status ?? payload.mapping_quality),
+    mappingEvalMetrics: normalizeTrueQualityMetrics(payload.mapping_eval_metrics),
+    tsSyntaxValid: payload.ts_syntax_valid ?? false,
+    tsRuntimePreviewValid: payload.ts_runtime_preview_valid ?? false,
+    outputSchemaValid: payload.output_schema_valid ?? false,
   };
 }
 
@@ -767,6 +938,45 @@ export async function fetchHistory(_userId: string): Promise<HistoryItem[]> {
     })),
     preview: item.preview,
     warnings: item.warnings,
+    validation: item.validation
+      ? {
+          targetSchema: item.validation.target_schema ?? null,
+          targetSchemaSummary: item.validation.target_schema_summary
+            ? {
+                rootType: item.validation.target_schema_summary.root_type,
+                requiredFields: item.validation.target_schema_summary.required_fields ?? [],
+                fieldCount: item.validation.target_schema_summary.field_count,
+                rootIsArray: item.validation.target_schema_summary.root_is_array,
+              }
+            : null,
+          tsValidation: item.validation.ts_validation
+            ? {
+                valid: item.validation.ts_validation.valid,
+                compilerAvailable: item.validation.ts_validation.compiler_available,
+                diagnostics: item.validation.ts_validation.diagnostics ?? [],
+              }
+            : null,
+          previewValidation: item.validation.preview_validation
+            ? {
+                runtimeValid: item.validation.preview_validation.runtime_valid,
+                schemaValid: item.validation.preview_validation.schema_valid,
+                diagnostics: item.validation.preview_validation.diagnostics ?? [],
+                validatedRows: item.validation.preview_validation.validated_rows,
+              }
+            : null,
+          qualitySummary: item.validation.quality_summary
+            ? {
+                operationalMappingStatus: normalizeOperationalMappingStatus(
+                  item.validation.quality_summary.operational_mapping_status ?? item.validation.quality_summary.mapping_quality
+                ),
+                trueQualityMetrics: normalizeTrueQualityMetrics(item.validation.quality_summary.true_quality_metrics),
+                tsSyntaxValid: item.validation.quality_summary.ts_syntax_valid,
+                tsRuntimePreviewValid: item.validation.quality_summary.ts_runtime_preview_valid,
+                outputSchemaValid: item.validation.quality_summary.output_schema_valid,
+              }
+            : null,
+        }
+      : null,
   }));
 }
 

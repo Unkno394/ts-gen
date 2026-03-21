@@ -75,12 +75,14 @@ CREATE TABLE IF NOT EXISTS generation_artifacts (
   mappings_json TEXT NOT NULL,
   preview_json TEXT NOT NULL,
   warnings_json TEXT NOT NULL,
+  validation_json TEXT NOT NULL DEFAULT '{}',
   legacy_history_id INTEGER UNIQUE,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   CHECK (json_valid(parsed_file_json)),
   CHECK (json_valid(mappings_json)),
   CHECK (json_valid(preview_json)),
   CHECK (json_valid(warnings_json)),
+  CHECK (json_valid(validation_json)),
   FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE,
   FOREIGN KEY (version_id) REFERENCES generation_versions(id) ON DELETE CASCADE
 );

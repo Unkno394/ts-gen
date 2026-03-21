@@ -1,0 +1,234 @@
+[
+  {
+    "field_name": "user_id",
+    "category": "core",
+    "expected_entity": "user",
+    "expected_attribute": "id",
+    "expected_role": "identifier",
+    "notes": "baseline identifier field"
+  },
+  {
+    "field_name": "productId",
+    "category": "core",
+    "expected_entity": "product",
+    "expected_attribute": "id",
+    "expected_role": "identifier",
+    "notes": "camelCase identifier field"
+  },
+  {
+    "field_name": "customerName",
+    "category": "core",
+    "expected_entity": "customer",
+    "expected_attribute": "name",
+    "expected_role": "label",
+    "notes": "entity plus label"
+  },
+  {
+    "field_name": "organizationDescription",
+    "category": "core",
+    "expected_entity": "organization",
+    "expected_attribute": "description",
+    "expected_role": "description",
+    "notes": "entity plus description"
+  },
+  {
+    "field_name": "dealAmount",
+    "category": "core",
+    "expected_entity": "deal",
+    "expected_attribute": "amount",
+    "expected_role": "numeric_value",
+    "notes": "numeric business amount"
+  },
+  {
+    "field_name": "grossAmount",
+    "category": "core",
+    "expected_entity": "gross",
+    "expected_attribute": "amount",
+    "expected_role": "numeric_value",
+    "notes": "gross amount cluster"
+  },
+  {
+    "field_name": "partnerFlag",
+    "category": "core",
+    "expected_entity": "partner",
+    "expected_attribute": "boolean",
+    "expected_role": "flag",
+    "notes": "boolean semantic role"
+  },
+  {
+    "field_name": "licenseUnit",
+    "category": "core",
+    "expected_entity": "license",
+    "expected_attribute": "unit",
+    "expected_role": "unit",
+    "notes": "unit semantic role"
+  },
+  {
+    "field_name": "manager",
+    "category": "homonym",
+    "expected_entity": null,
+    "expected_attribute": "responsible",
+    "expected_role": null,
+    "notes": "manager collapses to responsible synonym"
+  },
+  {
+    "field_name": "owner",
+    "category": "homonym",
+    "expected_entity": null,
+    "expected_attribute": "responsible",
+    "expected_role": null,
+    "notes": "owner is treated as responsible synonym"
+  },
+  {
+    "field_name": "lead",
+    "category": "homonym",
+    "expected_entity": null,
+    "expected_attribute": "lead",
+    "expected_role": null,
+    "notes": "ambiguous short field kept literal"
+  },
+  {
+    "field_name": "responsible",
+    "category": "homonym",
+    "expected_entity": null,
+    "expected_attribute": "responsible",
+    "expected_role": null,
+    "notes": "canonical responsible token"
+  },
+  {
+    "field_name": "creator",
+    "category": "homonym",
+    "expected_entity": null,
+    "expected_attribute": "creator",
+    "expected_role": null,
+    "notes": "creator stays as its own attribute token"
+  },
+  {
+    "field_name": "id",
+    "category": "neutral",
+    "expected_entity": null,
+    "expected_attribute": "id",
+    "expected_role": "identifier",
+    "notes": "neutral bare identifier"
+  },
+  {
+    "field_name": "name",
+    "category": "neutral",
+    "expected_entity": null,
+    "expected_attribute": "name",
+    "expected_role": "label",
+    "notes": "neutral bare label"
+  },
+  {
+    "field_name": "code",
+    "category": "neutral",
+    "expected_entity": null,
+    "expected_attribute": "code",
+    "expected_role": null,
+    "notes": "neutral code field without entity"
+  },
+  {
+    "field_name": "value",
+    "category": "neutral",
+    "expected_entity": null,
+    "expected_attribute": "value",
+    "expected_role": null,
+    "notes": "neutral value field"
+  },
+  {
+    "field_name": "date",
+    "category": "neutral",
+    "expected_entity": null,
+    "expected_attribute": "date",
+    "expected_role": "timestamp",
+    "notes": "neutral bare timestamp"
+  },
+  {
+    "field_name": "tax_residency_code",
+    "category": "domain",
+    "expected_entity": "tax",
+    "expected_attribute": "code",
+    "expected_role": null,
+    "notes": "domain identifier-like code with multi-token entity"
+  },
+  {
+    "field_name": "beneficiary_country",
+    "category": "domain",
+    "expected_entity": "beneficiary",
+    "expected_attribute": "country",
+    "expected_role": null,
+    "notes": "domain entity plus country attribute"
+  },
+  {
+    "field_name": "fatca_status",
+    "category": "domain",
+    "expected_entity": "fatca",
+    "expected_attribute": "status",
+    "expected_role": null,
+    "notes": "regulatory domain status"
+  },
+  {
+    "field_name": "pep_flag",
+    "category": "domain",
+    "expected_entity": "pep",
+    "expected_attribute": "boolean",
+    "expected_role": "flag",
+    "notes": "regulatory boolean flag"
+  },
+  {
+    "field_name": "account_open_date",
+    "category": "domain",
+    "expected_entity": "account",
+    "expected_attribute": "date",
+    "expected_role": "timestamp",
+    "notes": "account lifecycle date"
+  },
+  {
+    "field_name": "датаСоздания",
+    "category": "mixed_language",
+    "expected_entity": "date",
+    "expected_attribute": "created",
+    "expected_role": "timestamp",
+    "notes": "cyrillic camelCase transliterated to creation date"
+  },
+  {
+    "field_name": "summa_oplaty",
+    "category": "mixed_language",
+    "expected_entity": "oplaty",
+    "expected_attribute": "amount",
+    "expected_role": "numeric_value",
+    "notes": "transliterated amount phrase"
+  },
+  {
+    "field_name": "client-phone",
+    "category": "mixed_language",
+    "expected_entity": "customer",
+    "expected_attribute": "phone",
+    "expected_role": null,
+    "notes": "mixed language with synonym normalization"
+  },
+  {
+    "field_name": "ИНН",
+    "category": "mixed_language",
+    "expected_entity": null,
+    "expected_attribute": "inn",
+    "expected_role": "identifier",
+    "notes": "russian tax id should behave like identifier"
+  },
+  {
+    "field_name": "taxId",
+    "category": "mixed_language",
+    "expected_entity": "tax",
+    "expected_attribute": "id",
+    "expected_role": "identifier",
+    "notes": "mixed domain plus identifier"
+  },
+  {
+    "field_name": "kod_strany",
+    "category": "mixed_language",
+    "expected_entity": "strany",
+    "expected_attribute": "code",
+    "expected_role": null,
+    "notes": "transliterated country code should stay code, not generic id"
+  }
+]

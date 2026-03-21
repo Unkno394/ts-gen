@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates nodejs npm \
+    && npm install -g typescript@5.9.3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

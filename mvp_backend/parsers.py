@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+from copy import deepcopy
 import sys
 from datetime import date, datetime, time
 from pathlib import Path
@@ -393,19 +394,183 @@ def _filter_sparse_rows(columns: list[str], rows: list[dict[str, Any]]) -> list[
 
 
 
-def infer_target_fields(target_json_raw: str) -> tuple[list[TargetField], dict[str, Any]]:
+def infer_target_fields(target_json_raw: str) -> tuple[list[TargetField], dict[str, Any] | list[Any]]:
+    target_fields, payload, _, _ = parse_target_schema(target_json_raw)
+    return target_fields, payload
+
+
+def parse_target_schema(
+    target_json_raw: str,
+) -> tuple[list[TargetField], dict[str, Any] | list[Any], dict[str, Any], dict[str, Any]]:
+    payload, duplicate_keys = _load_target_json_with_duplicate_tracking(target_json_raw)
+
+    if duplicate_keys:
+        duplicates = ', '.join(sorted(set(duplicate_keys)))
+        raise ParseError(f'Target JSON contains duplicate keys: {duplicates}')
+
+    if not isinstance(payload, (dict, list)):
+        raise ParseError('Target JSON must be an object or an array of objects.')
+
+    target_schema = _build_target_schema(payload, path='$')
+    root_object_schema = _resolve_root_object_schema(target_schema)
+    target_fields = _extract_target_fields_from_schema(root_object_schema)
+    schema_summary = {
+        'root_type': target_schema['type'],
+        'required_fields': list(root_object_schema.get('required_fields', [])),
+        'field_count': len(target_fields),
+        'root_is_array': target_schema['type'] == 'array',
+    }
+    return target_fields, payload, target_schema, schema_summary
+
+
+def _load_target_json_with_duplicate_tracking(target_json_raw: str) -> tuple[Any, list[str]]:
+    duplicate_keys: list[str] = []
+
+    def _object_pairs_hook(pairs: list[tuple[Any, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            key_text = key if isinstance(key, str) else str(key)
+            if key_text in result:
+                duplicate_keys.append(key_text)
+            result[key_text] = value
+        return result
+
     try:
-        payload = json.loads(target_json_raw)
+        payload = json.loads(target_json_raw, object_pairs_hook=_object_pairs_hook)
     except json.JSONDecodeError as exc:
         raise ParseError(f'Invalid target JSON: {exc}') from exc
 
-    if not isinstance(payload, dict):
-        raise ParseError('Target JSON must be an object.')
+    return payload, duplicate_keys
 
+
+def _build_target_schema(value: Any, *, path: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        properties: dict[str, Any] = {}
+        required_fields: list[str] = []
+        for key, nested_value in value.items():
+            if not isinstance(key, str):
+                raise ParseError(f'Target JSON key at {path} must be a string.')
+            normalized_key = key.strip()
+            if not normalized_key:
+                raise ParseError(f'Target JSON contains an empty key at {path}.')
+            if normalized_key in properties:
+                raise ParseError(f'Target JSON contains duplicate key "{normalized_key}" at {path}.')
+            child_path = f'{path}.{normalized_key}'
+            properties[normalized_key] = _build_target_schema(nested_value, path=child_path)
+            required_fields.append(normalized_key)
+        return {
+            'type': 'object',
+            'nullable': False,
+            'properties': properties,
+            'required_fields': required_fields,
+        }
+
+    if isinstance(value, list):
+        if not value:
+            return {
+                'type': 'array',
+                'nullable': False,
+                'items': {'type': 'any', 'nullable': True},
+            }
+
+        item_schemas = [_build_target_schema(item, path=f'{path}[]') for item in value]
+        merged_item_schema = _merge_array_item_schemas(item_schemas, path=f'{path}[]')
+        return {
+            'type': 'array',
+            'nullable': False,
+            'items': merged_item_schema,
+        }
+
+    inferred_type = _infer_type(value)
+    return {
+        'type': inferred_type,
+        'nullable': value is None,
+    }
+
+
+def _merge_array_item_schemas(item_schemas: list[dict[str, Any]], *, path: str) -> dict[str, Any]:
+    non_null_schemas = [schema for schema in item_schemas if schema.get('type') != 'null']
+    nullable = len(non_null_schemas) != len(item_schemas)
+
+    if not non_null_schemas:
+        return {'type': 'null', 'nullable': True}
+
+    merged = deepcopy(non_null_schemas[0])
+    merged['nullable'] = bool(merged.get('nullable')) or nullable
+
+    for schema in non_null_schemas[1:]:
+        if merged.get('type') != schema.get('type'):
+            raise ParseError(f'Target JSON contains conflicting array item types at {path}.')
+        if merged.get('type') == 'object':
+            merged = _merge_object_schemas(merged, schema, path=path)
+            merged['nullable'] = bool(merged.get('nullable')) or nullable
+            continue
+        if merged.get('type') == 'array':
+            merged['items'] = _merge_array_item_schemas(
+                [merged.get('items', {'type': 'any'}), schema.get('items', {'type': 'any'})],
+                path=f'{path}[]',
+            )
+            merged['nullable'] = bool(merged.get('nullable')) or nullable
+
+    return merged
+
+
+def _merge_object_schemas(left: dict[str, Any], right: dict[str, Any], *, path: str) -> dict[str, Any]:
+    merged = deepcopy(left)
+    left_properties = dict(merged.get('properties', {}))
+    right_properties = dict(right.get('properties', {}))
+    all_keys = sorted(set(left_properties) | set(right_properties))
+    required_fields = set(merged.get('required_fields', [])) & set(right.get('required_fields', []))
+    merged_properties: dict[str, Any] = {}
+
+    for key in all_keys:
+        child_path = f'{path}.{key}'
+        left_schema = left_properties.get(key)
+        right_schema = right_properties.get(key)
+        if left_schema is None:
+            merged_properties[key] = deepcopy(right_schema)
+            continue
+        if right_schema is None:
+            merged_properties[key] = deepcopy(left_schema)
+            continue
+        if left_schema.get('type') != right_schema.get('type'):
+            raise ParseError(f'Target JSON contains conflicting types for "{key}" at {child_path}.')
+        if left_schema.get('type') == 'object':
+            merged_properties[key] = _merge_object_schemas(left_schema, right_schema, path=child_path)
+        elif left_schema.get('type') == 'array':
+            merged_properties[key] = deepcopy(left_schema)
+            merged_properties[key]['items'] = _merge_array_item_schemas(
+                [left_schema.get('items', {'type': 'any'}), right_schema.get('items', {'type': 'any'})],
+                path=f'{child_path}[]',
+            )
+        else:
+            merged_properties[key] = deepcopy(left_schema)
+            merged_properties[key]['nullable'] = bool(left_schema.get('nullable')) or bool(right_schema.get('nullable'))
+
+    merged['properties'] = merged_properties
+    merged['required_fields'] = [key for key in all_keys if key in required_fields]
+    return merged
+
+
+def _resolve_root_object_schema(target_schema: dict[str, Any]) -> dict[str, Any]:
+    if target_schema.get('type') == 'object':
+        return target_schema
+    if target_schema.get('type') == 'array':
+        item_schema = target_schema.get('items') or {}
+        if item_schema.get('type') != 'object':
+            raise ParseError('Target JSON array root must contain objects.')
+        return item_schema
+    raise ParseError('Target JSON must describe an object structure.')
+
+
+def _extract_target_fields_from_schema(object_schema: dict[str, Any]) -> list[TargetField]:
     fields: list[TargetField] = []
-    for key, value in payload.items():
-        fields.append(TargetField(name=key, type=_infer_type(value)))
-    return fields, payload
+    for key, field_schema in dict(object_schema.get('properties', {})).items():
+        field_type = field_schema.get('type', 'any')
+        if field_type not in {'string', 'number', 'boolean', 'object', 'array', 'null', 'any'}:
+            field_type = 'any'
+        fields.append(TargetField(name=key, type=field_type))
+    return fields
 
 
 

@@ -50,11 +50,13 @@ import type {
   LearningEvent,
   LearningMemory,
   LearningSummary,
+  OperationalMappingStatus,
   ManualCorrectionInput,
   MappingInfo,
   ParsedFileInfo,
   ParsedSheetInfo,
   UserProfile,
+  ValidationDiagnostic,
 } from '../types';
 import { VibeBackground } from './VibeBackground';
 
@@ -305,8 +307,12 @@ function detachGenerationLinkFromSectionState(state: SectionWorkspaceState, gene
 
 function parseSchemaFields(schemaText: string): string[] {
   try {
-    const parsed = JSON.parse(schemaText) as Record<string, unknown>;
-    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    const parsed = JSON.parse(schemaText) as Record<string, unknown> | Array<Record<string, unknown>>;
+    if (Array.isArray(parsed)) {
+      const firstObject = parsed.find((item) => isObjectRecord(item));
+      return firstObject ? Object.keys(firstObject) : [];
+    }
+    if (!parsed || typeof parsed !== 'object') {
       return [];
     }
     return Object.keys(parsed);
@@ -391,6 +397,52 @@ function mappingSourceLabel(mapping: MappingInfo): string {
     return 'Не определено';
   }
   return 'Источник не указан';
+}
+
+function qualityBandLabel(status: OperationalMappingStatus['status'] | undefined | null): string {
+  if (status === 'high') {
+    return 'Высокое';
+  }
+  if (status === 'medium') {
+    return 'Среднее';
+  }
+  if (status === 'low') {
+    return 'Низкое';
+  }
+  return 'Нет данных';
+}
+
+function qualityBandTone(status: OperationalMappingStatus['status'] | undefined | null): string {
+  if (status === 'high') {
+    return 'success';
+  }
+  if (status === 'medium') {
+    return 'warning';
+  }
+  if (status === 'low') {
+    return 'danger';
+  }
+  return 'neutral';
+}
+
+function validationStateLabel(valid: boolean | undefined, okText = 'OK', failText = 'Ошибка'): string {
+  return valid ? okText : failText;
+}
+
+function validationStateTone(valid: boolean | undefined): string {
+  return valid ? 'success' : 'danger';
+}
+
+function formatRatio(value: number | undefined | null): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '0%';
+  }
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatDiagnosticLabel(diagnostic: ValidationDiagnostic): string {
+  const parts = [diagnostic.path, diagnostic.code].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : 'diagnostic';
 }
 
 function semanticGraphRelationLabel(relationKind: LearningMemory['layers']['semanticGraph']['items'][number]['relationKind']): string {
@@ -1085,6 +1137,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     );
   }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, result.warnings, saveMessage]);
 
+  const visibleTsDiagnostics = useMemo(() => result.tsDiagnostics ?? [], [result.tsDiagnostics]);
+  const visiblePreviewDiagnostics = useMemo(() => result.previewDiagnostics ?? [], [result.previewDiagnostics]);
+
   const profileStats = useMemo(() => {
     const totalGenerations = history.length;
     const uniqueFiles = new Set(history.map((item) => item.fileName)).size;
@@ -1195,6 +1250,16 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       preview: item.preview,
       warnings: item.warnings,
       parsedFile: item.parsedFile ?? null,
+      targetSchema: item.validation?.targetSchema ?? null,
+      requiredFields: item.validation?.targetSchemaSummary?.requiredFields ?? [],
+      tsValid: item.validation?.tsValidation?.valid ?? false,
+      tsDiagnostics: item.validation?.tsValidation?.diagnostics ?? [],
+      previewDiagnostics: item.validation?.previewValidation?.diagnostics ?? [],
+      mappingOperationalStatus: item.validation?.qualitySummary?.operationalMappingStatus ?? null,
+      mappingEvalMetrics: item.validation?.qualitySummary?.trueQualityMetrics ?? null,
+      tsSyntaxValid: item.validation?.qualitySummary?.tsSyntaxValid ?? item.validation?.tsValidation?.valid ?? false,
+      tsRuntimePreviewValid: item.validation?.qualitySummary?.tsRuntimePreviewValid ?? item.validation?.previewValidation?.runtimeValid ?? false,
+      outputSchemaValid: item.validation?.qualitySummary?.outputSchemaValid ?? item.validation?.previewValidation?.schemaValid ?? false,
     };
     setResult(restoredResult);
     setActivePreviewSheet(item.selectedSheet ?? item.parsedFile?.sheets[0]?.name ?? null);
@@ -2469,6 +2534,83 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     <Sparkles size={16} /> Preview JSON
                   </div>
                   <pre className="preview-pane">{JSON.stringify(result.preview, null, 2)}</pre>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
+                    <ShieldCheck size={16} /> Качество генерации
+                  </div>
+                  <div className="generation-quality-grid">
+                    <div className="generation-quality-item">
+                      <span>Mapping readiness</span>
+                      <strong>{qualityBandLabel(result.mappingOperationalStatus?.status)}</strong>
+                      <small>
+                        {result.mappingOperationalStatus
+                          ? `${result.mappingOperationalStatus.resolvedCount}/${result.mappingOperationalStatus.resolvedCount + result.mappingOperationalStatus.unresolvedCount} полей`
+                          : 'ещё не считалось'}
+                      </small>
+                      <em className={`generation-quality-chip generation-quality-chip-${qualityBandTone(result.mappingOperationalStatus?.status)}`}>
+                        {result.mappingOperationalStatus ? formatRatio(result.mappingOperationalStatus.resolvedRatio) : 'нет данных'}
+                      </em>
+                    </div>
+                    <div className="generation-quality-item">
+                      <span>TS syntax</span>
+                      <strong>{validationStateLabel(result.tsSyntaxValid, 'Компилируется', 'Есть ошибки')}</strong>
+                      <small>{result.tsValid ? 'compiler check пройден' : 'compiler diagnostics доступны ниже'}</small>
+                      <em className={`generation-quality-chip generation-quality-chip-${validationStateTone(result.tsSyntaxValid)}`}>
+                        {result.tsSyntaxValid ? 'valid' : 'invalid'}
+                      </em>
+                    </div>
+                    <div className="generation-quality-item">
+                      <span>Preview runtime</span>
+                      <strong>{validationStateLabel(result.tsRuntimePreviewValid, 'OK', 'Проблемы')}</strong>
+                      <small>Проверка preview на 1-3 строках</small>
+                      <em className={`generation-quality-chip generation-quality-chip-${validationStateTone(result.tsRuntimePreviewValid)}`}>
+                        {result.tsRuntimePreviewValid ? 'pass' : 'fail'}
+                      </em>
+                    </div>
+                    <div className="generation-quality-item">
+                      <span>Output schema</span>
+                      <strong>{validationStateLabel(result.outputSchemaValid, 'Совпадает', 'Есть расхождения')}</strong>
+                      <small>{result.requiredFields && result.requiredFields.length > 0 ? `required: ${result.requiredFields.join(', ')}` : 'required fields не заданы'}</small>
+                      <em className={`generation-quality-chip generation-quality-chip-${validationStateTone(result.outputSchemaValid)}`}>
+                        {result.outputSchemaValid ? 'match' : 'mismatch'}
+                      </em>
+                    </div>
+                  </div>
+                  <p className="subtle-text mapping-editor-note">
+                    Readiness показывает полноту и объём ручной проверки в runtime. Accuracy-метрики считаются отдельно оффлайн на benchmark-наборах.
+                  </p>
+                  {(visibleTsDiagnostics.length > 0 || visiblePreviewDiagnostics.length > 0) && (
+                    <div className="generation-diagnostics-stack">
+                      {visibleTsDiagnostics.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>TypeScript diagnostics</strong>
+                          <div className="generation-diagnostics-list">
+                            {visibleTsDiagnostics.slice(0, 6).map((diagnostic, index) => (
+                              <div className="generation-diagnostic-item" key={`ts-${index}`}>
+                                <span>{formatDiagnosticLabel(diagnostic)}</span>
+                                <small>{diagnostic.message}</small>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {visiblePreviewDiagnostics.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>Preview vs schema</strong>
+                          <div className="generation-diagnostics-list">
+                            {visiblePreviewDiagnostics.slice(0, 6).map((diagnostic, index) => (
+                              <div className="generation-diagnostic-item" key={`preview-${index}`}>
+                                <span>{formatDiagnosticLabel(diagnostic)}</span>
+                                <small>{diagnostic.message}</small>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </section>
 
                 <section className="insight-card">

@@ -18,6 +18,7 @@ export type HistoryItem = {
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
   warnings: string[];
+  validation?: GenerationValidation | null;
 };
 
 export type ParsedFileInfo = {
@@ -54,6 +55,71 @@ export type GenerationResult = {
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
   warnings: string[];
+  targetSchema?: Record<string, unknown> | unknown[] | null;
+  requiredFields?: string[];
+  tsValid?: boolean;
+  tsDiagnostics?: ValidationDiagnostic[];
+  previewDiagnostics?: ValidationDiagnostic[];
+  mappingOperationalStatus?: OperationalMappingStatus | null;
+  mappingEvalMetrics?: TrueQualityMetrics | null;
+  tsSyntaxValid?: boolean;
+  tsRuntimePreviewValid?: boolean;
+  outputSchemaValid?: boolean;
+};
+
+export type ValidationDiagnostic = {
+  path?: string;
+  code?: string;
+  expected?: string;
+  actual?: string;
+  message: string;
+  source?: string;
+};
+
+export type OperationalMappingStatus = {
+  status: 'high' | 'medium' | 'low';
+  resolvedCount: number;
+  unresolvedCount: number;
+  resolvedRatio: number;
+  reviewRatio: number;
+  stats: Record<string, number>;
+};
+
+export type TrueQualityMetrics = {
+  available: boolean;
+  exactMatchRate?: number | null;
+  falsePositiveRate?: number | null;
+  unresolvedRate?: number | null;
+  acceptedAfterReviewRate?: number | null;
+  notes?: string | null;
+};
+
+export type GenerationValidation = {
+  targetSchema?: Record<string, unknown> | unknown[] | null;
+  targetSchemaSummary?: {
+    rootType?: string;
+    requiredFields?: string[];
+    fieldCount?: number;
+    rootIsArray?: boolean;
+  } | null;
+  tsValidation?: {
+    valid?: boolean;
+    compilerAvailable?: boolean;
+    diagnostics?: ValidationDiagnostic[];
+  } | null;
+  previewValidation?: {
+    runtimeValid?: boolean;
+    schemaValid?: boolean;
+    diagnostics?: ValidationDiagnostic[];
+    validatedRows?: number;
+  } | null;
+  qualitySummary?: {
+    operationalMappingStatus?: OperationalMappingStatus | null;
+    trueQualityMetrics?: TrueQualityMetrics | null;
+    tsSyntaxValid?: boolean;
+    tsRuntimePreviewValid?: boolean;
+    outputSchemaValid?: boolean;
+  } | null;
 };
 
 export type DraftFieldSuggestion = {

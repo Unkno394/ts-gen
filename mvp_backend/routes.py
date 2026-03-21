@@ -44,7 +44,7 @@ from models import (
     VerifyResetCodePayload,
     UpdateProfilePayload,
 )
-from parsers import ParseError, infer_target_fields, parse_file, resolve_generation_source
+from parsers import ParseError, parse_file, parse_target_schema, resolve_generation_source
 from storage import (
     EmailChangeError,
     InvalidCredentialsError,
@@ -89,6 +89,7 @@ from storage import (
     verify_user_password,
     complete_model_training_run,
 )
+from validation import assess_mapping_operational_status, compile_typescript_code, validate_preview_against_target_schema
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -306,7 +307,7 @@ async def generate(
             user_id=resolved_user_id,
         )
         parsed = parse_file(saved_path, filename)
-        target_fields, target_payload = infer_target_fields(target_json)
+        target_fields, target_payload, target_schema, target_schema_summary = parse_target_schema(target_json)
         source_columns, source_rows, source_warnings = resolve_generation_source(parsed, selected_sheet)
         parsed_file_json = json.dumps(_model_to_dict(parsed), ensure_ascii=False)
         resolved_schema_fingerprint_id = ensure_schema_fingerprint(
@@ -328,6 +329,26 @@ async def generate(
         mapping_explainability = mapping_result['explainability']
         ts_code = generate_typescript(target_fields, mappings)
         preview = build_preview(source_rows, target_fields, mappings)
+        ts_validation = compile_typescript_code(ts_code)
+        preview_validation = validate_preview_against_target_schema(preview, target_schema)
+        quality_summary = {
+            'operational_mapping_status': assess_mapping_operational_status(
+                mapping_explainability['mapping_stats'],
+                target_field_count=len(target_fields),
+            ),
+            'true_quality_metrics': None,
+            'ts_syntax_valid': bool(ts_validation['valid']),
+            'ts_runtime_preview_valid': bool(preview_validation['runtime_valid']),
+            'output_schema_valid': bool(preview_validation['schema_valid']),
+        }
+        validation_payload = {
+            'target_schema': target_schema,
+            'target_schema_summary': target_schema_summary,
+            'ts_validation': ts_validation,
+            'preview_validation': preview_validation,
+            'mapping_explainability': mapping_explainability,
+            'quality_summary': quality_summary,
+        }
         all_warnings = parsed.warnings + source_warnings + mapping_warnings
         serialized_mappings = [_model_to_dict(m) for m in mappings]
 
@@ -345,6 +366,7 @@ async def generate(
                 preview_json=json.dumps(preview, ensure_ascii=False),
                 warnings_json=json.dumps(all_warnings, ensure_ascii=False),
                 parsed_file_json=parsed_file_json,
+                validation_json=json.dumps(validation_payload, ensure_ascii=False),
                 selected_sheet=selected_sheet,
                 source_columns=source_columns,
                 upload_record_id=upload_record_id,
@@ -381,6 +403,17 @@ async def generate(
             'generated_typescript': ts_code,
             'preview': preview,
             'warnings': all_warnings,
+            'target_schema': target_schema,
+            'required_fields': target_schema_summary['required_fields'],
+            'ts_valid': bool(ts_validation['valid']),
+            'ts_diagnostics': ts_validation['diagnostics'],
+            'preview_diagnostics': preview_validation['diagnostics'],
+            'mapping_operational_status': quality_summary['operational_mapping_status'],
+            'mapping_quality': quality_summary['operational_mapping_status'],
+            'mapping_eval_metrics': quality_summary['true_quality_metrics'],
+            'ts_syntax_valid': quality_summary['ts_syntax_valid'],
+            'ts_runtime_preview_valid': quality_summary['ts_runtime_preview_valid'],
+            'output_schema_valid': quality_summary['output_schema_valid'],
             'mapping_stats': mapping_explainability['mapping_stats'],
             'mapping_sources': mapping_explainability['mapping_sources'],
             'unresolved_fields': mapping_explainability['unresolved_fields'],
@@ -521,6 +554,7 @@ def history(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
                 'generated_typescript': item['generated_typescript'],
                 'preview': json.loads(item['preview_json']),
                 'warnings': json.loads(item['warnings_json']),
+                'validation': json.loads(item['validation_json']) if item.get('validation_json') else {},
                 'created_at': item['created_at'],
             }
         )

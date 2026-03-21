@@ -2122,6 +2122,117 @@ input::-ms-reveal {
   background: rgba(255, 255, 255, 0.04);
 }
 
+.generation-quality-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.generation-quality-item {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.generation-quality-item span {
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.generation-quality-item strong {
+  font-size: 15px;
+}
+
+.generation-quality-item small {
+  color: rgba(255, 255, 255, 0.62);
+  line-height: 1.5;
+}
+
+.generation-quality-item em {
+  justify-self: start;
+  font-style: normal;
+}
+
+.generation-quality-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.generation-quality-chip-success {
+  color: #d9fff0;
+  border-color: rgba(94, 220, 186, 0.24);
+  background: rgba(31, 143, 116, 0.18);
+}
+
+.generation-quality-chip-warning {
+  color: #fff0d6;
+  border-color: rgba(243, 185, 94, 0.24);
+  background: rgba(175, 116, 32, 0.18);
+}
+
+.generation-quality-chip-danger {
+  color: #ffe5ec;
+  border-color: rgba(255, 113, 150, 0.24);
+  background: rgba(156, 46, 82, 0.18);
+}
+
+.generation-quality-chip-neutral {
+  color: rgba(239, 244, 255, 0.82);
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.generation-diagnostics-stack {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.generation-diagnostics-group {
+  display: grid;
+  gap: 8px;
+}
+
+.generation-diagnostics-group > strong {
+  font-size: 13px;
+}
+
+.generation-diagnostics-list {
+  display: grid;
+  gap: 8px;
+}
+
+.generation-diagnostic-item {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.generation-diagnostic-item span {
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.generation-diagnostic-item small {
+  color: rgba(255, 255, 255, 0.62);
+  line-height: 1.5;
+}
+
 .compact {
   min-height: 90px;
   display: grid;
@@ -2151,6 +2262,7 @@ input::-ms-reveal {
 
 @media (max-width: 900px) {
   .generator-action-row,
+  .generation-quality-grid,
   .mapping-editor-grid,
   .review-queue-grid,
   .knowledge-state-grid,

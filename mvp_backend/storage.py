@@ -9,12 +9,16 @@ import shutil
 import sqlite3
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from generator import build_preview, generate_typescript
 from infra.database import DatabaseClient, create_database
 from infra.security import hash_password, verify_password
 from matcher import prepare_field_name
+from models import FieldMapping, TargetField
+from validation import assess_mapping_operational_status, compile_typescript_code, validate_preview_against_target_schema
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_DIR / '.runtime'
@@ -160,6 +164,7 @@ def get_db() -> DatabaseClient:
 def init_db() -> None:
     ensure_dirs()
     get_db()
+    _ensure_generation_validation_schema()
     _ensure_semantic_graph_tables()
     _ensure_pattern_promotion_schema()
     _migrate_mapping_suggestions_source_of_truth_constraint()
@@ -167,6 +172,21 @@ def init_db() -> None:
     _seed_sensitive_token_registry()
     _seed_concept_synonyms()
     migrate_legacy_history()
+
+
+def _ensure_generation_validation_schema() -> None:
+    db = get_db()
+    columns = {
+        str(row['name'])
+        for row in db.all("PRAGMA table_info('generation_artifacts')")
+    }
+    if 'validation_json' not in columns:
+        db.run(
+            """
+            ALTER TABLE generation_artifacts
+            ADD COLUMN validation_json TEXT NOT NULL DEFAULT '{}'
+            """
+        )
 
 
 def _ensure_semantic_graph_tables() -> None:
@@ -1079,6 +1099,7 @@ def save_generation(
     generated_typescript: str,
     preview_json: str,
     warnings_json: str,
+    validation_json: str = '{}',
     parsed_file_json: str | Any | None = None,
     selected_sheet: str | None = None,
     source_columns: list[str] | None = None,
@@ -1092,6 +1113,7 @@ def save_generation(
     safe_mappings_json = _ensure_json_text(mappings_json, [])
     safe_preview_json = _ensure_json_text(preview_json, [])
     safe_warnings_json = _ensure_json_text(warnings_json, [])
+    safe_validation_json = _ensure_json_text(validation_json, {})
     safe_parsed_file_json = _ensure_json_text(
         parsed_file_json if parsed_file_json is not None else _build_fallback_parsed_file(file_name, file_type),
         _build_fallback_parsed_file(file_name, file_type),
@@ -1182,6 +1204,7 @@ def save_generation(
                 mappings_json,
                 preview_json,
                 warnings_json,
+                validation_json,
                 legacy_history_id
             )
             VALUES (
@@ -1195,6 +1218,7 @@ def save_generation(
                 :mappings_json,
                 :preview_json,
                 :warnings_json,
+                :validation_json,
                 NULL
             )
             ''',
@@ -1209,6 +1233,7 @@ def save_generation(
                 'mappings_json': safe_mappings_json,
                 'preview_json': safe_preview_json,
                 'warnings_json': safe_warnings_json,
+                'validation_json': safe_validation_json,
             },
         )
         artifact_id = int(artifact_cursor.lastrowid)
@@ -1318,6 +1343,7 @@ def get_history(user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
             v.generated_typescript,
             a.preview_json,
             a.warnings_json,
+            a.validation_json,
             g.created_at
         FROM generations g
         INNER JOIN users u
@@ -1408,6 +1434,7 @@ def get_generation_by_id(entry_id: int) -> dict[str, Any] | None:
             v.generated_typescript,
             a.preview_json,
             a.warnings_json,
+            a.validation_json,
             g.created_at
         FROM generations g
         INNER JOIN users u
@@ -1861,10 +1888,6 @@ def get_semantic_graph_mapping_candidates(
     if not target_normalized:
         return []
 
-    target_node = _get_semantic_field_node_by_normalized(db, target_normalized)
-    if target_node is None:
-        return []
-
     source_by_normalized = {
         _normalize_field_name(column): column
         for column in source_columns
@@ -1873,45 +1896,11 @@ def get_semantic_graph_mapping_candidates(
     if not source_by_normalized:
         return []
 
-    direct_rows = db.all(
-        '''
-        SELECT
-            e.left_node_id,
-            e.right_node_id,
-            e.user_id,
-            e.accepted_count,
-            e.rejected_count,
-            e.support_count,
-            e.mean_confidence,
-            ln.field_normalized AS left_field_normalized,
-            rn.field_normalized AS right_field_normalized
-        FROM semantic_field_edges e
-        JOIN semantic_field_nodes ln
-          ON ln.id = e.left_node_id
-        JOIN semantic_field_nodes rn
-          ON rn.id = e.right_node_id
-        WHERE (e.left_node_id = :target_node_id OR e.right_node_id = :target_node_id)
-        ''',
-        {'target_node_id': int(target_node['id'])},
-    )
-
     graph_scores: dict[str, dict[str, Any]] = {}
-    target_neighbors: set[int] = set()
-    for row in direct_rows:
-        other_node_id = int(row['right_node_id']) if int(row['left_node_id']) == int(target_node['id']) else int(row['left_node_id'])
-        target_neighbors.add(other_node_id)
-        candidate_norm = str(row['right_field_normalized']) if int(row['left_node_id']) == int(target_node['id']) else str(row['left_field_normalized'])
-        if candidate_norm not in source_by_normalized:
-            continue
-        graph_scores[candidate_norm] = _merge_graph_evidence(
-            current=graph_scores.get(candidate_norm),
-            evidence=_build_graph_evidence_from_row(row=row, path='direct', preferred_user_id=internal_user_id),
-        )
-
-    if target_neighbors:
-        placeholders = ','.join('?' for _ in target_neighbors)
-        transitive_rows = db.all(
-            f'''
+    target_node = _get_semantic_field_node_by_normalized(db, target_normalized)
+    if target_node is not None:
+        direct_rows = db.all(
+            '''
             SELECT
                 e.left_node_id,
                 e.right_node_id,
@@ -1927,24 +1916,82 @@ def get_semantic_graph_mapping_candidates(
               ON ln.id = e.left_node_id
             JOIN semantic_field_nodes rn
               ON rn.id = e.right_node_id
-            WHERE (e.left_node_id IN ({placeholders}) OR e.right_node_id IN ({placeholders}))
+            WHERE (e.left_node_id = :target_node_id OR e.right_node_id = :target_node_id)
             ''',
-            tuple(target_neighbors) + tuple(target_neighbors),
+            {'target_node_id': int(target_node['id'])},
         )
-        for row in transitive_rows:
-            left_id = int(row['left_node_id'])
-            right_id = int(row['right_node_id'])
-            if left_id in target_neighbors:
-                candidate_norm = str(row['right_field_normalized'])
-            elif right_id in target_neighbors:
-                candidate_norm = str(row['left_field_normalized'])
-            else:
-                continue
-            if candidate_norm == target_normalized or candidate_norm not in source_by_normalized:
+
+        target_neighbors: set[int] = set()
+        for row in direct_rows:
+            other_node_id = int(row['right_node_id']) if int(row['left_node_id']) == int(target_node['id']) else int(row['left_node_id'])
+            target_neighbors.add(other_node_id)
+            candidate_norm = str(row['right_field_normalized']) if int(row['left_node_id']) == int(target_node['id']) else str(row['left_field_normalized'])
+            if candidate_norm not in source_by_normalized:
                 continue
             graph_scores[candidate_norm] = _merge_graph_evidence(
                 current=graph_scores.get(candidate_norm),
-                evidence=_build_graph_evidence_from_row(row=row, path='transitive', preferred_user_id=internal_user_id),
+                evidence=_build_graph_evidence_from_row(row=row, path='direct', preferred_user_id=internal_user_id),
+            )
+
+        if target_neighbors:
+            placeholders = ','.join('?' for _ in target_neighbors)
+            transitive_rows = db.all(
+                f'''
+                SELECT
+                    e.left_node_id,
+                    e.right_node_id,
+                    e.user_id,
+                    e.accepted_count,
+                    e.rejected_count,
+                    e.support_count,
+                    e.mean_confidence,
+                    ln.field_normalized AS left_field_normalized,
+                    rn.field_normalized AS right_field_normalized
+                FROM semantic_field_edges e
+                JOIN semantic_field_nodes ln
+                  ON ln.id = e.left_node_id
+                JOIN semantic_field_nodes rn
+                  ON rn.id = e.right_node_id
+                WHERE (e.left_node_id IN ({placeholders}) OR e.right_node_id IN ({placeholders}))
+                ''',
+                tuple(target_neighbors) + tuple(target_neighbors),
+            )
+            for row in transitive_rows:
+                left_id = int(row['left_node_id'])
+                right_id = int(row['right_node_id'])
+                if left_id in target_neighbors:
+                    candidate_norm = str(row['right_field_normalized'])
+                elif right_id in target_neighbors:
+                    candidate_norm = str(row['left_field_normalized'])
+                else:
+                    continue
+                if candidate_norm == target_normalized or candidate_norm not in source_by_normalized:
+                    continue
+                graph_scores[candidate_norm] = _merge_graph_evidence(
+                    current=graph_scores.get(candidate_norm),
+                    evidence=_build_graph_evidence_from_row(row=row, path='transitive', preferred_user_id=internal_user_id),
+                )
+
+    contextual_edges = _get_semantic_graph_contextual_edges(
+        db=db,
+        prepared_target=target_prepared,
+        target_normalized=target_normalized,
+        preferred_user_id=internal_user_id,
+    )
+    for normalized_source, source_column in source_by_normalized.items():
+        prepared_source = prepare_field_name(source_column)
+        for edge in contextual_edges:
+            signature_score, signature_reason = _semantic_graph_node_similarity(prepared_source, edge)
+            if signature_score <= 0:
+                continue
+            evidence = _build_graph_evidence_from_row(row=edge, path='cluster', preferred_user_id=internal_user_id)
+            evidence['score'] = min(max(float(evidence['score']) * float(edge['anchor_match_score']) * signature_score, 0.0), 1.0)
+            evidence['reason'] = str(edge['anchor_reason'] or 'semantic_graph_cluster')
+            evidence['path'] = str(edge['path_label'] or 'cluster')
+            evidence['context_reason'] = signature_reason
+            graph_scores[normalized_source] = _merge_graph_evidence(
+                current=graph_scores.get(normalized_source),
+                evidence=evidence,
             )
 
     results: list[dict[str, Any]] = []
@@ -1970,7 +2017,7 @@ def get_semantic_graph_mapping_candidates(
                 'relation_support': evidence['support_count'] if evidence is not None else 0,
                 'accepted_count': evidence['accepted_count'] if evidence is not None else 0,
                 'rejected_count': evidence['rejected_count'] if evidence is not None else 0,
-                'context_reason': context_reason,
+                'context_reason': evidence.get('context_reason', context_reason) if evidence is not None else context_reason,
                 'graph_score': round(direct_score, 4),
                 'context_score': round(context_score, 4),
                 'entity_token': prepared_source.get('entity_token'),
@@ -1995,9 +2042,11 @@ def _build_graph_evidence_from_row(*, row: dict[str, Any], path: str, preferred_
         base_score += 0.08
     if path == 'transitive':
         base_score *= 0.72
+    elif path == 'cluster':
+        base_score *= 0.66
     return {
         'score': min(max(base_score, 0.0), 1.0),
-        'reason': 'semantic_graph_direct' if path == 'direct' else 'semantic_graph_transitive',
+        'reason': 'semantic_graph_direct' if path == 'direct' else ('semantic_graph_transitive' if path == 'transitive' else 'semantic_graph_cluster'),
         'path': path,
         'accepted_count': accepted_count,
         'rejected_count': rejected_count,
@@ -2011,6 +2060,177 @@ def _merge_graph_evidence(*, current: dict[str, Any] | None, evidence: dict[str,
     if float(evidence['score']) > float(current['score']):
         return evidence
     return current
+
+
+def _get_semantic_graph_contextual_edges(
+    *,
+    db: DatabaseClient,
+    prepared_target: dict[str, Any],
+    target_normalized: str,
+    preferred_user_id: int | None,
+) -> list[dict[str, Any]]:
+    anchors = _find_semantic_graph_anchor_nodes(
+        db=db,
+        prepared_target=prepared_target,
+        target_normalized=target_normalized,
+    )
+    if not anchors:
+        return []
+
+    placeholders = ','.join('?' for _ in anchors)
+    rows = db.all(
+        f'''
+        SELECT
+            e.left_node_id,
+            e.right_node_id,
+            e.user_id,
+            e.accepted_count,
+            e.rejected_count,
+            e.support_count,
+            e.mean_confidence,
+            ln.field_name AS left_field_name,
+            ln.field_normalized AS left_field_normalized,
+            ln.entity_token AS left_entity_token,
+            ln.attribute_token AS left_attribute_token,
+            ln.role_label AS left_role_label,
+            rn.field_name AS right_field_name,
+            rn.field_normalized AS right_field_normalized,
+            rn.entity_token AS right_entity_token,
+            rn.attribute_token AS right_attribute_token,
+            rn.role_label AS right_role_label
+        FROM semantic_field_edges e
+        JOIN semantic_field_nodes ln
+          ON ln.id = e.left_node_id
+        JOIN semantic_field_nodes rn
+          ON rn.id = e.right_node_id
+        WHERE e.left_node_id IN ({placeholders})
+           OR e.right_node_id IN ({placeholders})
+        ''',
+        tuple(int(anchor['id']) for anchor in anchors) + tuple(int(anchor['id']) for anchor in anchors),
+    )
+    anchor_by_id = {int(anchor['id']): anchor for anchor in anchors}
+    contextual_rows: list[dict[str, Any]] = []
+
+    for row in rows:
+        left_id = int(row['left_node_id'])
+        right_id = int(row['right_node_id'])
+        anchor = anchor_by_id.get(left_id) or anchor_by_id.get(right_id)
+        if anchor is None:
+            continue
+        candidate_is_right = left_id == int(anchor['id'])
+        candidate_field_name = str(row['right_field_name']) if candidate_is_right else str(row['left_field_name'])
+        candidate_field_normalized = str(row['right_field_normalized']) if candidate_is_right else str(row['left_field_normalized'])
+        if candidate_field_normalized == target_normalized:
+            continue
+        contextual_rows.append(
+            {
+                **dict(row),
+                'candidate_field_name': candidate_field_name,
+                'candidate_field_normalized': candidate_field_normalized,
+                'candidate_entity_token': row['right_entity_token'] if candidate_is_right else row['left_entity_token'],
+                'candidate_attribute_token': row['right_attribute_token'] if candidate_is_right else row['left_attribute_token'],
+                'candidate_role_label': row['right_role_label'] if candidate_is_right else row['left_role_label'],
+                'anchor_match_score': float(anchor['match_score']),
+                'anchor_reason': anchor['match_reason'],
+                'path_label': 'concept_cluster',
+                'preferred_user_id': preferred_user_id,
+            }
+        )
+    return contextual_rows
+
+
+def _find_semantic_graph_anchor_nodes(
+    *,
+    db: DatabaseClient,
+    prepared_target: dict[str, Any],
+    target_normalized: str,
+) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {'target_normalized': target_normalized}
+    clauses: list[str] = []
+    if prepared_target.get('attribute_token'):
+        clauses.append('attribute_token = :attribute_token')
+        params['attribute_token'] = prepared_target['attribute_token']
+    if prepared_target.get('role_label'):
+        clauses.append('role_label = :role_label')
+        params['role_label'] = prepared_target['role_label']
+    if prepared_target.get('entity_token'):
+        clauses.append('entity_token = :entity_token')
+        params['entity_token'] = prepared_target['entity_token']
+    if not clauses:
+        return []
+
+    rows = db.all(
+        f'''
+        SELECT id, field_name, field_normalized, entity_token, attribute_token, role_label
+        FROM semantic_field_nodes
+        WHERE field_normalized != :target_normalized
+          AND ({' OR '.join(clauses)})
+        ''',
+        params,
+    )
+    anchors: list[dict[str, Any]] = []
+    for row in rows:
+        node_payload = dict(row)
+        match_score, match_reason = _semantic_graph_anchor_score(prepared_target, node_payload)
+        if match_score <= 0:
+            continue
+        anchors.append(
+            {
+                **node_payload,
+                'match_score': match_score,
+                'match_reason': match_reason,
+            }
+        )
+    anchors.sort(key=lambda item: float(item['match_score']), reverse=True)
+    return anchors[:10]
+
+
+def _semantic_graph_anchor_score(prepared_target: dict[str, Any], node_row: dict[str, Any]) -> tuple[float, str]:
+    score = 0.0
+    reasons: list[str] = []
+    if prepared_target.get('attribute_token') and prepared_target.get('attribute_token') == node_row.get('attribute_token'):
+        score += 0.5
+        reasons.append('attribute')
+    if prepared_target.get('role_label') and prepared_target.get('role_label') == node_row.get('role_label'):
+        score += 0.3
+        reasons.append('role')
+    if prepared_target.get('entity_token') and prepared_target.get('entity_token') == node_row.get('entity_token'):
+        score += 0.2
+        reasons.append('entity')
+
+    target_cluster = _infer_single_field_concept_cluster(prepared_target)
+    node_cluster = _infer_single_field_concept_cluster(prepare_field_name(str(node_row.get('field_name') or '')))
+    if target_cluster and node_cluster and target_cluster == node_cluster:
+        score = max(score, 0.62)
+        reasons.append('concept')
+
+    return min(score, 1.0), '+'.join(reasons) or 'semantic_anchor'
+
+
+def _semantic_graph_node_similarity(prepared_source: dict[str, Any], node_row: dict[str, Any]) -> tuple[float, str]:
+    score = 0.0
+    reasons: list[str] = []
+    if prepared_source.get('attribute_token') and prepared_source.get('attribute_token') == node_row.get('candidate_attribute_token'):
+        score += 0.45
+        reasons.append('attribute')
+    if prepared_source.get('role_label') and prepared_source.get('role_label') == node_row.get('candidate_role_label'):
+        score += 0.25
+        reasons.append('role')
+    if prepared_source.get('entity_token') and prepared_source.get('entity_token') == node_row.get('candidate_entity_token'):
+        score += 0.2
+        reasons.append('entity')
+
+    candidate_cluster = _infer_single_field_concept_cluster(prepare_field_name(str(node_row.get('candidate_field_name') or '')))
+    source_cluster = _infer_single_field_concept_cluster(prepared_source)
+    if source_cluster and candidate_cluster and source_cluster == candidate_cluster:
+        score = max(score, 0.58)
+        reasons.append('concept')
+
+    return min(score, 1.0), '+'.join(reasons) or 'graph_signature'
+
+
+def _infer_single_field_concept_cluster(prepared_field: dict[str, Any]) -> str | None:
+    return _infer_concept_cluster(prepared_field, prepared_field)
 
 
 def _build_semantic_graph_clusters(graph_rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
@@ -3332,6 +3552,12 @@ def confirm_generation_learning(
             'updated_at': _timestamp(),
         },
     )
+    canonical_state = _refresh_canonical_generation_state(
+        db=db,
+        generation_id=generation_id,
+        schema_fingerprint_id=int(context['schema_fingerprint_id']) if context['schema_fingerprint_id'] is not None else None,
+        note='Confirmed reviewed generation state',
+    )
     promoted = _promote_confirmed_generation_learning(
         db=db,
         generation_id=generation_id,
@@ -3339,6 +3565,7 @@ def confirm_generation_learning(
         notes=notes,
     )
     promoted['generation_id'] = generation_id
+    promoted['canonical_state'] = canonical_state
     return promoted
 
 
@@ -3649,6 +3876,12 @@ def apply_mapping_feedback(
             accepted=False,
         )
 
+    canonical_state = _refresh_canonical_generation_state(
+        db=db,
+        generation_id=generation_id,
+        schema_fingerprint_id=resolved_schema_fingerprint_id,
+        note='Reviewed mapping feedback applied',
+    )
     promotion = _promote_confirmed_generation_learning(
         db=db,
         generation_id=generation_id,
@@ -3660,6 +3893,7 @@ def apply_mapping_feedback(
         **result,
         'reviewed_count': len(corrections),
         'rejected_count': len(rejected_pairs),
+        'canonical_state': canonical_state,
         'promotion': promotion,
     }
 
@@ -5618,13 +5852,16 @@ def _load_generation_learning_context(db: DatabaseClient, generation_id: int) ->
             g.id AS generation_id,
             g.user_id AS internal_user_id,
             v.id AS version_id,
+            v.version_number,
             a.file_name,
+            a.file_path,
             a.file_type,
             a.selected_sheet,
             a.parsed_file_json,
             a.mappings_json,
             a.preview_json,
             a.warnings_json,
+            a.validation_json,
             v.target_json,
             v.generated_typescript
         FROM generations g
@@ -5641,6 +5878,532 @@ def _load_generation_learning_context(db: DatabaseClient, generation_id: int) ->
     payload = dict(row)
     payload['schema_fingerprint_id'] = _find_schema_fingerprint_for_generation(db, generation_id)
     return payload
+
+
+def _load_generation_canonical_mappings(
+    *,
+    db: DatabaseClient,
+    generation_id: int,
+    fallback_mappings_json: str,
+) -> list[dict[str, Any]]:
+    rows = db.all(
+        '''
+        SELECT
+            id,
+            source_field,
+            target_field,
+            confidence,
+            reason,
+            status,
+            source_of_truth,
+            schema_fingerprint_id,
+            metadata_json
+        FROM mapping_suggestions
+        WHERE generation_id = :generation_id
+        ORDER BY id ASC
+        ''',
+        {'generation_id': generation_id},
+    )
+    if not rows:
+        payload = _ensure_json_value(fallback_mappings_json, [])
+        return payload if isinstance(payload, list) else []
+
+    mappings: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = _ensure_json_value(row['metadata_json'], {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        mappings.append(
+            {
+                'source': row['source_field'],
+                'target': row['target_field'],
+                'confidence': _score_to_confidence(float(row['confidence'])) if row['confidence'] is not None else 'none',
+                'reason': row['reason'],
+                'status': row['status'],
+                'source_of_truth': row['source_of_truth'],
+                'suggestion_id': int(row['id']),
+                'schema_fingerprint_id': row['schema_fingerprint_id'],
+                'model_confidence_score': metadata.get('model_confidence_score'),
+                'candidate_metadata': metadata.get('candidate_metadata') if isinstance(metadata.get('candidate_metadata'), dict) else {},
+            }
+        )
+    return mappings
+
+
+def _resolve_generation_source_payload(
+    parsed_payload: dict[str, Any],
+    selected_sheet: str | None,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    sheets = parsed_payload.get('sheets', []) or []
+    if selected_sheet:
+        normalized_name = selected_sheet.strip()
+        for sheet in sheets:
+            if not isinstance(sheet, dict) or sheet.get('name') != normalized_name:
+                continue
+            return (
+                [str(column) for column in sheet.get('columns', []) or []],
+                [dict(row) for row in sheet.get('rows', []) or [] if isinstance(row, dict)],
+                [f'Generated mapping from selected sheet: {normalized_name}'],
+            )
+    return (
+        [str(column) for column in parsed_payload.get('columns', []) or []],
+        [dict(row) for row in parsed_payload.get('rows', []) or [] if isinstance(row, dict)],
+        warnings,
+    )
+
+
+def _build_runtime_target_schema_payload(
+    target_json_text: str,
+) -> tuple[list[TargetField], dict[str, Any] | list[Any], dict[str, Any], dict[str, Any]]:
+    payload = _ensure_json_value(target_json_text, {})
+    if not isinstance(payload, (dict, list)):
+        payload = {}
+
+    target_schema = _build_runtime_target_schema(payload)
+    root_object_schema = _resolve_runtime_root_object_schema(target_schema)
+    target_fields = _extract_target_fields_from_runtime_schema(root_object_schema)
+    schema_summary = {
+        'root_type': target_schema['type'],
+        'required_fields': list(root_object_schema.get('required_fields', [])),
+        'field_count': len(target_fields),
+        'root_is_array': target_schema['type'] == 'array',
+    }
+    return target_fields, payload, target_schema, schema_summary
+
+
+def _build_runtime_target_schema(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        properties: dict[str, Any] = {}
+        required_fields: list[str] = []
+        for key, nested_value in value.items():
+            normalized_key = str(key).strip()
+            if not normalized_key:
+                continue
+            properties[normalized_key] = _build_runtime_target_schema(nested_value)
+            required_fields.append(normalized_key)
+        return {
+            'type': 'object',
+            'nullable': False,
+            'properties': properties,
+            'required_fields': required_fields,
+        }
+
+    if isinstance(value, list):
+        if not value:
+            return {
+                'type': 'array',
+                'nullable': False,
+                'items': {'type': 'any', 'nullable': True},
+            }
+
+        item_schemas = [_build_runtime_target_schema(item) for item in value]
+        return {
+            'type': 'array',
+            'nullable': False,
+            'items': _merge_runtime_array_item_schemas(item_schemas),
+        }
+
+    inferred_type = _json_type(value)
+    return {
+        'type': inferred_type,
+        'nullable': value is None,
+    }
+
+
+def _merge_runtime_array_item_schemas(item_schemas: list[dict[str, Any]]) -> dict[str, Any]:
+    non_null_schemas = [schema for schema in item_schemas if schema.get('type') != 'null']
+    nullable = len(non_null_schemas) != len(item_schemas)
+    if not non_null_schemas:
+        return {'type': 'null', 'nullable': True}
+
+    merged = deepcopy(non_null_schemas[0])
+    merged['nullable'] = bool(merged.get('nullable')) or nullable
+
+    for schema in non_null_schemas[1:]:
+        if merged.get('type') != schema.get('type'):
+            return {'type': 'any', 'nullable': True}
+        if merged.get('type') == 'object':
+            merged = _merge_runtime_object_schemas(merged, schema)
+            merged['nullable'] = bool(merged.get('nullable')) or nullable
+            continue
+        if merged.get('type') == 'array':
+            merged['items'] = _merge_runtime_array_item_schemas(
+                [merged.get('items', {'type': 'any'}), schema.get('items', {'type': 'any'})]
+            )
+            merged['nullable'] = bool(merged.get('nullable')) or nullable
+
+    return merged
+
+
+def _merge_runtime_object_schemas(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(left)
+    left_properties = dict(merged.get('properties', {}))
+    right_properties = dict(right.get('properties', {}))
+    all_keys = list(dict.fromkeys([*left_properties.keys(), *right_properties.keys()]))
+    required_fields = set(merged.get('required_fields', [])) & set(right.get('required_fields', []))
+    merged_properties: dict[str, Any] = {}
+
+    for key in all_keys:
+        left_schema = left_properties.get(key)
+        right_schema = right_properties.get(key)
+        if left_schema is None:
+            merged_properties[key] = deepcopy(right_schema)
+            continue
+        if right_schema is None:
+            merged_properties[key] = deepcopy(left_schema)
+            continue
+        if left_schema.get('type') != right_schema.get('type'):
+            merged_properties[key] = {'type': 'any', 'nullable': True}
+            continue
+        if left_schema.get('type') == 'object':
+            merged_properties[key] = _merge_runtime_object_schemas(left_schema, right_schema)
+        elif left_schema.get('type') == 'array':
+            merged_properties[key] = deepcopy(left_schema)
+            merged_properties[key]['items'] = _merge_runtime_array_item_schemas(
+                [left_schema.get('items', {'type': 'any'}), right_schema.get('items', {'type': 'any'})]
+            )
+        else:
+            merged_properties[key] = deepcopy(left_schema)
+            merged_properties[key]['nullable'] = bool(left_schema.get('nullable')) or bool(right_schema.get('nullable'))
+
+    merged['properties'] = merged_properties
+    merged['required_fields'] = [key for key in all_keys if key in required_fields]
+    return merged
+
+
+def _resolve_runtime_root_object_schema(target_schema: dict[str, Any]) -> dict[str, Any]:
+    if target_schema.get('type') == 'object':
+        return target_schema
+    if target_schema.get('type') == 'array':
+        item_schema = target_schema.get('items') or {}
+        if item_schema.get('type') == 'object':
+            return item_schema
+    return {
+        'type': 'object',
+        'nullable': False,
+        'properties': {},
+        'required_fields': [],
+    }
+
+
+def _extract_target_fields_from_runtime_schema(root_object_schema: dict[str, Any]) -> list[TargetField]:
+    properties = root_object_schema.get('properties') or {}
+    if not isinstance(properties, dict):
+        return []
+
+    target_fields: list[TargetField] = []
+    for field_name, field_schema in properties.items():
+        if not isinstance(field_schema, dict):
+            continue
+        field_type = str(field_schema.get('type') or 'any')
+        if field_type not in {'string', 'number', 'boolean', 'object', 'array', 'null', 'any'}:
+            field_type = 'any'
+        target_fields.append(TargetField(name=str(field_name), type=field_type))
+    return target_fields
+
+
+def _build_mapping_explainability_from_payload(
+    mappings: list[dict[str, Any]],
+    *,
+    schema_fingerprint_id: int | None,
+) -> dict[str, Any]:
+    stats = {
+        'deterministic_rule': 0,
+        'personal_memory': 0,
+        'global_pattern': 0,
+        'semantic_graph': 0,
+        'model_suggestion': 0,
+        'position_fallback': 0,
+        'unresolved': 0,
+        'candidate_ranked': 0,
+        'candidate_skipped': 0,
+    }
+    rows: list[dict[str, Any]] = []
+    unresolved_fields: list[str] = []
+    suggestions: list[dict[str, Any]] = []
+
+    for mapping in mappings:
+        source_of_truth = str(mapping.get('source_of_truth') or 'unresolved')
+        if source_of_truth in stats:
+            stats[source_of_truth] += 1
+        rows.append(
+            {
+                'target': mapping.get('target'),
+                'source': mapping.get('source'),
+                'source_of_truth': source_of_truth,
+                'status': mapping.get('status'),
+                'confidence': mapping.get('confidence'),
+                'reason': mapping.get('reason'),
+                'schema_fingerprint_id': mapping.get('schema_fingerprint_id') or schema_fingerprint_id,
+                'model_confidence_score': mapping.get('model_confidence_score'),
+                'candidate_metadata': mapping.get('candidate_metadata') or {},
+            }
+        )
+        if not mapping.get('source'):
+            unresolved_fields.append(str(mapping.get('target') or ''))
+        elif str(mapping.get('status') or 'suggested') == 'suggested':
+            suggestions.append(rows[-1])
+
+    return {
+        'mapping_stats': stats,
+        'mapping_sources': rows,
+        'unresolved_fields': [field for field in unresolved_fields if field],
+        'suggestions': suggestions,
+    }
+
+
+def _build_mapping_warnings_from_payload(mappings: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    for mapping in mappings:
+        target_field = str(mapping.get('target') or '').strip()
+        source_field = mapping.get('source')
+        status = str(mapping.get('status') or 'suggested')
+        source_of_truth = str(mapping.get('source_of_truth') or 'unresolved')
+        if target_field and not source_field:
+            warnings.append(f'Не найдено исходное поле для "{target_field}".')
+            continue
+        if not target_field or not source_field or status != 'suggested':
+            continue
+        if source_of_truth == 'global_pattern':
+            warnings.append(f'Проверьте сопоставление для "{target_field}": использован устойчивый глобальный паттерн "{source_field}".')
+        elif source_of_truth == 'semantic_graph':
+            warnings.append(f'Проверьте сопоставление для "{target_field}": использован semantic graph candidate "{source_field}".')
+        elif source_of_truth == 'model_suggestion':
+            warnings.append(f'Проверьте сопоставление для "{target_field}": модель выбрала "{source_field}" из shortlist.')
+        elif source_of_truth == 'position_fallback':
+            warnings.append(f'Проверьте сопоставление для "{target_field}": применён fallback по порядку колонок.')
+    return _dedupe_values(warnings)
+
+
+def _dedupe_values(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _append_generation_state_version(
+    *,
+    db: DatabaseClient,
+    generation_id: int,
+    parent_version_id: int | None,
+    parent_version_number: int | None,
+    note: str,
+    target_json: str,
+    generated_typescript: str,
+    file_name: str,
+    file_path: str | None,
+    file_type: str,
+    selected_sheet: str | None,
+    parsed_file_json: str,
+    mappings_json: str,
+    preview_json: str,
+    warnings_json: str,
+    validation_json: str,
+) -> dict[str, Any]:
+    next_version_number = max(int(parent_version_number or 0), 0) + 1
+    version_cursor = db.run(
+        '''
+        INSERT INTO generation_versions (
+            generation_id,
+            parent_version_id,
+            version_number,
+            change_type,
+            note,
+            target_json,
+            generated_typescript
+        )
+        VALUES (
+            :generation_id,
+            :parent_version_id,
+            :version_number,
+            'manual_fix',
+            :note,
+            :target_json,
+            :generated_typescript
+        )
+        ''',
+        {
+            'generation_id': generation_id,
+            'parent_version_id': parent_version_id,
+            'version_number': next_version_number,
+            'note': note,
+            'target_json': target_json,
+            'generated_typescript': generated_typescript,
+        },
+    )
+    version_id = int(version_cursor.lastrowid)
+
+    artifact_cursor = db.run(
+        '''
+        INSERT INTO generation_artifacts (
+            generation_id,
+            version_id,
+            file_name,
+            file_path,
+            file_type,
+            selected_sheet,
+            parsed_file_json,
+            mappings_json,
+            preview_json,
+            warnings_json,
+            validation_json,
+            legacy_history_id
+        )
+        VALUES (
+            :generation_id,
+            :version_id,
+            :file_name,
+            :file_path,
+            :file_type,
+            :selected_sheet,
+            :parsed_file_json,
+            :mappings_json,
+            :preview_json,
+            :warnings_json,
+            :validation_json,
+            NULL
+        )
+        ''',
+        {
+            'generation_id': generation_id,
+            'version_id': version_id,
+            'file_name': file_name,
+            'file_path': file_path,
+            'file_type': file_type,
+            'selected_sheet': selected_sheet,
+            'parsed_file_json': parsed_file_json,
+            'mappings_json': mappings_json,
+            'preview_json': preview_json,
+            'warnings_json': warnings_json,
+            'validation_json': validation_json,
+        },
+    )
+    artifact_id = int(artifact_cursor.lastrowid)
+
+    db.run(
+        '''
+        UPDATE generations
+        SET
+            current_version_id = :version_id,
+            updated_at = :updated_at
+        WHERE id = :generation_id
+        ''',
+        {
+            'generation_id': generation_id,
+            'version_id': version_id,
+            'updated_at': _timestamp(),
+        },
+    )
+    return {
+        'version_id': version_id,
+        'version_number': next_version_number,
+        'artifact_id': artifact_id,
+    }
+
+
+def _refresh_canonical_generation_state(
+    *,
+    db: DatabaseClient,
+    generation_id: int,
+    schema_fingerprint_id: int | None,
+    note: str,
+) -> dict[str, Any]:
+    context = _load_generation_learning_context(db, generation_id)
+    if context is None:
+        raise ValueError(f'Generation не найдена: {generation_id}')
+
+    canonical_mapping_payload = _load_generation_canonical_mappings(
+        db=db,
+        generation_id=generation_id,
+        fallback_mappings_json=str(context['mappings_json'] or '[]'),
+    )
+    canonical_mappings = [FieldMapping(**mapping) for mapping in canonical_mapping_payload]
+    parsed_payload = _ensure_json_value(
+        str(context['parsed_file_json'] or _ensure_json_text(_build_fallback_parsed_file('generation', 'unknown'), {})),
+        _build_fallback_parsed_file('generation', 'unknown'),
+    )
+    if not isinstance(parsed_payload, dict):
+        parsed_payload = _build_fallback_parsed_file('generation', 'unknown')
+
+    target_fields, target_payload, target_schema, target_schema_summary = _build_runtime_target_schema_payload(
+        str(context['target_json'] or '{}')
+    )
+    source_columns, source_rows, source_warnings = _resolve_generation_source_payload(parsed_payload, context['selected_sheet'])
+    generated_typescript = generate_typescript(target_fields, canonical_mappings)
+    preview = build_preview(source_rows, target_fields, canonical_mappings)
+    ts_validation = compile_typescript_code(generated_typescript)
+    preview_validation = validate_preview_against_target_schema(preview, target_schema)
+    mapping_explainability = _build_mapping_explainability_from_payload(
+        canonical_mapping_payload,
+        schema_fingerprint_id=schema_fingerprint_id,
+    )
+    quality_summary = {
+        'operational_mapping_status': assess_mapping_operational_status(
+            mapping_explainability['mapping_stats'],
+            target_field_count=len(target_fields),
+        ),
+        'true_quality_metrics': None,
+        'ts_syntax_valid': bool(ts_validation['valid']),
+        'ts_runtime_preview_valid': bool(preview_validation['runtime_valid']),
+        'output_schema_valid': bool(preview_validation['schema_valid']),
+    }
+    warnings = _dedupe_values(
+        [str(item) for item in parsed_payload.get('warnings', []) or []]
+        + source_warnings
+        + _build_mapping_warnings_from_payload(canonical_mapping_payload)
+    )
+    validation_payload = {
+        'target_schema': target_schema,
+        'target_schema_summary': target_schema_summary,
+        'ts_validation': ts_validation,
+        'preview_validation': preview_validation,
+        'mapping_explainability': mapping_explainability,
+        'quality_summary': quality_summary,
+    }
+    serialized_mappings = _ensure_json_text(canonical_mapping_payload, [])
+    serialized_preview = _ensure_json_text(preview, [])
+    serialized_warnings = _ensure_json_text(warnings, [])
+    serialized_validation = _ensure_json_text(validation_payload, {})
+    current_mappings_json = _ensure_json_text(str(context['mappings_json'] or '[]'), [])
+    current_validation_json = _ensure_json_text(str(context['validation_json'] or '{}'), {})
+
+    if serialized_mappings == current_mappings_json and serialized_validation == current_validation_json:
+        return {
+            'updated': False,
+            'generation_id': generation_id,
+            'version_id': int(context['version_id']) if context['version_id'] is not None else None,
+            'version_number': int(context['version_number']) if context['version_number'] is not None else None,
+        }
+
+    version_info = _append_generation_state_version(
+        db=db,
+        generation_id=generation_id,
+        parent_version_id=int(context['version_id']) if context['version_id'] is not None else None,
+        parent_version_number=int(context['version_number']) if context['version_number'] is not None else None,
+        note=note,
+        target_json=str(context['target_json'] or _ensure_json_text(target_payload, {})),
+        generated_typescript=generated_typescript,
+        file_name=str(context['file_name'] or 'generation'),
+        file_path=str(context['file_path']) if context.get('file_path') else None,
+        file_type=str(context['file_type'] or 'unknown'),
+        selected_sheet=context['selected_sheet'],
+        parsed_file_json=str(context['parsed_file_json'] or _ensure_json_text(parsed_payload, {})),
+        mappings_json=serialized_mappings,
+        preview_json=serialized_preview,
+        warnings_json=serialized_warnings,
+        validation_json=serialized_validation,
+    )
+    return {
+        'updated': True,
+        'generation_id': generation_id,
+        **version_info,
+    }
 
 
 def _promote_confirmed_generation_learning(
