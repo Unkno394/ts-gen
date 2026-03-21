@@ -281,44 +281,23 @@ function buildSchemaFromDraftSuggestions(suggestions: DraftFieldSuggestion[]): s
 }
 
 function mappingStatusLabel(mapping: MappingInfo): string {
-  if (mapping.status === 'accepted') {
-    return 'Подтверждено';
-  }
   if (mapping.status === 'rejected') {
     return 'Отклонено';
   }
-  if (mapping.sourceOfTruth === 'personal_memory') {
-    return 'Из памяти';
+  if (mappingNeedsExplicitReview(mapping) && (mapping.status ?? 'suggested') === 'suggested') {
+    return 'На проверке';
   }
-  if (mapping.sourceOfTruth === 'deterministic_rule') {
-    return 'Правило';
-  }
-  if (mapping.sourceOfTruth === 'position_fallback') {
-    return 'Fallback';
-  }
-  if (mapping.sourceOfTruth === 'model_suggestion') {
-    return 'Нужно проверить';
-  }
-  return 'Черновик';
+  return 'Подтверждено';
 }
 
 function draftSuggestionStatusLabel(suggestion: DraftFieldSuggestion): string {
-  if (suggestion.status === 'accepted') {
-    return 'Подтверждено';
-  }
   if (suggestion.status === 'rejected') {
     return 'Отклонено';
   }
-  if (suggestion.sourceOfTruth === 'personal_memory') {
-    return 'Из памяти';
+  if (draftSuggestionNeedsExplicitReview(suggestion) && (suggestion.status ?? 'suggested') === 'suggested') {
+    return 'На проверке';
   }
-  if (suggestion.sourceOfTruth === 'model_suggestion') {
-    return 'Модель';
-  }
-  if (suggestion.sourceOfTruth === 'global_pattern') {
-    return 'Паттерн';
-  }
-  return 'Черновик';
+  return 'Подтверждено';
 }
 
 function mappingSourceLabel(mapping: MappingInfo): string {
@@ -335,7 +314,7 @@ function mappingSourceLabel(mapping: MappingInfo): string {
     return 'Системное правило';
   }
   if (mapping.sourceOfTruth === 'position_fallback') {
-    return 'Fallback';
+    return 'По позиции';
   }
   if (mapping.sourceOfTruth === 'unresolved') {
     return 'Не определено';
@@ -416,6 +395,64 @@ function learningEventFilterLabel(filter: LearningEventFilter): string {
     return 'Все';
   }
   return learningEventStageLabel(filter);
+}
+
+const reviewItemCollator = new Intl.Collator('ru', {
+  sensitivity: 'base',
+  numeric: true,
+});
+
+function compareReviewLabels(left: string, right: string): number {
+  const normalizedLeft = left.trim();
+  const normalizedRight = right.trim();
+
+  if (!normalizedLeft && !normalizedRight) {
+    return 0;
+  }
+  if (!normalizedLeft) {
+    return 1;
+  }
+  if (!normalizedRight) {
+    return -1;
+  }
+  return reviewItemCollator.compare(normalizedLeft, normalizedRight);
+}
+
+function mappingReviewSortLabel(mapping: MappingInfo): string {
+  if (mapping.source && mapping.source !== 'not found') {
+    return mapping.source;
+  }
+  return mapping.target;
+}
+
+function draftSuggestionReviewSortLabel(suggestion: DraftFieldSuggestion): string {
+  return suggestion.sourceColumn || suggestion.targetField;
+}
+
+function mappingDisplayPriority(mapping: MappingInfo): number {
+  if (mappingNeedsExplicitReview(mapping) && (mapping.status ?? 'suggested') === 'suggested') {
+    return 0;
+  }
+  if (mapping.status === 'accepted' || (!mappingNeedsExplicitReview(mapping) && mapping.status !== 'rejected')) {
+    return 1;
+  }
+  if (mapping.status === 'rejected') {
+    return 2;
+  }
+  return 3;
+}
+
+function draftSuggestionDisplayPriority(suggestion: DraftFieldSuggestion): number {
+  if (draftSuggestionNeedsExplicitReview(suggestion) && (suggestion.status ?? 'suggested') === 'suggested') {
+    return 0;
+  }
+  if (suggestion.status === 'accepted' || (!draftSuggestionNeedsExplicitReview(suggestion) && suggestion.status !== 'rejected')) {
+    return 1;
+  }
+  if (suggestion.status === 'rejected') {
+    return 2;
+  }
+  return 3;
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -613,6 +650,42 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return draftSuggestions.some((suggestion, index) => draftSuggestionNeedsExplicitReview(suggestion) && suggestion.status === 'rejected' && !draftReviewNotes[`draft-${index}`]?.trim());
   }, [draftReviewNotes, draftSuggestions]);
 
+  const sortedMappingRows = useMemo(() => {
+    return result.mappings
+      .map((mapping, index) => ({ mapping, index }))
+      .sort((left, right) => {
+        const priorityDelta = mappingDisplayPriority(left.mapping) - mappingDisplayPriority(right.mapping);
+        if (priorityDelta !== 0) {
+          return priorityDelta;
+        }
+
+        const alphabeticalOrder = compareReviewLabels(mappingReviewSortLabel(left.mapping), mappingReviewSortLabel(right.mapping));
+        if (alphabeticalOrder !== 0) {
+          return alphabeticalOrder;
+        }
+
+        return left.index - right.index;
+      });
+  }, [result.mappings]);
+
+  const sortedDraftSuggestionRows = useMemo(() => {
+    return draftSuggestions
+      .map((suggestion, index) => ({ suggestion, index }))
+      .sort((left, right) => {
+        const priorityDelta = draftSuggestionDisplayPriority(left.suggestion) - draftSuggestionDisplayPriority(right.suggestion);
+        if (priorityDelta !== 0) {
+          return priorityDelta;
+        }
+
+        const alphabeticalOrder = compareReviewLabels(draftSuggestionReviewSortLabel(left.suggestion), draftSuggestionReviewSortLabel(right.suggestion));
+        if (alphabeticalOrder !== 0) {
+          return alphabeticalOrder;
+        }
+
+        return left.index - right.index;
+      });
+  }, [draftSuggestions]);
+
   const pendingMappingReviewItems = useMemo(() => {
     return result.mappings.flatMap((mapping, index) =>
       mappingNeedsExplicitReview(mapping) && (mapping.status ?? 'suggested') === 'suggested'
@@ -621,6 +694,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               id: `mapping-${index}-${mapping.target}`,
               scrollTargetId: `mapping-review-${index}`,
               title: mapping.target,
+              sortLabel: mappingReviewSortLabel(mapping),
               description: mapping.source && mapping.source !== 'not found' ? `source: ${mapping.source}` : 'source пока не определён',
             },
           ]
@@ -636,12 +710,33 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               id: `draft-${index}-${suggestion.sourceColumn}`,
               scrollTargetId: `draft-review-${index}`,
               title: suggestion.targetField || suggestion.sourceColumn,
+              sortLabel: draftSuggestionReviewSortLabel(suggestion),
               description: `колонка: ${suggestion.sourceColumn}`,
             },
           ]
         : []
     );
   }, [draftSuggestions]);
+
+  const sortedPendingMappingReviewItems = useMemo(() => {
+    return [...pendingMappingReviewItems].sort((left, right) => {
+      const alphabeticalOrder = compareReviewLabels(left.sortLabel, right.sortLabel);
+      if (alphabeticalOrder !== 0) {
+        return alphabeticalOrder;
+      }
+      return compareReviewLabels(left.title, right.title);
+    });
+  }, [pendingMappingReviewItems]);
+
+  const sortedPendingDraftReviewItems = useMemo(() => {
+    return [...pendingDraftReviewItems].sort((left, right) => {
+      const alphabeticalOrder = compareReviewLabels(left.sortLabel, right.sortLabel);
+      if (alphabeticalOrder !== 0) {
+        return alphabeticalOrder;
+      }
+      return compareReviewLabels(left.title, right.title);
+    });
+  }, [pendingDraftReviewItems]);
 
   const pendingReviewTotal = pendingMappingReviewItems.length + pendingDraftReviewItems.length;
 
@@ -1419,25 +1514,29 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setLearningReviewNotice('');
 
     try {
-      const feedbackItems = result.mappings
-        .filter((mapping) => mappingNeedsExplicitReview(mapping))
-        .map((mapping, index) => {
+      const feedbackItems = result.mappings.flatMap((mapping, index) => {
+        if (!mappingNeedsExplicitReview(mapping)) {
+          return [];
+        }
+
           const nextStatus = mapping.status ?? 'accepted';
           const hasSource = Boolean(mapping.source && mapping.source !== 'not found');
           const rationale = nextStatus === 'rejected' ? mappingReviewNotes[`mapping-${index}`]?.trim() || 'Rejected in frontend workspace review.' : null;
-          return {
-            suggestionId: mapping.suggestionId ?? null,
-            targetField: mapping.target,
-            status: nextStatus,
-            sourceField: hasSource ? mapping.source : null,
-            correctedSourceField: nextStatus === 'accepted' && hasSource ? mapping.source : null,
-            correctedTargetField: nextStatus === 'accepted' ? mapping.target : null,
-            confidenceAfter: confidenceToScore(mapping.confidence),
-            rationale,
-            metadata: {
-              source_of_truth: mapping.sourceOfTruth ?? null,
+          return [
+            {
+              suggestionId: mapping.suggestionId ?? null,
+              targetField: mapping.target,
+              status: nextStatus,
+              sourceField: hasSource ? mapping.source : null,
+              correctedSourceField: nextStatus === 'accepted' && hasSource ? mapping.source : null,
+              correctedTargetField: nextStatus === 'accepted' ? mapping.target : null,
+              confidenceAfter: confidenceToScore(mapping.confidence),
+              rationale,
+              metadata: {
+                source_of_truth: mapping.sourceOfTruth ?? null,
+              },
             },
-          };
+          ];
         });
 
       if (feedbackItems.length > 0) {
@@ -1971,13 +2070,13 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   </div>
                   {pendingReviewTotal > 0 ? (
                     <div className="review-queue-list">
-                      {pendingMappingReviewItems.map((item) => (
+                      {sortedPendingMappingReviewItems.map((item) => (
                         <button className="review-queue-item review-queue-item-button" key={item.id} onClick={() => scrollToReviewTarget(item.scrollTargetId)} type="button">
                           <strong>{item.title}</strong>
                           <span>{item.description}</span>
                         </button>
                       ))}
-                      {pendingDraftReviewItems.map((item) => (
+                      {sortedPendingDraftReviewItems.map((item) => (
                         <button className="review-queue-item review-queue-item-button" key={item.id} onClick={() => scrollToReviewTarget(item.scrollTargetId)} type="button">
                           <strong>{item.title}</strong>
                           <span>{item.description}</span>
@@ -1998,7 +2097,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   </div>
                   <div className="mapping-editor-list">
                     {result.mappings.length === 0 && <div className="empty-card compact">После генерации здесь появятся найденные соответствия.</div>}
-                    {result.mappings.map((mapping, index) => (
+                    {sortedMappingRows.map(({ mapping, index }) => (
                       <div
                         className={reviewFocusTarget === `mapping-review-${index}` ? 'mapping-editor-row review-target-focus' : 'mapping-editor-row'}
                         id={`mapping-review-${index}`}
@@ -2107,7 +2206,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   </div>
                   <div className="mapping-editor-list">
                     {draftSuggestions.length === 0 && <div className="empty-card compact">После нажатия «Draft JSON по таблице» здесь появятся названия полей для проверки.</div>}
-                    {draftSuggestions.map((suggestion, index) => (
+                    {sortedDraftSuggestionRows.map(({ suggestion, index }) => (
                       <div
                         className={reviewFocusTarget === `draft-review-${index}` ? 'mapping-editor-row review-target-focus' : 'mapping-editor-row'}
                         id={`draft-review-${index}`}
