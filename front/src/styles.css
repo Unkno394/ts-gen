@@ -76,6 +76,7 @@ input::-ms-reveal {
 
 .subtle-text {
   color: rgba(255, 255, 255, 0.66);
+  overflow-wrap: anywhere;
 }
 
 .primary-btn,
@@ -129,6 +130,24 @@ input::-ms-reveal {
 .icon-btn {
   width: 38px;
   height: 38px;
+}
+
+.source-refresh-btn.is-busy {
+  cursor: wait;
+}
+
+.source-refresh-btn.is-success {
+  border-color: rgba(88, 221, 184, 0.34);
+  background: rgba(26, 175, 137, 0.16);
+  box-shadow: 0 10px 24px rgba(26, 175, 137, 0.18);
+}
+
+.source-refresh-icon-spinning {
+  animation: sourceRefreshSpin 0.9s linear infinite;
+}
+
+.source-refresh-icon-success {
+  animation: sourceRefreshPop 320ms ease-out;
 }
 
 .link-btn {
@@ -795,13 +814,19 @@ input::-ms-reveal {
   background: rgba(0, 0, 0, 0.18);
 }
 
+.insight-card {
+  min-width: 0;
+}
+
 .panel-title,
 .pane-header {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 12px;
   font-weight: 700;
+  min-width: 0;
 }
 
 .pane-header-with-action {
@@ -975,6 +1000,11 @@ input::-ms-reveal {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  margin-bottom: 14px;
+}
+
+.source-refresh-status {
+  margin-top: 0;
   margin-bottom: 14px;
 }
 
@@ -1879,6 +1909,8 @@ input::-ms-reveal {
   font-size: 13px;
   line-height: 1.6;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .code-editor {
@@ -2100,7 +2132,7 @@ input::-ms-reveal {
 
 .review-queue-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 10px;
 }
 
@@ -2114,6 +2146,7 @@ input::-ms-reveal {
   background: rgba(255, 255, 255, 0.03);
   align-content: center;
   text-align: center;
+  min-width: 0;
 }
 
 .review-queue-stat strong {
@@ -2125,12 +2158,14 @@ input::-ms-reveal {
   color: rgba(255, 255, 255, 0.58);
   font-size: 12px;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .review-queue-list {
   display: grid;
   gap: 10px;
   margin-top: 12px;
+  min-width: 0;
 }
 
 .review-queue-item {
@@ -2140,15 +2175,24 @@ input::-ms-reveal {
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
+  min-width: 0;
 }
 
 .review-queue-item span {
   color: rgba(255, 255, 255, 0.58);
   font-size: 13px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.review-queue-item strong {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .review-queue-item-button {
   width: 100%;
+  min-width: 0;
   color: inherit;
   text-align: left;
   transition:
@@ -2225,7 +2269,8 @@ input::-ms-reveal {
 
 .insight-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
   gap: 16px;
 }
 
@@ -2233,6 +2278,7 @@ input::-ms-reveal {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 
 .warning-item,
@@ -2241,21 +2287,27 @@ input::-ms-reveal {
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.04);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .generation-quality-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
   gap: 10px;
 }
 
 .generation-quality-item {
   display: grid;
   gap: 6px;
+  flex: 1 1 220px;
   padding: 12px 14px;
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
+  min-width: 0;
 }
 
 .generation-quality-item span {
@@ -2263,20 +2315,26 @@ input::-ms-reveal {
   font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  overflow-wrap: anywhere;
 }
 
 .generation-quality-item strong {
   font-size: 15px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .generation-quality-item small {
   color: rgba(255, 255, 255, 0.62);
   line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .generation-quality-item em {
   justify-self: start;
   font-style: normal;
+  max-width: 100%;
 }
 
 .generation-quality-chip {
@@ -2318,11 +2376,13 @@ input::-ms-reveal {
   display: grid;
   gap: 12px;
   margin-top: 14px;
+  min-width: 0;
 }
 
 .generation-diagnostics-group {
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 
 .generation-diagnostics-group > strong {
@@ -2332,6 +2392,7 @@ input::-ms-reveal {
 .generation-diagnostics-list {
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 
 .generation-diagnostic-item {
@@ -2341,17 +2402,22 @@ input::-ms-reveal {
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
+  min-width: 0;
 }
 
 .generation-diagnostic-item span {
   color: rgba(255, 255, 255, 0.74);
   font-size: 12px;
   font-weight: 700;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .generation-diagnostic-item small {
   color: rgba(255, 255, 255, 0.62);
   line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .compact {
@@ -2665,6 +2731,32 @@ body {
   100% {
     transform: translateX(0%);
     background-position: 100% 50%;
+  }
+}
+
+@keyframes sourceRefreshSpin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sourceRefreshPop {
+  0% {
+    transform: scale(0.82);
+    opacity: 0.4;
+  }
+
+  70% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+
+  100% {
+    transform: scale(1);
   }
 }
 

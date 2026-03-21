@@ -37,6 +37,7 @@ from models import (
     RepairPreviewPayload,
     ParsedFile,
     RegisterPayload,
+    SourcePreviewRefreshLogPayload,
     ResetPasswordPayload,
     TargetField,
     TrainingRunActivationPayload,
@@ -615,7 +616,11 @@ def _preview_text(value: str, limit: int = 200) -> str:
 
 
 @router.post('/source-preview')
-async def source_preview(file: UploadFile = File(...)) -> dict:
+async def source_preview(
+    file: UploadFile = File(...),
+    target_json: str | None = Form(default=None),
+    selected_sheet: str | None = Form(default=None),
+) -> dict:
     cleanup_expired_guest_files()
 
     filename = file.filename or 'uploaded_file'
@@ -624,6 +629,31 @@ async def source_preview(file: UploadFile = File(...)) -> dict:
 
     try:
         parsed = parse_file(saved_path, filename)
+        source_warnings: list[str] = []
+        resolved_target_fields: list[TargetField] | None = None
+
+        if target_json and target_json.strip():
+            try:
+                resolved_target_fields, _target_payload, _target_schema, _target_schema_summary = parse_target_schema(target_json)
+            except ParseError as exc:
+                parsed.warnings.append(f'Target JSON was skipped during structure refresh: {exc}')
+
+        try:
+            source_columns, source_rows, source_warnings = resolve_generation_source(
+                parsed,
+                selected_sheet,
+                target_fields=resolved_target_fields,
+            )
+            if source_columns or source_rows:
+                parsed.columns = source_columns
+                parsed.rows = source_rows
+        except ParseError as exc:
+            parsed.warnings.append(f'Structure refresh fallback: {exc}')
+
+        if source_warnings:
+            deduped_warnings = list(dict.fromkeys([*parsed.warnings, *source_warnings]))
+            parsed.warnings = deduped_warnings
+
         try:
             saved_path.unlink(missing_ok=True)
         except PermissionError:
@@ -638,6 +668,37 @@ async def source_preview(file: UploadFile = File(...)) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.exception('source preview failed: file=%s error=%s', filename, exc)
         raise HTTPException(status_code=500, detail='Произошла внутренняя ошибка сервера. Попробуйте ещё раз.') from exc
+
+
+@router.post('/source-preview-log')
+def source_preview_log(
+    payload: SourcePreviewRefreshLogPayload,
+    current_user: dict[str, str] | None = Depends(get_optional_current_user),
+) -> dict:
+    logger.info(
+        'source-preview-log: user_id=%s file=%s selected_sheet=%s result=%s active_sheet_changed=%s structure_changed=%s previous_sheet=%s next_sheet=%s previous_sheet_count=%s next_sheet_count=%s previous_columns=%s next_columns=%s previous_rows=%s next_rows=%s details=%s message=%s',
+        current_user['id'] if current_user else 'guest',
+        payload.file_name,
+        payload.selected_sheet,
+        payload.result,
+        payload.active_sheet_changed,
+        payload.structure_changed,
+        payload.previous_sheet_name,
+        payload.next_sheet_name,
+        payload.previous_sheet_count,
+        payload.next_sheet_count,
+        payload.previous_column_count,
+        payload.next_column_count,
+        payload.previous_row_count,
+        payload.next_row_count,
+        ', '.join(payload.details),
+        payload.message,
+    )
+    return {
+        'logged': True,
+        'result': payload.result,
+        'user_id': current_user['id'] if current_user else None,
+    }
 
 
 @router.post('/repair-preview')

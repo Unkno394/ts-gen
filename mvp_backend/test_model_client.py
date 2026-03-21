@@ -514,6 +514,82 @@ class ModelClientRuntimeTests(unittest.TestCase):
         self.assertEqual(ranking['best_candidate'], 'Сумма')
         self.assertEqual(captured['oauth_headers']['Authorization'], 'Basic Y2xpZW50LWlkOmNsaWVudC1zZWNyZXQ=')
 
+    def test_extract_model_usage_backfills_total_and_accepts_aliases(self) -> None:
+        usage = model_client._extract_model_usage(
+            {
+                'usage': {
+                    'input_tokens': '21',
+                    'output_tokens': 8,
+                    'precached_prompt_tokens': '3',
+                }
+            }
+        )
+
+        self.assertEqual(
+            usage,
+            {
+                'prompt_tokens': 21,
+                'completion_tokens': 8,
+                'total_tokens': 29,
+                'precached_prompt_tokens': 3,
+            },
+        )
+
+    def test_gigachat_usage_is_logged_when_provider_returns_usage(self) -> None:
+        with patch.dict(
+            'os.environ',
+            {
+                'TSGEN_MODEL_PROVIDER': 'gigachat',
+                'TSGEN_MODEL_BASE_URL': 'https://gigachat.devices.sberbank.ru/api/v1',
+                'TSGEN_MODEL_NAME': 'GigaChat-2-Pro',
+                'TSGEN_MODEL_API_KEY': 'gigachat-access-token',
+            },
+            clear=False,
+        ):
+            def fake_post_json(
+                url: str,
+                payload: dict,
+                headers: dict,
+                timeout_seconds: float,
+                ssl_context=None,
+            ) -> dict:
+                return {
+                    'choices': [
+                        {
+                            'message': {
+                                'content': (
+                                    '{"target":"amount","best_candidate":"РЎСѓРјРјР°",'
+                                    '"confidence":0.82,"reason":"semantic amount match"}'
+                                )
+                            }
+                        }
+                    ],
+                    'usage': {
+                        'prompt_tokens': 127,
+                        'completion_tokens': 19,
+                        'total_tokens': 146,
+                        'precached_prompt_tokens': 4,
+                    },
+                }
+
+            with self.assertLogs('model_client', level='INFO') as captured_logs:
+                with patch('model_client._post_json', side_effect=fake_post_json):
+                    ranking, warnings = model_client.rank_mapping_candidate(
+                        target_field='amount',
+                        target_type='number',
+                        candidates=['РЎСѓРјРјР°', 'Р”Р°С‚Р°'],
+                    )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(ranking['best_candidate'], 'РЎСѓРјРјР°')
+        self.assertTrue(
+            any(
+                'llm usage: provider=gigachat model=GigaChat-2-Pro prompt_tokens=127 completion_tokens=19 total_tokens=146 precached_prompt_tokens=4'
+                in entry
+                for entry in captured_logs.output
+            )
+        )
+
     def test_gigachat_markdown_fence_json_is_parsed(self) -> None:
         with patch.dict(
             'os.environ',

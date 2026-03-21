@@ -534,6 +534,17 @@ def _call_model(*, instructions: str, payload: dict[str, Any], runtime: dict[str
             request_payload,
             **request_kwargs,
         )
+        usage = _extract_model_usage(response)
+        if usage is not None:
+            logger.info(
+                'llm usage: provider=%s model=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d precached_prompt_tokens=%d',
+                provider,
+                model_name,
+                usage['prompt_tokens'],
+                usage['completion_tokens'],
+                usage['total_tokens'],
+                usage['precached_prompt_tokens'],
+            )
         choices = response.get('choices') if isinstance(response, dict) else None
         if not isinstance(choices, list) or not choices:
             raise RuntimeError('GigaChat не вернул choices.')
@@ -1059,6 +1070,43 @@ def _extract_openai_message_content(message: Any) -> str | None:
         return None
 
     return None
+
+
+def _extract_model_usage(response: Any) -> dict[str, int] | None:
+    if not isinstance(response, dict):
+        return None
+
+    usage = response.get('usage')
+    if not isinstance(usage, dict):
+        return None
+
+    prompt_tokens = _coerce_usage_int(usage.get('prompt_tokens'), fallback=usage.get('input_tokens'))
+    completion_tokens = _coerce_usage_int(usage.get('completion_tokens'), fallback=usage.get('output_tokens'))
+    total_tokens = _coerce_usage_int(usage.get('total_tokens'))
+    precached_prompt_tokens = _coerce_usage_int(usage.get('precached_prompt_tokens'))
+
+    if total_tokens <= 0 and (prompt_tokens > 0 or completion_tokens > 0):
+        total_tokens = prompt_tokens + completion_tokens
+
+    return {
+        'prompt_tokens': prompt_tokens,
+        'completion_tokens': completion_tokens,
+        'total_tokens': total_tokens,
+        'precached_prompt_tokens': precached_prompt_tokens,
+    }
+
+
+def _coerce_usage_int(value: Any, *, fallback: Any = None) -> int:
+    for candidate in (value, fallback):
+        if candidate is None:
+            continue
+        try:
+            normalized = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if normalized >= 0:
+            return normalized
+    return 0
 
 
 def _extract_json_payload(content: str) -> Any:

@@ -39,6 +39,8 @@ import {
   fetchSourcePreviewFromBackend,
   generateDraftJsonFromBackend,
   generateFromBackend,
+  logSourcePreviewRefreshToBackend,
+  refreshSourceStructureFromBackend,
   requestEmailChangeCode,
   saveLearningCorrections,
   saveDraftJsonFeedback,
@@ -282,6 +284,132 @@ function buildFormPreviewSheet(parsedFile: ParsedFileInfo): ParsedSheetInfo | nu
   }
 
   return buildPreviewSheet('Form extraction', ['field', 'value', 'source'], rows);
+}
+
+function buildPreviewSheetsForParsedFile(parsedFile: ParsedFileInfo | null): ParsedSheetInfo[] {
+  if (!parsedFile) {
+    return [];
+  }
+
+  if (parsedFile.documentMode === 'form_layout_mode') {
+    const formPreviewSheet = buildFormPreviewSheet(parsedFile);
+    if (formPreviewSheet) {
+      return [formPreviewSheet];
+    }
+  }
+
+  if (parsedFile.sheets.length > 0) {
+    return parsedFile.sheets;
+  }
+
+  if (parsedFile.columns.length === 0 && parsedFile.rows.length === 0) {
+    return [];
+  }
+
+  return [buildPreviewSheet(parsedFile.fileName, parsedFile.columns, parsedFile.rows)];
+}
+
+function buildPreviewSheetSignature(sheet: ParsedSheetInfo | null): string {
+  if (!sheet) {
+    return '';
+  }
+
+  return JSON.stringify({
+    name: sheet.name,
+    columns: sheet.columns,
+    rows: sheet.rows.map((row) => sheet.columns.map((column) => formatPreviewCellValue(row[column]))),
+  });
+}
+
+function buildPreviewSheetCollectionSignature(sheets: ParsedSheetInfo[]): string {
+  return JSON.stringify(
+    sheets.map((sheet) => ({
+      name: sheet.name,
+      columns: sheet.columns,
+      rows: sheet.rows.map((row) => sheet.columns.map((column) => formatPreviewCellValue(row[column]))),
+    }))
+  );
+}
+
+function describeSourceStructureRefresh(previousParsedFile: ParsedFileInfo | null, nextParsedFile: ParsedFileInfo, preferredSheetName: string | null) {
+  const previousSheets = buildPreviewSheetsForParsedFile(previousParsedFile);
+  const nextSheets = buildPreviewSheetsForParsedFile(nextParsedFile);
+  const fallbackSheetName = preferredSheetName ?? previousSheets[0]?.name ?? nextSheets[0]?.name ?? null;
+  const previousActiveSheet = previousSheets.find((sheet) => sheet.name === fallbackSheetName) ?? previousSheets[0] ?? null;
+  const nextActiveSheet = nextSheets.find((sheet) => sheet.name === fallbackSheetName) ?? nextSheets[0] ?? null;
+  const activeSheetChanged = buildPreviewSheetSignature(previousActiveSheet) !== buildPreviewSheetSignature(nextActiveSheet);
+  const structureChanged = buildPreviewSheetCollectionSignature(previousSheets) !== buildPreviewSheetCollectionSignature(nextSheets);
+  const details: string[] = [];
+
+  if (previousSheets.length !== nextSheets.length) {
+    details.push(`листов ${previousSheets.length}→${nextSheets.length}`);
+  }
+
+  if ((previousActiveSheet?.name ?? null) !== (nextActiveSheet?.name ?? null) && (previousActiveSheet || nextActiveSheet)) {
+    details.push(`активная таблица "${previousActiveSheet?.name ?? 'нет'}" → "${nextActiveSheet?.name ?? 'нет'}"`);
+  }
+
+  if ((previousActiveSheet?.columns.length ?? 0) !== (nextActiveSheet?.columns.length ?? 0)) {
+    details.push(`колонки ${(previousActiveSheet?.columns.length ?? 0)}→${nextActiveSheet?.columns.length ?? 0}`);
+  }
+
+  if ((previousActiveSheet?.rows.length ?? 0) !== (nextActiveSheet?.rows.length ?? 0)) {
+    details.push(`строки ${(previousActiveSheet?.rows.length ?? 0)}→${nextActiveSheet?.rows.length ?? 0}`);
+  }
+
+  if (activeSheetChanged && details.length === 0) {
+    details.push('содержимое обновлено');
+  }
+
+  const networkResult: 'changed' | 'unchanged' | 'initial' = !previousParsedFile
+    ? 'initial'
+    : activeSheetChanged || structureChanged
+      ? 'changed'
+      : 'unchanged';
+
+  let message = 'Перегенерация завершена: структура источника обновлена.';
+  if (!previousParsedFile) {
+    message = nextActiveSheet
+      ? `Перегенерация завершена: таблица "${nextActiveSheet.name}" собрана.`
+      : 'Перегенерация завершена: структура источника собрана.';
+  } else if (!structureChanged && !activeSheetChanged) {
+    message = previousActiveSheet
+      ? `Перегенерация завершена: таблица "${previousActiveSheet.name}" не изменилась.`
+      : 'Перегенерация завершена: структура источника не изменилась.';
+  } else if (activeSheetChanged) {
+    const targetSheetLabel = nextActiveSheet?.name ?? previousActiveSheet?.name ?? null;
+    const suffix = details.length > 0 ? ` (${details.join(', ')})` : '';
+    message = targetSheetLabel
+      ? `Перегенерация завершена: таблица "${targetSheetLabel}" изменилась${suffix}.`
+      : `Перегенерация завершена: структура источника обновлена${suffix}.`;
+  } else {
+    const targetSheetLabel = nextActiveSheet?.name ?? previousActiveSheet?.name ?? null;
+    const suffix = details.length > 0 ? ` (${details.join(', ')})` : '';
+    message = targetSheetLabel
+      ? `Перегенерация завершена: таблица "${targetSheetLabel}" не изменилась, но структура источника обновилась${suffix}.`
+      : `Перегенерация завершена: структура источника обновилась${suffix}.`;
+  }
+
+  return {
+    activeSheetChanged,
+    structureChanged,
+    networkResult,
+    message,
+    nextActiveSheetName: nextActiveSheet?.name ?? null,
+    consolePayload: {
+      activeSheetChanged,
+      structureChanged,
+      previousSheetName: previousActiveSheet?.name ?? null,
+      nextSheetName: nextActiveSheet?.name ?? null,
+      previousSheetCount: previousSheets.length,
+      nextSheetCount: nextSheets.length,
+      previousColumnCount: previousActiveSheet?.columns.length ?? 0,
+      nextColumnCount: nextActiveSheet?.columns.length ?? 0,
+      previousRowCount: previousActiveSheet?.rows.length ?? 0,
+      nextRowCount: nextActiveSheet?.rows.length ?? 0,
+      details,
+    },
+  };
 }
 
 function needsBackendSourcePreview(extension: string | undefined): boolean {
@@ -1052,12 +1180,14 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [sourcePreviewRefreshBusy, setSourcePreviewRefreshBusy] = useState(false);
   const [sourcePreviewRefreshNotice, setSourcePreviewRefreshNotice] = useState('');
   const [sourcePreviewRefreshError, setSourcePreviewRefreshError] = useState('');
+  const [sourcePreviewRefreshDone, setSourcePreviewRefreshDone] = useState(false);
   const [activeRepairActionKey, setActiveRepairActionKey] = useState<string | null>(null);
   const [repairPreview, setRepairPreview] = useState<RepairPreviewResult | null>(null);
   const [sectionStateCache, setSectionStateCache] = useState<Record<string, SectionWorkspaceState>>({});
   const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
+  const sourcePreviewRefreshTimerRef = useRef<number | null>(null);
   const previewGridWrapRef = useRef<HTMLDivElement | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
   const currentFormExplainability = result.formExplainability ?? null;
@@ -1104,28 +1234,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [historyDeleteBusyId, historyDeleteTarget]);
 
-  const previewSheets = useMemo(() => {
-    if (!parsedFile) {
-      return [];
-    }
-
-    if (parsedFile.documentMode === 'form_layout_mode') {
-      const formPreviewSheet = buildFormPreviewSheet(parsedFile);
-      if (formPreviewSheet) {
-        return [formPreviewSheet];
+  useEffect(() => {
+    return () => {
+      if (sourcePreviewRefreshTimerRef.current !== null) {
+        window.clearTimeout(sourcePreviewRefreshTimerRef.current);
       }
-    }
+    };
+  }, []);
 
-    if (parsedFile.sheets.length > 0) {
-      return parsedFile.sheets;
-    }
-
-    if (parsedFile.columns.length === 0 && parsedFile.rows.length === 0) {
-      return [];
-    }
-
-    return [buildPreviewSheet(parsedFile.fileName, parsedFile.columns, parsedFile.rows)];
-  }, [parsedFile]);
+  const previewSheets = useMemo(() => buildPreviewSheetsForParsedFile(parsedFile), [parsedFile]);
 
   const currentPreviewSheet = useMemo(() => {
     if (previewSheets.length === 0) {
@@ -1610,6 +1727,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftJsonSaved(false);
     setRepairNotice('');
     setRepairError('');
+    setSourcePreviewRefreshNotice('');
+    setSourcePreviewRefreshError('');
+    setSourcePreviewRefreshDone(false);
     setActiveRepairActionKey(null);
     setRepairPreview(null);
     setLearningReviewNotice('');
@@ -2151,29 +2271,64 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       return;
     }
 
+    if (sourcePreviewRefreshTimerRef.current !== null) {
+      window.clearTimeout(sourcePreviewRefreshTimerRef.current);
+      sourcePreviewRefreshTimerRef.current = null;
+    }
+
     setSourcePreviewRefreshBusy(true);
+    setSourcePreviewRefreshDone(false);
     setSourcePreviewRefreshNotice('');
     setSourcePreviewRefreshError('');
 
     try {
-      const selectedFileExtension = selectedFile.name.split('.').pop()?.toLowerCase();
-      const refreshed = needsBackendSourcePreview(selectedFileExtension)
-        ? await fetchSourcePreviewFromBackend(selectedFile)
-        : await parseFile(selectedFile);
+      const previousParsedFile = parsedFile;
+      const previousPreferredSheetName = currentPreviewSheet?.name ?? activePreviewSheet;
+      const refreshedResponse = await refreshSourceStructureFromBackend({
+        file: selectedFile,
+        targetJson: schema,
+        selectedSheet: previousPreferredSheetName,
+      });
+      const refreshed = refreshedResponse.parsedFile;
+      const refreshSummary = describeSourceStructureRefresh(previousParsedFile, refreshed, previousPreferredSheetName);
 
       setParsedFile(refreshed);
       setResult((current) => ({
         ...current,
         parsedFile: refreshed,
+        formExplainability: refreshedResponse.formExplainability ?? current.formExplainability ?? null,
       }));
-      setActivePreviewSheet(refreshed.sheets[0]?.name ?? null);
+      setActivePreviewSheet(refreshSummary.nextActiveSheetName);
       setSourceStructureTab(preferredSourceStructureTab(refreshed));
       setSectionStateCache({});
       setAutoGenerateSectionKey(null);
       setActiveRepairActionKey(null);
       setRepairPreview(null);
-      setSourcePreviewRefreshNotice('Структура источника перегенерирована.');
+      setSourcePreviewRefreshDone(true);
+      void logSourcePreviewRefreshToBackend({
+        fileName: refreshed.fileName ?? selectedFile.name,
+        selectedSheet: refreshSummary.nextActiveSheetName,
+        result: refreshSummary.networkResult,
+        activeSheetChanged: refreshSummary.activeSheetChanged,
+        structureChanged: refreshSummary.structureChanged,
+        previousSheetName: refreshSummary.consolePayload.previousSheetName,
+        nextSheetName: refreshSummary.consolePayload.nextSheetName,
+        previousSheetCount: refreshSummary.consolePayload.previousSheetCount,
+        nextSheetCount: refreshSummary.consolePayload.nextSheetCount,
+        previousColumnCount: refreshSummary.consolePayload.previousColumnCount,
+        nextColumnCount: refreshSummary.consolePayload.nextColumnCount,
+        previousRowCount: refreshSummary.consolePayload.previousRowCount,
+        nextRowCount: refreshSummary.consolePayload.nextRowCount,
+        details: refreshSummary.consolePayload.details,
+        message: refreshSummary.message,
+      });
+      sourcePreviewRefreshTimerRef.current = window.setTimeout(() => {
+        setSourcePreviewRefreshDone(false);
+        sourcePreviewRefreshTimerRef.current = null;
+      }, 1800);
+      setSourcePreviewRefreshNotice(refreshSummary.message);
     } catch (error) {
+      setSourcePreviewRefreshDone(false);
       setSourcePreviewRefreshError(error instanceof Error ? error.message : 'Не удалось перегенерировать структуру источника.');
     } finally {
       setSourcePreviewRefreshBusy(false);
@@ -2969,13 +3124,23 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     </span>
                     <button
                       aria-label="Перегенерировать структуру источника"
-                      className="icon-btn copy-code-btn"
+                      className={
+                        sourcePreviewRefreshBusy
+                          ? 'icon-btn copy-code-btn source-refresh-btn is-busy'
+                          : sourcePreviewRefreshDone
+                            ? 'icon-btn copy-code-btn source-refresh-btn is-success'
+                            : 'icon-btn copy-code-btn source-refresh-btn'
+                      }
                       disabled={!selectedFile || sourcePreviewRefreshBusy}
                       onClick={onRefreshSourceStructure}
                       title="Перегенерировать структуру источника"
                       type="button"
                     >
-                      <RotateCcw size={16} />
+                      {sourcePreviewRefreshDone && !sourcePreviewRefreshBusy ? (
+                        <Check className="source-refresh-icon source-refresh-icon-success" size={16} />
+                      ) : (
+                        <RotateCcw className={sourcePreviewRefreshBusy ? 'source-refresh-icon source-refresh-icon-spinning' : 'source-refresh-icon'} size={16} />
+                      )}
                     </button>
                   </div>
                   <div className="source-structure-tabs">
@@ -2990,6 +3155,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </button>
                     ))}
                   </div>
+                  {sourcePreviewRefreshNotice && <div className="auth-status auth-status-success source-refresh-status">{sourcePreviewRefreshNotice}</div>}
+                  {sourcePreviewRefreshError && <div className="warning-item auth-status auth-status-error source-refresh-status">{sourcePreviewRefreshError}</div>}
                   {sourceStructureTab === 'tables' && previewSheets.length > 0 && (
                     <>
                       {previewSheets.length > 1 && (

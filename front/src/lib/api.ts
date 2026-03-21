@@ -24,6 +24,30 @@ type GenerateParams = {
   selectedSheet?: string;
 };
 
+type SourcePreviewRefreshLogParams = {
+  fileName?: string | null;
+  selectedSheet?: string | null;
+  result: 'changed' | 'unchanged' | 'initial' | 'error';
+  activeSheetChanged: boolean;
+  structureChanged: boolean;
+  previousSheetName?: string | null;
+  nextSheetName?: string | null;
+  previousSheetCount: number;
+  nextSheetCount: number;
+  previousColumnCount: number;
+  nextColumnCount: number;
+  previousRowCount: number;
+  nextRowCount: number;
+  details: string[];
+  message?: string | null;
+};
+
+type SourceStructureRefreshParams = {
+  file: File;
+  targetJson?: string;
+  selectedSheet?: string | null;
+};
+
 type BackendParsedFile = {
   file_name: string;
   file_type: string;
@@ -143,6 +167,12 @@ type BackendGenerateResponse = {
 type BackendSourcePreviewResponse = {
   parsed_file: BackendParsedFile;
   form_explainability?: BackendFormExplainability | null;
+};
+
+type BackendSourcePreviewLogResponse = {
+  logged: boolean;
+  result: 'changed' | 'unchanged' | 'initial' | 'error';
+  user_id?: string | null;
 };
 
 type BackendHistoryResponse = {
@@ -1224,6 +1254,59 @@ export async function fetchSourcePreviewFromBackend(file: File) {
 
   const payload = await parseJson<BackendSourcePreviewResponse>(response);
   return normalizeParsedFile(payload.parsed_file);
+}
+
+export async function refreshSourceStructureFromBackend(params: SourceStructureRefreshParams): Promise<{
+  parsedFile: ReturnType<typeof normalizeParsedFile>;
+  formExplainability: FormExplainability | null;
+}> {
+  const formData = new FormData();
+  formData.append('file', params.file);
+  if (params.targetJson?.trim()) {
+    formData.append('target_json', params.targetJson);
+  }
+  if (params.selectedSheet?.trim()) {
+    formData.append('selected_sheet', params.selectedSheet);
+  }
+
+  const response = await fetchWithTimeout(
+    buildApiUrl('/api/source-preview'),
+    {
+      method: 'POST',
+      body: formData,
+    },
+    GENERATE_REQUEST_TIMEOUT_MS
+  );
+
+  const payload = await parseJson<BackendSourcePreviewResponse>(response);
+  return {
+    parsedFile: normalizeParsedFile(payload.parsed_file),
+    formExplainability: normalizeFormExplainability(payload.form_explainability),
+  };
+}
+
+export async function logSourcePreviewRefreshToBackend(params: SourcePreviewRefreshLogParams): Promise<void> {
+  await postJson<BackendSourcePreviewLogResponse>(
+    '/api/source-preview-log',
+    {
+      file_name: params.fileName ?? null,
+      selected_sheet: params.selectedSheet ?? null,
+      result: params.result,
+      active_sheet_changed: params.activeSheetChanged,
+      structure_changed: params.structureChanged,
+      previous_sheet_name: params.previousSheetName ?? null,
+      next_sheet_name: params.nextSheetName ?? null,
+      previous_sheet_count: params.previousSheetCount,
+      next_sheet_count: params.nextSheetCount,
+      previous_column_count: params.previousColumnCount,
+      next_column_count: params.nextColumnCount,
+      previous_row_count: params.previousRowCount,
+      next_row_count: params.nextRowCount,
+      details: params.details,
+      message: params.message ?? null,
+    },
+    6000
+  );
 }
 
 export async function fetchHistory(_userId: string): Promise<HistoryItem[]> {

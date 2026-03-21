@@ -394,3 +394,21 @@ class RepairApplyPayload(BaseModel):
     generation_id: int | None = None
     notes: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SourcePreviewRefreshLogPayload(BaseModel):
+    file_name: str | None = None
+    selected_sheet: str | None = None
+    result: Literal['changed', 'unchanged', 'initial', 'error']
+    active_sheet_changed: bool = False
+    structure_changed: bool = False
+    previous_sheet_name: str | None = None
+    next_sheet_name: str | None = None
+    previous_sheet_count: int = 0
+    next_sheet_count: int = 0
+    previous_column_count: int = 0
+    next_column_count: int = 0
+    previous_row_count: int = 0
+    next_row_count: int = 0
+    details: list[str] = Field(default_factory=list)
+    message: str | None = None
