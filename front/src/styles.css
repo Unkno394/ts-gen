@@ -952,6 +952,99 @@ input::-ms-reveal {
   margin-bottom: 14px;
 }
 
+.source-structure-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.source-structure-tab {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: rgba(236, 242, 255, 0.82);
+  background: rgba(255, 255, 255, 0.03);
+  transition:
+    border-color 180ms ease,
+    background 180ms ease,
+    transform 180ms ease;
+}
+
+.source-structure-tab:hover {
+  transform: translateY(-1px);
+  border-color: rgba(96, 160, 255, 0.24);
+  background: rgba(67, 98, 214, 0.08);
+}
+
+.source-structure-tab.active {
+  border-color: rgba(96, 160, 255, 0.34);
+  background: rgba(67, 98, 214, 0.16);
+}
+
+.source-structure-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.source-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.source-field-card,
+.text-block-card {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.source-field-card span,
+.source-status-card span {
+  color: rgba(255, 255, 255, 0.54);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.source-field-card p,
+.text-block-card p {
+  margin: 0;
+  color: rgba(236, 242, 255, 0.86);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.source-field-card small {
+  color: rgba(255, 255, 255, 0.58);
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.text-block-list {
+  display: grid;
+  gap: 10px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.source-text-pane {
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.source-status-card {
+  align-items: start;
+}
+
 .preview-status-pill {
   display: inline-flex;
   align-items: center;
@@ -2574,5 +2667,9 @@ body {
   .memory-layer-top {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .source-field-grid {
+    grid-template-columns: 1fr;
   }
 }

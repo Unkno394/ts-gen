@@ -25,6 +25,33 @@ type BackendParsedFile = {
   file_type: string;
   columns: string[];
   rows: Record<string, unknown>[];
+  content_type?: 'table' | 'form' | 'text' | 'image_like' | 'mixed' | 'unknown';
+  extraction_status?: string;
+  raw_text?: string;
+  text_blocks?: Array<{
+    id: string;
+    kind: 'paragraph' | 'line';
+    text: string;
+    label?: string | null;
+  }>;
+  sections?: Array<{
+    title: string;
+    text: string;
+  }>;
+  kv_pairs?: Array<{
+    label: string;
+    value: string;
+    confidence: 'high' | 'medium' | 'low';
+    source_text?: string | null;
+  }>;
+  source_candidates?: Array<{
+    candidate_type: 'table_column' | 'kv_pair' | 'text_fact' | 'text_section';
+    label: string;
+    value?: unknown;
+    sample_values?: unknown[];
+    source_text?: string | null;
+    section_title?: string | null;
+  }>;
   sheets: Array<{
     name: string;
     columns: string[];
@@ -110,18 +137,7 @@ type BackendHistoryResponse = {
     file_name: string;
     file_type: string;
     selected_sheet: string | null;
-    parsed_file: {
-      file_name: string;
-      file_type: string;
-      columns: string[];
-      rows: Record<string, unknown>[];
-      sheets: Array<{
-        name: string;
-        columns: string[];
-        rows: Record<string, unknown>[];
-      }>;
-      warnings: string[];
-    } | null;
+    parsed_file: BackendParsedFile | null;
     target_json: Record<string, unknown>;
     mappings: Array<{
       source: string | null;
@@ -377,6 +393,33 @@ function normalizeParsedFile(payload: BackendParsedFile) {
     extension: payload.file_type,
     columns: payload.columns,
     rows: payload.rows,
+    contentType: payload.content_type ?? 'unknown',
+    extractionStatus: payload.extraction_status ?? 'unknown',
+    rawText: payload.raw_text ?? '',
+    textBlocks: (payload.text_blocks ?? []).map((block) => ({
+      id: block.id,
+      kind: block.kind,
+      text: block.text,
+      label: block.label ?? null,
+    })),
+    sections: (payload.sections ?? []).map((section) => ({
+      title: section.title,
+      text: section.text,
+    })),
+    kvPairs: (payload.kv_pairs ?? []).map((pair) => ({
+      label: pair.label,
+      value: pair.value,
+      confidence: pair.confidence,
+      sourceText: pair.source_text ?? null,
+    })),
+    sourceCandidates: (payload.source_candidates ?? []).map((candidate) => ({
+      candidateType: candidate.candidate_type,
+      label: candidate.label,
+      value: candidate.value,
+      sampleValues: candidate.sample_values ?? [],
+      sourceText: candidate.source_text ?? null,
+      sectionTitle: candidate.section_title ?? null,
+    })),
     sheets: payload.sheets ?? [],
     warnings: payload.warnings,
   };
@@ -914,16 +957,7 @@ export async function fetchHistory(_userId: string): Promise<HistoryItem[]> {
     createdAt: item.created_at,
     fileName: item.file_name,
     selectedSheet: item.selected_sheet,
-    parsedFile: item.parsed_file
-      ? {
-          fileName: item.parsed_file.file_name,
-          extension: item.parsed_file.file_type,
-          columns: item.parsed_file.columns,
-          rows: item.parsed_file.rows,
-          sheets: item.parsed_file.sheets ?? [],
-          warnings: item.parsed_file.warnings,
-        }
-      : null,
+    parsedFile: item.parsed_file ? normalizeParsedFile(item.parsed_file) : null,
     schema: JSON.stringify(item.target_json, null, 2),
     code: item.generated_typescript,
     mappings: item.mappings.map((mapping) => ({

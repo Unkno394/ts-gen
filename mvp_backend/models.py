@@ -11,11 +11,46 @@ class ParsedSheet(BaseModel):
     rows: list[dict[str, Any]]
 
 
+class ParsedTextBlock(BaseModel):
+    id: str
+    kind: Literal['paragraph', 'line']
+    text: str
+    label: str | None = None
+
+
+class ParsedSection(BaseModel):
+    title: str
+    text: str
+
+
+class ParsedKvPair(BaseModel):
+    label: str
+    value: str
+    confidence: Literal['high', 'medium', 'low'] = 'medium'
+    source_text: str | None = None
+
+
+class SourceCandidate(BaseModel):
+    candidate_type: Literal['table_column', 'kv_pair', 'text_fact', 'text_section']
+    label: str
+    value: Any | None = None
+    sample_values: list[Any] = Field(default_factory=list)
+    source_text: str | None = None
+    section_title: str | None = None
+
+
 class ParsedFile(BaseModel):
     file_name: str
     file_type: str
     columns: list[str]
     rows: list[dict[str, Any]]
+    content_type: Literal['table', 'form', 'text', 'image_like', 'mixed', 'unknown'] = 'unknown'
+    extraction_status: str = 'unknown'
+    raw_text: str = ''
+    text_blocks: list[ParsedTextBlock] = Field(default_factory=list)
+    sections: list[ParsedSection] = Field(default_factory=list)
+    kv_pairs: list[ParsedKvPair] = Field(default_factory=list)
+    source_candidates: list[SourceCandidate] = Field(default_factory=list)
     sheets: list[ParsedSheet] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 

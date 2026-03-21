@@ -157,8 +157,56 @@ class DocumentParserTests(unittest.TestCase):
 
         self.assertEqual(parsed.columns, [])
         self.assertTrue(any('No tables found in DOCX' in warning for warning in parsed.warnings))
-        self.assertTrue(any('Документ загружен.' in warning for warning in parsed.warnings))
+        self.assertEqual(parsed.content_type, 'text')
+        self.assertEqual(parsed.extraction_status, 'text_extracted')
         self.assertNotIn('No columns detected in the file.', parsed.warnings)
+
+    def test_docx_form_text_extracts_kv_pairs_and_candidates(self) -> None:
+        path = self.test_root / 'form.docx'
+        doc = Document()
+        doc.add_paragraph('ФИО: Иванов Иван')
+        doc.add_paragraph('Дата рождения: 01.01.1990')
+        doc.add_paragraph('Страна налогового резидентства: Германия')
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+        columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(parsed.content_type, 'form')
+        self.assertEqual(parsed.extraction_status, 'text_extracted')
+        self.assertEqual([pair.label for pair in parsed.kv_pairs], ['ФИО', 'Дата рождения', 'Страна налогового резидентства'])
+        self.assertEqual(columns, ['ФИО', 'Дата рождения', 'Страна налогового резидентства'])
+        self.assertEqual(rows, [{'ФИО': 'Иванов Иван', 'Дата рождения': '01.01.1990', 'Страна налогового резидентства': 'Германия'}])
+        self.assertIn('Generated mapping from extracted fields/text candidates.', warnings)
+
+    def test_txt_form_extracts_kv_pairs_and_sections(self) -> None:
+        path = self.test_root / 'form.txt'
+        path.write_text(
+            'Анкета клиента\n\nФИО: Иванов Иван\nДата рождения: 01.01.1990\nСтрана налогового резидентства: Германия\n',
+            encoding='utf-8',
+        )
+
+        parsed = parse_file(path, path.name)
+        columns, rows, _warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(parsed.file_type, 'txt')
+        self.assertEqual(parsed.content_type, 'form')
+        self.assertEqual(parsed.extraction_status, 'text_extracted')
+        self.assertGreaterEqual(len(parsed.sections), 1)
+        self.assertEqual(columns, ['ФИО', 'Дата рождения', 'Страна налогового резидентства'])
+        self.assertEqual(rows[0]['Страна налогового резидентства'], 'Германия')
+
+    def test_image_like_input_reports_ocr_requirement(self) -> None:
+        path = self.test_root / 'scan.png'
+        path.write_bytes(b'not-a-real-png-but-extension-is-enough')
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.content_type, 'image_like')
+        self.assertEqual(parsed.extraction_status, 'image_parse_not_supported_yet')
+        self.assertEqual(parsed.columns, [])
+        self.assertEqual(parsed.rows, [])
+        self.assertTrue(any('OCR' in warning or 'image' in warning.lower() for warning in parsed.warnings))
 
 @unittest.skipIf(openpyxl is None, 'openpyxl is not installed in the current environment')
 class ExcelParserTests(unittest.TestCase):

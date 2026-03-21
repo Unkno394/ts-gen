@@ -26,6 +26,13 @@ export type ParsedFileInfo = {
   extension: string;
   columns: string[];
   rows: Record<string, unknown>[];
+  contentType: 'table' | 'form' | 'text' | 'image_like' | 'mixed' | 'unknown';
+  extractionStatus: string;
+  rawText: string;
+  textBlocks: ParsedTextBlockInfo[];
+  sections: ParsedSectionInfo[];
+  kvPairs: ParsedKvPairInfo[];
+  sourceCandidates: SourceCandidateInfo[];
   sheets: ParsedSheetInfo[];
   warnings: string[];
 };
@@ -34,6 +41,34 @@ export type ParsedSheetInfo = {
   name: string;
   columns: string[];
   rows: Record<string, unknown>[];
+};
+
+export type ParsedTextBlockInfo = {
+  id: string;
+  kind: 'paragraph' | 'line';
+  text: string;
+  label?: string | null;
+};
+
+export type ParsedSectionInfo = {
+  title: string;
+  text: string;
+};
+
+export type ParsedKvPairInfo = {
+  label: string;
+  value: string;
+  confidence: 'high' | 'medium' | 'low';
+  sourceText?: string | null;
+};
+
+export type SourceCandidateInfo = {
+  candidateType: 'table_column' | 'kv_pair' | 'text_fact' | 'text_section';
+  label: string;
+  value?: unknown;
+  sampleValues: unknown[];
+  sourceText?: string | null;
+  sectionTitle?: string | null;
 };
 
 export type MappingInfo = {

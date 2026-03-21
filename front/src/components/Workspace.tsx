@@ -69,6 +69,7 @@ type Props = {
 };
 
 type LearningEventFilter = 'all' | LearningEvent['stage'];
+type SourceStructureTab = 'tables' | 'fields' | 'text' | 'warnings';
 
 const defaultSchema = `{
   "customerName": "",
@@ -107,6 +108,58 @@ function buildPreviewSheet(name: string, columns: string[], rows: Record<string,
     columns,
     rows,
   };
+}
+
+function needsBackendSourcePreview(extension: string | undefined): boolean {
+  return ['pdf', 'docx', 'txt', 'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'].includes(extension ?? '');
+}
+
+function parsedContentTypeLabel(contentType: ParsedFileInfo['contentType']): string {
+  if (contentType === 'mixed') return 'Смешанный источник';
+  if (contentType === 'form') return 'Анкета / форма';
+  if (contentType === 'text') return 'Текстовый документ';
+  if (contentType === 'image_like') return 'Скан / изображение';
+  if (contentType === 'table') return 'Табличный источник';
+  return 'Источник';
+}
+
+function parsedExtractionStatusLabel(extractionStatus: string): string {
+  if (extractionStatus === 'structured_extracted') return 'Таблица извлечена';
+  if (extractionStatus === 'text_extracted') return 'Текст извлечён';
+  if (extractionStatus === 'requires_ocr_or_manual_input') return 'Нужен OCR или ручной ввод';
+  if (extractionStatus === 'image_parse_not_supported_yet') return 'OCR-free image parse пока недоступен';
+  if (extractionStatus === 'text_not_extracted') return 'Текст не извлечён';
+  return 'Статус неизвестен';
+}
+
+function getExtractedFieldEntries(parsedFile: ParsedFileInfo | null): Array<{ kind: 'kv_pair' | 'text_fact'; label: string; value: string; hint?: string | null }> {
+  if (!parsedFile) {
+    return [];
+  }
+
+  const kvEntries = parsedFile.kvPairs.map((pair) => ({
+    kind: 'kv_pair' as const,
+    label: pair.label,
+    value: pair.value,
+    hint: pair.sourceText ?? null,
+  }));
+  const factEntries = parsedFile.sourceCandidates
+    .filter((candidate) => candidate.candidateType === 'text_fact')
+    .map((candidate) => ({
+      kind: 'text_fact' as const,
+      label: candidate.label,
+      value: String(candidate.value ?? ''),
+      hint: candidate.sourceText ?? null,
+    }))
+    .filter((entry) => entry.value.trim().length > 0);
+
+  return [...kvEntries, ...factEntries];
+}
+
+function collectParsedSourceColumns(parsedFile: ParsedFileInfo | null, currentPreviewSheet: ParsedSheetInfo | null): string[] {
+  const columns = currentPreviewSheet?.columns ?? parsedFile?.columns ?? [];
+  const extractedFields = getExtractedFieldEntries(parsedFile).map((entry) => entry.label);
+  return Array.from(new Set([...columns, ...extractedFields]));
 }
 
 function parseWorkbookSheets(workbook: WorkBook, xlsxModule: typeof import('xlsx')): {
@@ -194,6 +247,13 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
       extension,
       columns,
       rows,
+      contentType: 'table',
+      extractionStatus: 'structured_extracted',
+      rawText: '',
+      textBlocks: [],
+      sections: [],
+      kvPairs: [],
+      sourceCandidates: [],
       sheets: [buildPreviewSheet(file.name, columns, rows)],
       warnings: rows.length === 0 ? ['В файле нет строк данных.'] : [],
     };
@@ -210,20 +270,34 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
       extension,
       columns: workbookPreview.columns,
       rows: workbookPreview.rows,
+      contentType: 'table',
+      extractionStatus: 'structured_extracted',
+      rawText: '',
+      textBlocks: [],
+      sections: [],
+      kvPairs: [],
+      sourceCandidates: [],
       sheets: workbookPreview.sheets,
       warnings: workbookPreview.warnings,
     };
   }
 
 
-  if (extension === 'pdf' || extension === 'docx') {
+  if (needsBackendSourcePreview(extension)) {
     return {
       fileName: file.name,
       extension,
       columns: [],
       rows: [],
+      contentType: 'unknown',
+      extractionStatus: 'unknown',
+      rawText: '',
+      textBlocks: [],
+      sections: [],
+      kvPairs: [],
+      sourceCandidates: [],
       sheets: [],
-      warnings: ['Документ загружен. Таблицу из PDF/DOCX прочитаем на backend при генерации.'],
+      warnings: ['Предварительную структуру источника прочитаем на backend.'],
     };
   }
 
@@ -232,8 +306,15 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
     extension,
     columns: [],
     rows: [],
+    contentType: 'unknown',
+    extractionStatus: 'unknown',
+    rawText: '',
+    textBlocks: [],
+    sections: [],
+    kvPairs: [],
+    sourceCandidates: [],
     sheets: [],
-    warnings: ['Поддерживаются CSV, XLSX, XLS, PDF и DOCX.'],
+    warnings: ['Поддерживаются CSV, XLSX, XLS, PDF, DOCX, TXT и image-like файлы без OCR.'],
   };
 }
 
@@ -498,6 +579,13 @@ function previewSectionStatusLabel(status: 'idle' | 'cached' | 'confirmed' | 'lo
   return 'Не считалась';
 }
 
+function sourceStructureTabLabel(tab: SourceStructureTab): string {
+  if (tab === 'tables') return 'Таблицы';
+  if (tab === 'fields') return 'Поля';
+  if (tab === 'text') return 'Текст';
+  return 'Предупреждения';
+}
+
 function draftSuggestionSourceLabel(suggestion: DraftFieldSuggestion): string {
   if (suggestion.sourceOfTruth === 'personal_memory') {
     return 'Персональная память';
@@ -685,6 +773,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [dragActive, setDragActive] = useState(false);
   const [copied, setCopied] = useState(false);
   const [activePreviewSheet, setActivePreviewSheet] = useState<string | null>(null);
+  const [sourceStructureTab, setSourceStructureTab] = useState<SourceStructureTab>('tables');
   const [activeView, setActiveView] = useState<'generator' | 'profile'>('generator');
   const [displayName, setDisplayName] = useState(profile.name);
   const [profileSaveBusy, setProfileSaveBusy] = useState(false);
@@ -809,6 +898,25 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return previewSheets.findIndex((sheet) => sheet.name === currentPreviewSheet.name);
   }, [currentPreviewSheet, previewSheets]);
 
+  const extractedFieldEntries = useMemo(() => getExtractedFieldEntries(parsedFile), [parsedFile]);
+
+  const availableSourceStructureTabs = useMemo(() => {
+    const tabs: SourceStructureTab[] = [];
+    if (previewSheets.length > 0) {
+      tabs.push('tables');
+    }
+    if (extractedFieldEntries.length > 0) {
+      tabs.push('fields');
+    }
+    if ((parsedFile?.rawText ?? '').trim().length > 0 || (parsedFile?.textBlocks.length ?? 0) > 0 || (parsedFile?.sections.length ?? 0) > 0) {
+      tabs.push('text');
+    }
+    if ((parsedFile?.warnings.length ?? 0) > 0 || !!parsedFile?.extractionStatus) {
+      tabs.push('warnings');
+    }
+    return tabs;
+  }, [extractedFieldEntries.length, parsedFile?.extractionStatus, parsedFile?.rawText, parsedFile?.sections.length, parsedFile?.textBlocks.length, parsedFile?.warnings.length, previewSheets.length]);
+
   const currentSectionKey = useMemo(
     () => buildSectionCacheKey(parsedFile?.fileName, currentPreviewSheet?.name ?? activePreviewSheet ?? 'default'),
     [activePreviewSheet, currentPreviewSheet?.name, parsedFile?.fileName]
@@ -819,20 +927,24 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       return 'Файл еще не загружен';
     }
 
-    if ((parsedFile.extension === 'pdf' || parsedFile.extension === 'docx') && parsedFile.sheets.length > 1) {
-      return `${parsedFile.fileName} · ${parsedFile.sheets.length} таблиц(ы) найдено`;
+    if (parsedFile.contentType === 'image_like') {
+      return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${parsedExtractionStatusLabel(parsedFile.extractionStatus)}`;
     }
 
-    if (parsedFile.extension === 'pdf' || parsedFile.extension === 'docx') {
-      return `${parsedFile.fileName} · документ загружен`;
+    if (previewSheets.length > 0) {
+      return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${previewSheets.length} preview section(s)`;
     }
 
-    if (parsedFile.sheets.length > 1) {
-      return `${parsedFile.fileName} · ${parsedFile.sheets.length} sheets · ${parsedFile.rows.length} preview rows`;
+    if (extractedFieldEntries.length > 0) {
+      return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${extractedFieldEntries.length} field(s) extracted`;
     }
 
-    return `${parsedFile.fileName} · ${parsedFile.columns.length} колонок · ${parsedFile.rows.length} preview rows`;
-  }, [parsedFile]);
+    if ((parsedFile.rawText ?? '').trim().length > 0) {
+      return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · text extracted`;
+    }
+
+    return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${parsedExtractionStatusLabel(parsedFile.extractionStatus)}`;
+  }, [extractedFieldEntries.length, parsedFile, previewSheets.length]);
 
   const schemaTargetFields = useMemo(() => parseSchemaFields(schema), [schema]);
 
@@ -842,10 +954,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   }, [result.mappings, schemaTargetFields]);
 
   const mappingSourceOptions = useMemo(() => {
-    const sourceColumns = currentPreviewSheet?.columns ?? parsedFile?.columns ?? [];
+    const sourceColumns = collectParsedSourceColumns(parsedFile, currentPreviewSheet);
     const currentSources = result.mappings.map((mapping) => mapping.source).filter((value) => value && value !== 'not found');
     return Array.from(new Set([...sourceColumns, ...currentSources])) as string[];
-  }, [currentPreviewSheet?.columns, parsedFile?.columns, result.mappings]);
+  }, [currentPreviewSheet, parsedFile, result.mappings]);
 
   const hasReviewableMappings = useMemo(() => {
     return result.mappings.some((mapping) => mappingNeedsExplicitReview(mapping));
@@ -1263,6 +1375,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     };
     setResult(restoredResult);
     setActivePreviewSheet(item.selectedSheet ?? item.parsedFile?.sheets[0]?.name ?? null);
+    setSourceStructureTab(
+      item.parsedFile?.sheets.length
+        ? 'tables'
+        : item.parsedFile?.kvPairs.length
+          ? 'fields'
+          : item.parsedFile?.rawText
+            ? 'text'
+            : 'warnings'
+    );
     setSectionStateCache({});
     setCorrectionBaseline(profile.skipped ? null : buildCorrectionBaseline(item.id, item.schema, restoredResult));
     setCorrectionSaveNotice('');
@@ -1432,6 +1553,19 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   }, [activePreviewSheet, previewSheets]);
 
   useEffect(() => {
+    if (availableSourceStructureTabs.length === 0) {
+      if (sourceStructureTab !== 'warnings') {
+        setSourceStructureTab('warnings');
+      }
+      return;
+    }
+
+    if (!availableSourceStructureTabs.includes(sourceStructureTab)) {
+      setSourceStructureTab(availableSourceStructureTabs[0]);
+    }
+  }, [availableSourceStructureTabs, sourceStructureTab]);
+
+  useEffect(() => {
     setDisplayName(profile.name);
   }, [profile.name]);
 
@@ -1523,11 +1657,11 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const handleSelectedFile = async (file: File) => {
     setSelectedFile(file);
     let parsed = await parseFile(file);
-    if (parsed.extension === 'pdf' || parsed.extension === 'docx') {
+    if (needsBackendSourcePreview(parsed.extension)) {
       try {
         parsed = await fetchSourcePreviewFromBackend(file);
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Не удалось прочитать таблицы документа на backend.';
+        const message = error instanceof Error ? error.message : 'Не удалось прочитать структуру источника на backend.';
         parsed = {
           ...parsed,
           warnings: [...parsed.warnings, message],
@@ -1536,6 +1670,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
+    setSourceStructureTab(parsed.sheets.length > 0 ? 'tables' : parsed.kvPairs.length > 0 ? 'fields' : parsed.rawText ? 'text' : 'warnings');
     setSectionStateCache({});
     setAutoGenerateSectionKey(null);
     setSaveMessage('');
@@ -2345,9 +2480,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               </div>
 
               <label className={dragActive ? 'upload-zone drag-active' : 'upload-zone'}>
-                <input accept=".csv,.xlsx,.xls,.pdf,.docx" hidden onChange={onFileChange} type="file" />
+                <input accept=".csv,.xlsx,.xls,.pdf,.docx,.txt,.png,.jpg,.jpeg,.bmp,.gif,.tif,.tiff,.webp" hidden onChange={onFileChange} type="file" />
                 <Upload size={18} />
-                <strong>Загрузить CSV/XLSX/PDF/DOCX</strong>
+                <strong>Загрузить CSV/XLSX/PDF/DOCX/TXT/IMG</strong>
                 <span>{fileSummary}</span>
               </label>
 
@@ -2358,7 +2493,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
               <div className="generator-action-row">
                 <button className="secondary-btn" disabled={draftJsonBusy || busy || !selectedFile} onClick={onGenerateDraftJson} type="button">
-                  <Sparkles size={16} /> {draftJsonBusy ? 'Строим draft JSON...' : 'Draft JSON по таблице'}
+                  <Sparkles size={16} /> {draftJsonBusy ? 'Строим draft JSON...' : 'Draft JSON по источнику'}
                 </button>
                 {!profile.skipped && draftSuggestions.length > 0 && (
                   <button className="secondary-btn" disabled={draftJsonBusy || hasPendingDraftReview || hasRejectedDraftWithoutReason} onClick={onSaveDraftJsonLearning} type="button">
@@ -2440,68 +2575,151 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               <div className="viewer-grid">
                 <section className="viewer-pane">
                   <div className="pane-header">
-                    <FileSpreadsheet size={16} /> Preview файла
+                    <FileSpreadsheet size={16} /> Структура источника
                   </div>
-                  {previewSheets.length > 1 && (
+                  <div className="source-structure-tabs">
+                    {availableSourceStructureTabs.map((tab) => (
+                      <button
+                        className={sourceStructureTab === tab ? 'source-structure-tab active' : 'source-structure-tab'}
+                        key={tab}
+                        onClick={() => setSourceStructureTab(tab)}
+                        type="button"
+                      >
+                        {sourceStructureTabLabel(tab)}
+                      </button>
+                    ))}
+                  </div>
+                  {sourceStructureTab === 'tables' && previewSheets.length > 0 && (
                     <>
-                      <div className="preview-switcher">
-                        <button className="icon-btn preview-switch-btn" onClick={() => selectRelativePreviewSheet(-1)} title="Предыдущая таблица" type="button">
-                          <ChevronLeft size={16} />
-                        </button>
-                        <div className="preview-switch-info">
-                          <span>{previewSectionLabel(parsedFile?.extension, previewSheets.length)}</span>
-                          <strong>
-                            {currentPreviewIndex + 1} / {previewSheets.length}
-                          </strong>
-                          <small>{currentPreviewSheet?.name}</small>
-                        </div>
-                        <button className="icon-btn preview-switch-btn" onClick={() => selectRelativePreviewSheet(1)} title="Следующая таблица" type="button">
-                          <ChevronRight size={16} />
-                        </button>
-                      </div>
-                      <div className="preview-status-row">
-                        {previewSheets.map((sheet, index) => {
-                          const status = getPreviewSectionStatus(sheet.name);
-                          return (
-                            <button
-                              className={sheet.name === currentPreviewSheet?.name ? 'preview-status-pill active' : 'preview-status-pill'}
-                              key={sheet.name}
-                              onClick={() => switchToPreviewSheet(sheet.name)}
-                              type="button"
-                            >
-                              <span className={`preview-status-dot preview-status-dot-${status}`} />
-                              <strong>{index + 1}</strong>
-                              <small>{previewSectionStatusLabel(status)}</small>
+                      {previewSheets.length > 1 && (
+                        <>
+                          <div className="preview-switcher">
+                            <button className="icon-btn preview-switch-btn" onClick={() => selectRelativePreviewSheet(-1)} title="Предыдущая таблица" type="button">
+                              <ChevronLeft size={16} />
                             </button>
-                          );
-                        })}
+                            <div className="preview-switch-info">
+                              <span>{previewSectionLabel(parsedFile?.extension, previewSheets.length)}</span>
+                              <strong>
+                                {currentPreviewIndex + 1} / {previewSheets.length}
+                              </strong>
+                              <small>{currentPreviewSheet?.name}</small>
+                            </div>
+                            <button className="icon-btn preview-switch-btn" onClick={() => selectRelativePreviewSheet(1)} title="Следующая таблица" type="button">
+                              <ChevronRight size={16} />
+                            </button>
+                          </div>
+                          <div className="preview-status-row">
+                            {previewSheets.map((sheet, index) => {
+                              const status = getPreviewSectionStatus(sheet.name);
+                              return (
+                                <button
+                                  className={sheet.name === currentPreviewSheet?.name ? 'preview-status-pill active' : 'preview-status-pill'}
+                                  key={sheet.name}
+                                  onClick={() => switchToPreviewSheet(sheet.name)}
+                                  type="button"
+                                >
+                                  <span className={`preview-status-dot preview-status-dot-${status}`} />
+                                  <strong>{index + 1}</strong>
+                                  <small>{previewSectionStatusLabel(status)}</small>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </>
+                      )}
+                      <div className="data-grid-wrap">
+                        {currentPreviewSheet && (currentPreviewSheet.columns.length > 0 || currentPreviewSheet.rows.length > 0) ? (
+                          <table className="data-grid">
+                            <thead>
+                              <tr>
+                                {currentPreviewSheet.columns.map((column) => (
+                                  <th key={column}>{column}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {currentPreviewSheet.rows.map((row, index) => (
+                                <tr key={index}>
+                                  {currentPreviewSheet.columns.map((column) => (
+                                    <td key={`${index}-${column}`}>{String(row[column] ?? '')}</td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        ) : (
+                          <div className="empty-card">Табличная структура не найдена.</div>
+                        )}
                       </div>
                     </>
                   )}
-                  <div className="data-grid-wrap">
-                    {currentPreviewSheet && (currentPreviewSheet.columns.length > 0 || currentPreviewSheet.rows.length > 0) ? (
-                      <table className="data-grid">
-                        <thead>
-                          <tr>
-                            {currentPreviewSheet.columns.map((column) => (
-                              <th key={column}>{column}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {currentPreviewSheet.rows.map((row, index) => (
-                            <tr key={index}>
-                              {currentPreviewSheet.columns.map((column) => (
-                                <td key={`${index}-${column}`}>{String(row[column] ?? '')}</td>
-                              ))}
-                            </tr>
+                  {sourceStructureTab === 'fields' && (
+                    <div className="source-structure-stack">
+                      {extractedFieldEntries.length > 0 ? (
+                        <div className="source-field-grid">
+                          {extractedFieldEntries.map((entry, index) => (
+                            <div className="source-field-card" key={`${entry.kind}-${entry.label}-${index}`}>
+                              <span>{entry.kind === 'kv_pair' ? 'label:value' : 'text fact'}</span>
+                              <strong>{entry.label}</strong>
+                              <p>{entry.value}</p>
+                              {entry.hint && <small>{entry.hint}</small>}
+                            </div>
                           ))}
-                        </tbody>
-                      </table>
-                    ) : (
-                      <div className="empty-card">После загрузки тут покажется содержимое файла.</div>
-                    )}
-                  </div>
+                        </div>
+                      ) : (
+                        <div className="empty-card">Извлечённые поля пока не найдены.</div>
+                      )}
+                    </div>
+                  )}
+                  {sourceStructureTab === 'text' && (
+                    <div className="source-structure-stack">
+                      {parsedFile?.sections.length ? (
+                        <div className="text-block-list">
+                          {parsedFile.sections.map((section, index) => (
+                            <div className="text-block-card" key={`${section.title}-${index}`}>
+                              <strong>{section.title}</strong>
+                              <p>{section.text}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : parsedFile?.textBlocks.length ? (
+                        <div className="text-block-list">
+                          {parsedFile.textBlocks.map((block) => (
+                            <div className="text-block-card" key={block.id}>
+                              {block.label && <strong>{block.label}</strong>}
+                              <p>{block.text}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : parsedFile?.rawText ? (
+                        <pre className="preview-pane source-text-pane">{parsedFile.rawText}</pre>
+                      ) : (
+                        <div className="empty-card">Текстовый слой не извлечён.</div>
+                      )}
+                    </div>
+                  )}
+                  {sourceStructureTab === 'warnings' && (
+                    <div className="source-structure-stack">
+                      {parsedFile && (
+                        <div className="source-field-card source-status-card">
+                          <span>{parsedContentTypeLabel(parsedFile.contentType)}</span>
+                          <strong>{parsedExtractionStatusLabel(parsedFile.extractionStatus)}</strong>
+                          <p>{fileSummary}</p>
+                        </div>
+                      )}
+                      {parsedFile?.warnings.length ? (
+                        <div className="warning-list">
+                          {parsedFile.warnings.map((warning, index) => (
+                            <div className="warning-item" key={`${warning}-${index}`}>
+                              {warning}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="empty-card">Предупреждений нет.</div>
+                      )}
+                    </div>
+                  )}
                 </section>
 
                 <section className="viewer-pane">
@@ -2768,7 +2986,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     <WandSparkles size={16} /> Draft JSON naming
                   </div>
                   <div className="mapping-editor-list">
-                    {draftSuggestions.length === 0 && <div className="empty-card compact">После нажатия «Draft JSON по таблице» здесь появятся названия полей для проверки.</div>}
+                    {draftSuggestions.length === 0 && <div className="empty-card compact">После нажатия «Draft JSON по источнику» здесь появятся названия полей для проверки.</div>}
                     {sortedDraftSuggestionRows.map(({ suggestion, index }) => (
                       <div
                         className={reviewFocusTarget === `draft-review-${index}` ? 'mapping-editor-row review-target-focus' : 'mapping-editor-row'}

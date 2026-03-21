@@ -9,7 +9,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
-from models import ParsedFile, ParsedSheet, TargetField
+from models import ParsedFile, ParsedKvPair, ParsedSection, ParsedSheet, ParsedTextBlock, SourceCandidate, TargetField
 
 try:
     from openpyxl import load_workbook
@@ -25,10 +25,12 @@ PARSER_DIR = Path(__file__).resolve().parent / 'parser'
 if str(PARSER_DIR) not in sys.path:
     sys.path.insert(0, str(PARSER_DIR))
 
+from candidate_normalizer import build_candidate_source, build_source_candidates  # noqa: E402
 from document_parser import parse_document  # noqa: E402
 
 PREVIEW_ROW_LIMIT = 5
 SPARSE_ROW_RATIO_THRESHOLD = 0.35
+IMAGE_FILE_TYPES = {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'}
 logger = logging.getLogger(__name__)
 
 
@@ -39,32 +41,85 @@ class ParseError(ValueError):
 def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
     ext = file_path.suffix.lower().lstrip('.')
     original_name = original_name or file_path.name
-    warnings: list[str] = []
-    sheets: list[ParsedSheet] = []
+    parsed_kwargs: dict[str, Any] = {
+        'columns': [],
+        'rows': [],
+        'content_type': 'unknown',
+        'extraction_status': 'unknown',
+        'raw_text': '',
+        'text_blocks': [],
+        'sections': [],
+        'kv_pairs': [],
+        'source_candidates': [],
+        'sheets': [],
+        'warnings': [],
+    }
 
     logger.info('parse_file started: name=%s ext=%s path=%s', original_name, ext, file_path)
 
     if ext == 'csv':
         columns, rows = _parse_csv(file_path)
+        parsed_kwargs.update(
+            {
+                'columns': columns,
+                'rows': rows[:PREVIEW_ROW_LIMIT],
+                'content_type': 'table',
+                'extraction_status': 'structured_extracted',
+                'source_candidates': [
+                    SourceCandidate(**candidate)
+                    for candidate in build_source_candidates(
+                        tables=[{'name': original_name, 'columns': columns, 'rows': rows[:PREVIEW_ROW_LIMIT]}]
+                    )
+                ],
+            }
+        )
     elif ext in {'xlsx', 'xls'}:
         columns, rows, extra_warnings, sheets = _parse_excel(file_path)
-        warnings.extend(extra_warnings)
-    elif ext in {'pdf', 'docx'}:
-        columns, rows, extra_warnings, sheets = _parse_document(file_path)
-        warnings.extend(extra_warnings)
+        parsed_kwargs.update(
+            {
+                'columns': columns,
+                'rows': rows[:PREVIEW_ROW_LIMIT],
+                'sheets': sheets,
+                'warnings': extra_warnings,
+                'content_type': 'table',
+                'extraction_status': 'structured_extracted',
+                'source_candidates': [
+                    SourceCandidate(**candidate)
+                    for candidate in build_source_candidates(
+                        tables=[
+                            {
+                                'name': sheet.name,
+                                'columns': sheet.columns,
+                                'rows': sheet.rows,
+                            }
+                            for sheet in sheets
+                        ]
+                        or [{'name': original_name, 'columns': columns, 'rows': rows[:PREVIEW_ROW_LIMIT]}]
+                    )
+                ],
+            }
+        )
+    elif ext in {'pdf', 'docx', 'txt'} | IMAGE_FILE_TYPES:
+        parsed_kwargs.update(_parse_document(file_path))
     else:
         raise ParseError(f'Unsupported file type: {ext}')
 
-    if not columns and not (ext in {'pdf', 'docx'} and warnings):
+    columns = list(parsed_kwargs['columns'])
+    rows = list(parsed_kwargs['rows'])
+    warnings = list(parsed_kwargs['warnings'])
+    if not columns and not rows and not warnings:
         warnings.append('No columns detected in the file.')
+    parsed_kwargs['warnings'] = warnings
 
     logger.info(
-        'parse_file finished: name=%s ext=%s columns=%d preview_rows=%d warnings=%d',
+        'parse_file finished: name=%s ext=%s columns=%d preview_rows=%d warnings=%d content_type=%s extraction_status=%s',
         original_name,
         ext,
         len(columns),
         min(len(rows), PREVIEW_ROW_LIMIT),
         len(warnings),
+        parsed_kwargs['content_type'],
+        parsed_kwargs['extraction_status'],
     )
 
     return ParsedFile(
@@ -72,7 +127,14 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         file_type=ext,
         columns=columns,
         rows=rows[:PREVIEW_ROW_LIMIT],
-        sheets=sheets,
+        content_type=str(parsed_kwargs['content_type']),
+        extraction_status=str(parsed_kwargs['extraction_status']),
+        raw_text=str(parsed_kwargs['raw_text']),
+        text_blocks=list(parsed_kwargs['text_blocks']),
+        sections=list(parsed_kwargs['sections']),
+        kv_pairs=list(parsed_kwargs['kv_pairs']),
+        source_candidates=list(parsed_kwargs['source_candidates']),
+        sheets=list(parsed_kwargs['sheets']),
         warnings=warnings,
     )
 
@@ -82,6 +144,18 @@ def resolve_generation_source(
     selected_sheet: str | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     if not parsed_file.sheets:
+        if parsed_file.columns or parsed_file.rows:
+            return parsed_file.columns, parsed_file.rows, []
+
+        candidate_columns, candidate_rows = build_candidate_source(
+            [_model_to_plain_dict(candidate) for candidate in parsed_file.source_candidates]
+        )
+        if candidate_columns and candidate_rows:
+            return candidate_columns, candidate_rows, ['Generated mapping from extracted fields/text candidates.']
+
+        if parsed_file.extraction_status in {'requires_ocr_or_manual_input', 'text_not_extracted', 'image_parse_not_supported_yet'}:
+            raise ParseError(_extraction_status_message(parsed_file))
+
         return parsed_file.columns, parsed_file.rows, []
 
     if selected_sheet is None or selected_sheet.strip() == '':
@@ -290,10 +364,11 @@ def _has_visible_value(value: Any) -> bool:
     return True
 
 
-def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], list[str], list[ParsedSheet]]:
+def _parse_document(file_path: Path) -> dict[str, Any]:
     try:
         parsed = parse_document(file_path)
         content_type = str(parsed.get('content_type', 'unknown'))
+        extraction_status = str(parsed.get('extraction_status', 'unknown'))
         columns = [str(column) for column in parsed.get('columns', [])]
         raw_rows = parsed.get('rows', [])
         rows = [dict(row) for row in raw_rows if isinstance(row, dict)]
@@ -320,19 +395,60 @@ def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], l
         rows = _filter_sparse_rows(columns, rows)
         filtered_out = original_row_count - len(rows)
         if columns and not rows:
-            warnings.append('Таблица в документе получилась слишком пустой, поэтому она пока не используется.')
+            warnings.append('Extracted table is too sparse to use as a structured source.')
             columns = []
 
-        if parsed.get('content_type') != 'table' and not rows:
-            warnings.append('Документ загружен. Таблица не найдена или пока не подходит для обработки.')
+        text_blocks = [
+            ParsedTextBlock(
+                id=str(block.get('id') or f'block-{index}'),
+                kind='line' if str(block.get('kind') or 'paragraph') == 'line' else 'paragraph',
+                text=str(block.get('text') or ''),
+                label=str(block.get('label')) if block.get('label') is not None else None,
+            )
+            for index, block in enumerate(parsed.get('text_blocks', []), start=1)
+            if isinstance(block, dict) and str(block.get('text') or '').strip()
+        ]
+        sections = [
+            ParsedSection(title=str(section.get('title') or 'Section'), text=str(section.get('text') or ''))
+            for section in parsed.get('sections', [])
+            if isinstance(section, dict) and str(section.get('text') or '').strip()
+        ]
+        kv_pairs = [
+            ParsedKvPair(
+                label=str(pair.get('label') or ''),
+                value=str(pair.get('value') or ''),
+                confidence=_safe_kv_confidence(pair.get('confidence')),
+                source_text=str(pair.get('source_text')) if pair.get('source_text') is not None else None,
+            )
+            for pair in parsed.get('kv_pairs', [])
+            if isinstance(pair, dict) and str(pair.get('label') or '').strip() and str(pair.get('value') or '').strip()
+        ]
+        source_candidates = [
+            SourceCandidate(
+                candidate_type=_safe_candidate_type(candidate.get('candidate_type')),
+                label=str(candidate.get('label') or ''),
+                value=candidate.get('value'),
+                sample_values=list(candidate.get('sample_values') or []),
+                source_text=str(candidate.get('source_text')) if candidate.get('source_text') is not None else None,
+                section_title=str(candidate.get('section_title')) if candidate.get('section_title') is not None else None,
+            )
+            for candidate in parsed.get('source_candidates', [])
+            if isinstance(candidate, dict) and str(candidate.get('label') or '').strip()
+        ]
+
+        if content_type not in {'table', 'mixed'} and not rows and not kv_pairs:
+            warnings.append('Document uploaded without a tabular preview. Generation will use extracted fields when available.')
 
         logger.info(
-            'document parser result: file=%s content_type=%s columns=%d rows=%d filtered_sparse_rows=%d',
+            'document parser result: file=%s content_type=%s extraction_status=%s columns=%d rows=%d filtered_sparse_rows=%d kv_pairs=%d candidates=%d',
             file_path.name,
             content_type,
+            extraction_status,
             len(columns),
             len(rows),
             max(filtered_out, 0),
+            len(kv_pairs),
+            len(source_candidates),
         )
 
         if content_type != 'table':
@@ -365,7 +481,19 @@ def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], l
                 )
             sheets = filtered_sheets
 
-        return columns, rows, warnings, sheets
+        return {
+            'columns': columns,
+            'rows': rows[:PREVIEW_ROW_LIMIT],
+            'warnings': warnings,
+            'sheets': sheets,
+            'content_type': content_type,
+            'extraction_status': extraction_status,
+            'raw_text': str(parsed.get('text') or ''),
+            'text_blocks': text_blocks,
+            'sections': sections,
+            'kv_pairs': kv_pairs,
+            'source_candidates': source_candidates,
+        }
     except Exception as exc:  # noqa: BLE001
         logger.exception('document parser failed: file=%s error=%s', file_path.name, exc)
         raise ParseError(f'Failed to parse document: {exc}') from exc
@@ -391,6 +519,40 @@ def _filter_sparse_rows(columns: list[str], rows: list[dict[str, Any]]) -> list[
             filtered_rows.append(row)
 
     return filtered_rows
+
+
+def _model_to_plain_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, 'model_dump'):
+        return value.model_dump()
+    if hasattr(value, 'dict'):
+        return value.dict()
+    if isinstance(value, dict):
+        return value
+    raise TypeError(f'Unsupported parsed model type: {type(value)!r}')
+
+
+def _safe_candidate_type(value: Any) -> str:
+    candidate_type = str(value or 'text_section')
+    if candidate_type in {'table_column', 'kv_pair', 'text_fact', 'text_section'}:
+        return candidate_type
+    return 'text_section'
+
+
+def _safe_kv_confidence(value: Any) -> str:
+    confidence = str(value or 'medium')
+    if confidence in {'high', 'medium', 'low'}:
+        return confidence
+    return 'medium'
+
+
+def _extraction_status_message(parsed_file: ParsedFile) -> str:
+    if parsed_file.extraction_status == 'requires_ocr_or_manual_input':
+        return 'Document looks like a scan or image-based PDF. OCR or manual input is required.'
+    if parsed_file.extraction_status == 'image_parse_not_supported_yet':
+        return 'Image-like files are detected, but OCR-free extraction is not supported yet.'
+    if parsed_file.extraction_status == 'text_not_extracted':
+        return 'Text could not be extracted from the document.'
+    return 'No usable source fields were extracted from the document.'
 
 
 

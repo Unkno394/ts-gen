@@ -3,8 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from candidate_normalizer import build_source_candidates
+from document_classifier import classify_document
 from docx_parser import parse_docx
+from form_parser import extract_kv_pairs
 from pdf_parser import parse_pdf
+from text_parser import extract_sections, extract_text_facts, normalize_text, split_text_blocks
 
 
 class UnsupportedFileTypeError(ValueError):
@@ -25,6 +29,9 @@ def empty_result(file_path: str | Path, file_type: str) -> dict[str, Any]:
 
 
 SUPPORTED_TYPES = {"pdf", "docx"}
+IMAGE_TYPES = {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'}
+TEXT_TYPES = {'txt'}
+SUPPORTED_TYPES = SUPPORTED_TYPES | IMAGE_TYPES | TEXT_TYPES
 
 
 def parse_document(file_path: str | Path) -> dict[str, Any]:
@@ -37,12 +44,110 @@ def parse_document(file_path: str | Path) -> dict[str, Any]:
         )
 
     if ext == "docx":
-        return parse_docx(path)
+        base_result = parse_docx(path)
+    elif ext == "pdf":
+        base_result = parse_pdf(path)
+    elif ext == 'txt':
+        base_result = _parse_text_file(path)
+    elif ext in IMAGE_TYPES:
+        base_result = _parse_image_like_file(path)
+    else:
+        raise UnsupportedFileTypeError(f"Unsupported file type: {ext}")
 
-    if ext == "pdf":
-        return parse_pdf(path)
+    return _enrich_document_result(path=path, ext=ext, base_result=base_result)
 
-    raise UnsupportedFileTypeError(f"Unsupported file type: {ext}")
+
+def _parse_text_file(path: Path) -> dict[str, Any]:
+    encodings_to_try = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']
+    last_error: Exception | None = None
+    for encoding in encodings_to_try:
+        try:
+            text = path.read_text(encoding=encoding)
+            return {
+                'file_name': path.name,
+                'file_type': 'txt',
+                'columns': [],
+                'rows': [],
+                'tables': [],
+                'text': text,
+                'blocks': [],
+                'warnings': [],
+            }
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+
+    raise UnsupportedFileTypeError(f'Failed to read TXT file: {last_error}')
+
+
+def _parse_image_like_file(path: Path) -> dict[str, Any]:
+    return {
+        'file_name': path.name,
+        'file_type': path.suffix.lower().lstrip('.'),
+        'columns': [],
+        'rows': [],
+        'tables': [],
+        'text': '',
+        'blocks': [],
+        'warnings': [
+            'Document looks like an image or scan. Text extraction without OCR is not supported yet.',
+        ],
+    }
+
+
+def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]) -> dict[str, Any]:
+    tables = [table for table in base_result.get('tables', []) if isinstance(table, dict)]
+    raw_text = normalize_text(base_result.get('text', ''))
+    text_blocks = split_text_blocks(raw_text)
+    sections = extract_sections(raw_text)
+    kv_pairs = extract_kv_pairs(raw_text)
+    text_facts = extract_text_facts(raw_text)
+    classification = classify_document(file_type=ext, tables=tables, raw_text=raw_text, kv_pairs=kv_pairs)
+    source_candidates = build_source_candidates(
+        tables=tables,
+        kv_pairs=kv_pairs,
+        text_facts=text_facts,
+        sections=sections,
+    )
+
+    warnings = [str(warning) for warning in base_result.get('warnings', [])]
+    extraction_status = classification['extraction_status']
+    if extraction_status == 'requires_ocr_or_manual_input':
+        warnings.append('Text layer was not extracted. OCR or manual input is required.')
+    elif extraction_status == 'text_not_extracted':
+        warnings.append('Text could not be extracted from the document.')
+    elif extraction_status == 'image_parse_not_supported_yet':
+        warnings.append('Image-like files are detected, but OCR-free extraction is not supported yet.')
+
+    if classification['content_type'] == 'form' and kv_pairs:
+        warnings.append(f'Detected {len(kv_pairs)} extracted field(s) from a semi-structured document.')
+    elif classification['content_type'] == 'text' and raw_text:
+        warnings.append('Detected text document with extracted text blocks.')
+
+    deduped_warnings: list[str] = []
+    seen_warnings: set[str] = set()
+    for warning in warnings:
+        if warning in seen_warnings:
+            continue
+        seen_warnings.add(warning)
+        deduped_warnings.append(warning)
+
+    return {
+        'file_name': base_result.get('file_name', path.name),
+        'file_type': base_result.get('file_type', ext),
+        'content_type': classification['content_type'],
+        'extraction_status': extraction_status,
+        'columns': [str(column) for column in base_result.get('columns', [])],
+        'rows': [dict(row) for row in base_result.get('rows', []) if isinstance(row, dict)],
+        'tables': tables,
+        'text': raw_text,
+        'text_blocks': text_blocks,
+        'blocks': text_blocks,
+        'sections': sections,
+        'kv_pairs': kv_pairs,
+        'text_facts': text_facts,
+        'source_candidates': source_candidates,
+        'warnings': deduped_warnings,
+    }
 
 
 if __name__ == "__main__":
