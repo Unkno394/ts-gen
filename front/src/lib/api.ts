@@ -20,22 +20,24 @@ type GenerateParams = {
   selectedSheet?: string;
 };
 
+type BackendParsedFile = {
+  file_name: string;
+  file_type: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  sheets: Array<{
+    name: string;
+    columns: string[];
+    rows: Record<string, unknown>[];
+  }>;
+  warnings: string[];
+};
+
 type BackendGenerateResponse = {
   generation_id: string | null;
   schema_fingerprint_id?: number | null;
   mode: 'guest' | 'authorized';
-  parsed_file: {
-    file_name: string;
-    file_type: string;
-    columns: string[];
-    rows: Record<string, unknown>[];
-    sheets: Array<{
-      name: string;
-      columns: string[];
-      rows: Record<string, unknown>[];
-    }>;
-    warnings: string[];
-  };
+  parsed_file: BackendParsedFile;
   mappings: Array<{
     source: string | null;
     target: string;
@@ -49,6 +51,10 @@ type BackendGenerateResponse = {
   generated_typescript: string;
   preview: Record<string, unknown>[];
   warnings: string[];
+};
+
+type BackendSourcePreviewResponse = {
+  parsed_file: BackendParsedFile;
 };
 
 type BackendHistoryResponse = {
@@ -86,6 +92,12 @@ type BackendHistoryResponse = {
     warnings: string[];
     created_at: string;
   }>;
+};
+
+type BackendDeleteHistoryResponse = {
+  deleted: boolean;
+  generation_id: number;
+  deleted_files: number;
 };
 
 type BackendLearningSummaryResponse = {
@@ -249,6 +261,17 @@ type BackendLearningMemoryResponse = {
     };
   };
 };
+
+function normalizeParsedFile(payload: BackendParsedFile) {
+  return {
+    fileName: payload.file_name,
+    extension: payload.file_type,
+    columns: payload.columns,
+    rows: payload.rows,
+    sheets: payload.sheets ?? [],
+    warnings: payload.warnings,
+  };
+}
 
 type BackendCorrectionSessionResponse = {
   session_id: number;
@@ -597,14 +620,7 @@ export async function generateFromBackend({ file, targetJson, userId, selectedSh
   return {
     generationId: payload.generation_id,
     schemaFingerprintId: payload.schema_fingerprint_id ?? null,
-    parsedFile: {
-      fileName: payload.parsed_file.file_name,
-      extension: payload.parsed_file.file_type,
-      columns: payload.parsed_file.columns,
-      rows: payload.parsed_file.rows,
-      sheets: payload.parsed_file.sheets ?? [],
-      warnings: payload.parsed_file.warnings,
-    },
+    parsedFile: normalizeParsedFile(payload.parsed_file),
     code: payload.generated_typescript,
     mappings: payload.mappings.map((item) => ({
       source: item.source ?? 'not found',
@@ -619,6 +635,23 @@ export async function generateFromBackend({ file, targetJson, userId, selectedSh
     preview: payload.preview,
     warnings: payload.warnings,
   };
+}
+
+export async function fetchSourcePreviewFromBackend(file: File) {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const response = await fetchWithTimeout(
+    buildApiUrl('/api/source-preview'),
+    {
+      method: 'POST',
+      body: formData,
+    },
+    GENERATE_REQUEST_TIMEOUT_MS
+  );
+
+  const payload = await parseJson<BackendSourcePreviewResponse>(response);
+  return normalizeParsedFile(payload.parsed_file);
 }
 
 export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
@@ -660,6 +693,17 @@ export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
     preview: item.preview,
     warnings: item.warnings,
   }));
+}
+
+export async function deleteHistoryEntry(userId: string, generationId: string): Promise<BackendDeleteHistoryResponse> {
+  const response = await fetchWithTimeout(
+    buildApiUrl(`/api/history/${encodeURIComponent(userId)}/${encodeURIComponent(generationId)}`),
+    {
+      method: 'DELETE',
+    },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+  return parseJson<BackendDeleteHistoryResponse>(response);
 }
 
 export async function fetchLearningSummary(userId: string): Promise<LearningSummary> {
@@ -895,14 +939,7 @@ export async function generateDraftJsonFromBackend(params: {
   const payload = await parseJson<BackendDraftJsonResponse>(response);
   return {
     schemaFingerprintId: payload.schema_fingerprint_id ?? null,
-    parsedFile: {
-      fileName: payload.parsed_file.file_name,
-      extension: payload.parsed_file.file_type,
-      columns: payload.parsed_file.columns,
-      rows: payload.parsed_file.rows,
-      sheets: payload.parsed_file.sheets ?? [],
-      warnings: payload.parsed_file.warnings,
-    },
+    parsedFile: normalizeParsedFile(payload.parsed_file),
     draftJson: payload.draft_json,
     fieldSuggestions: payload.field_suggestions.map((item) => ({
       sourceColumn: item.source_column,

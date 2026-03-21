@@ -850,15 +850,21 @@ input::-ms-reveal {
   overflow: auto;
 }
 
+.history-item-row {
+  position: relative;
+}
+
 .history-item {
   display: grid;
   gap: 6px;
-  padding: 12px;
+  width: 100%;
+  padding: 12px 42px 12px 12px;
   color: inherit;
   text-align: left;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
+  transition: border-color 0.18s ease, background 0.18s ease;
 }
 
 .history-item.active {
@@ -869,6 +875,34 @@ input::-ms-reveal {
 .history-item span {
   color: rgba(255, 255, 255, 0.5);
   font-size: 12px;
+}
+
+.history-item-delete {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: rgba(255, 255, 255, 0.56);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(9, 12, 22, 0.9);
+  transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.history-item-delete:hover:not(:disabled) {
+  color: rgba(255, 255, 255, 0.92);
+  border-color: rgba(255, 118, 118, 0.36);
+  background: rgba(255, 118, 118, 0.12);
+}
+
+.history-item-delete:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .preview-switcher {
@@ -1575,6 +1609,11 @@ input::-ms-reveal {
   border-radius: 28px;
 }
 
+.history-delete-modal {
+  width: min(520px, 100%);
+  max-height: none;
+}
+
 .profile-modal-header {
   display: flex;
   align-items: flex-start;
@@ -1589,6 +1628,57 @@ input::-ms-reveal {
 
 .profile-modal-switch {
   margin-bottom: 18px;
+}
+
+.history-delete-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.history-delete-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  color: #ffdbe5;
+  border: 1px solid rgba(255, 122, 154, 0.22);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(110, 40, 64, 0.38), rgba(79, 27, 48, 0.24));
+  box-shadow: 0 12px 24px rgba(79, 27, 48, 0.16);
+}
+
+.history-delete-copy {
+  display: grid;
+  gap: 10px;
+}
+
+.history-delete-copy p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.history-delete-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+
+.history-delete-actions .secondary-btn,
+.history-delete-actions .primary-btn {
+  width: auto;
+}
+
+.history-delete-confirm {
+  background: linear-gradient(135deg, #ff6d8d, #ff4c73);
+  box-shadow: 0 16px 32px rgba(255, 76, 115, 0.2);
+}
+
+.history-delete-confirm:hover:not(:disabled) {
+  filter: brightness(1.04);
 }
 
 .viewer-pane {

@@ -30,9 +30,11 @@ import {
   changeEmailWithPassword,
   changePasswordWithBackend,
   confirmGenerationLearning,
+  deleteHistoryEntry,
   fetchLearningEvents,
   fetchLearningMemory,
   fetchLearningSummary,
+  fetchSourcePreviewFromBackend,
   generateDraftJsonFromBackend,
   generateFromBackend,
   requestEmailChangeCode,
@@ -282,6 +284,22 @@ function buildSectionWorkspaceState(params: {
       : null,
     mappingReviewNotes: { ...(params.mappingReviewNotes ?? {}) },
     draftReviewNotes: { ...(params.draftReviewNotes ?? {}) },
+  };
+}
+
+function detachGenerationLinkFromSectionState(state: SectionWorkspaceState, generationId: string): SectionWorkspaceState {
+  const generationMatches = state.result.generationId === generationId;
+  const baselineMatches = state.correctionBaseline?.generationId === generationId;
+
+  if (!generationMatches && !baselineMatches) {
+    return state;
+  }
+
+  return {
+    ...state,
+    result: generationMatches ? { ...state.result, generationId: null } : state.result,
+    generationConfirmed: generationMatches ? false : state.generationConfirmed,
+    correctionBaseline: baselineMatches ? null : state.correctionBaseline,
   };
 }
 
@@ -608,6 +626,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [result, setResult] = useState<GenerationResult>({ code: defaultCode, mappings: [], preview: [], warnings: [] });
   const [busy, setBusy] = useState(false);
   const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
+  const [historyDeleteTarget, setHistoryDeleteTarget] = useState<HistoryItem | null>(null);
+  const [historyDeleteBusyId, setHistoryDeleteBusyId] = useState<string | null>(null);
+  const [historyDeleteError, setHistoryDeleteError] = useState('');
   const [saveMessage, setSaveMessage] = useState('');
   const [dragActive, setDragActive] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -688,6 +709,22 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setLearningEventsError(message);
     }
   };
+
+  useEffect(() => {
+    if (!historyDeleteTarget || historyDeleteBusyId !== null) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setHistoryDeleteError('');
+        setHistoryDeleteTarget(null);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [historyDeleteBusyId, historyDeleteTarget]);
 
   const previewSheets = useMemo(() => {
     if (!parsedFile) {
@@ -1145,6 +1182,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const globalKnowledgeHighlights = useMemo(() => learningMemory?.layers.globalKnowledge.items ?? [], [learningMemory]);
 
   const restoreHistoryItem = (item: HistoryItem) => {
+    setHistoryDeleteError('');
     setActiveHistoryId(item.id);
     setSelectedFile(null);
     setParsedFile(item.parsedFile ?? null);
@@ -1174,6 +1212,65 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setLearningReviewError('');
     setGenerationConfirmed(true);
     setActiveView('generator');
+  };
+
+  const openHistoryDeleteModal = (item: HistoryItem) => {
+    if (profile.skipped || historyDeleteBusyId !== null) {
+      return;
+    }
+    setHistoryDeleteError('');
+    setHistoryDeleteTarget(item);
+  };
+
+  const closeHistoryDeleteModal = () => {
+    if (historyDeleteBusyId !== null) {
+      return;
+    }
+    setHistoryDeleteError('');
+    setHistoryDeleteTarget(null);
+  };
+
+  const onDeleteHistoryItem = async () => {
+    if (profile.skipped || historyDeleteBusyId !== null || !historyDeleteTarget) {
+      return;
+    }
+
+    const item = historyDeleteTarget;
+
+    setHistoryDeleteBusyId(item.id);
+    setHistoryDeleteError('');
+
+    try {
+      await deleteHistoryEntry(profile.id, item.id);
+
+      setSectionStateCache((current) => {
+        let changed = false;
+        const nextEntries = Object.entries(current).map(([sectionKey, state]) => {
+          const nextState = detachGenerationLinkFromSectionState(state, item.id);
+          if (nextState !== state) {
+            changed = true;
+          }
+          return [sectionKey, nextState] as const;
+        });
+        return changed ? Object.fromEntries(nextEntries) : current;
+      });
+      setResult((current) => (current.generationId === item.id ? { ...current, generationId: null } : current));
+      setCorrectionBaseline((current) => (current?.generationId === item.id ? null : current));
+      if (result.generationId === item.id || correctionBaseline?.generationId === item.id) {
+        setGenerationConfirmed(false);
+      }
+      if (activeHistoryId === item.id) {
+        setActiveHistoryId(null);
+      }
+
+      setHistoryDeleteTarget(null);
+      await onSaveHistory();
+      setSaveMessage(`Запрос "${item.fileName}" удален из истории.`);
+    } catch (error) {
+      setHistoryDeleteError(error instanceof Error ? error.message : 'Не удалось удалить запрос из истории.');
+    } finally {
+      setHistoryDeleteBusyId(null);
+    }
   };
 
   const findHistoryItemByGenerationId = (generationId: unknown): HistoryItem | null => {
@@ -1360,7 +1457,18 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const handleSelectedFile = async (file: File) => {
     setSelectedFile(file);
-    const parsed = await parseFile(file);
+    let parsed = await parseFile(file);
+    if (parsed.extension === 'pdf' || parsed.extension === 'docx') {
+      try {
+        parsed = await fetchSourcePreviewFromBackend(file);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Не удалось прочитать таблицы документа на backend.';
+        parsed = {
+          ...parsed,
+          warnings: [...parsed.warnings, message],
+        };
+      }
+    }
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
     setSectionStateCache({});
@@ -2225,15 +2333,29 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               <div className="history-list sidebar-history-list">
                 {history.length === 0 && <div className="empty-card compact">Пока пусто.</div>}
                 {history.map((item) => (
-                  <button
-                    className={item.id === activeHistoryId ? 'history-item active' : 'history-item'}
-                    key={item.id}
-                    onClick={() => restoreHistoryItem(item)}
-                    type="button"
-                  >
-                    <strong>{item.fileName}</strong>
-                    <span>{new Date(item.createdAt).toLocaleString()}</span>
-                  </button>
+                  <div className="history-item-row" key={item.id}>
+                    <button
+                      className={item.id === activeHistoryId ? 'history-item active' : 'history-item'}
+                      onClick={() => restoreHistoryItem(item)}
+                      type="button"
+                    >
+                      <strong>{item.fileName}</strong>
+                      <span>{new Date(item.createdAt).toLocaleString()}</span>
+                    </button>
+                    <button
+                      aria-label={`Удалить ${item.fileName} из истории`}
+                      className="history-item-delete"
+                      disabled={historyDeleteBusyId !== null}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openHistoryDeleteModal(item);
+                      }}
+                      title="Удалить из истории"
+                      type="button"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
                 ))}
               </div>
             </section>
@@ -3043,6 +3165,45 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
           )}
         </main>
       </div>
+
+      {historyDeleteTarget && !profile.skipped && (
+        <div className="profile-modal-backdrop" role="presentation" onClick={closeHistoryDeleteModal}>
+          <section className="profile-modal history-delete-modal glass-card" role="dialog" aria-modal="true" aria-labelledby="history-delete-title" onClick={(event) => event.stopPropagation()}>
+            <div className="profile-modal-header">
+              <div className="history-delete-heading">
+                <div className="history-delete-icon" aria-hidden="true">
+                  <TriangleAlert size={18} />
+                </div>
+                <div>
+                  <div className="eyebrow">History deletion</div>
+                  <h3 id="history-delete-title">Удалить запрос из истории?</h3>
+                </div>
+              </div>
+              <button className="icon-btn" disabled={historyDeleteBusyId !== null} onClick={closeHistoryDeleteModal} title="Закрыть" type="button">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="history-delete-copy">
+              <p>
+                Запрос <strong>{historyDeleteTarget.fileName}</strong> будет удален из истории генераций.
+              </p>
+              <p className="subtle-text">Связанный сохраненный результат и исходный файл тоже будут удалены из backend-хранилища.</p>
+            </div>
+
+            {historyDeleteError && <div className="warning-item auth-status auth-status-error">{historyDeleteError}</div>}
+
+            <div className="history-delete-actions">
+              <button className="secondary-btn" disabled={historyDeleteBusyId !== null} onClick={closeHistoryDeleteModal} type="button">
+                Отмена
+              </button>
+              <button className="primary-btn history-delete-confirm" disabled={historyDeleteBusyId !== null} onClick={() => void onDeleteHistoryItem()} type="button">
+                <X size={16} /> {historyDeleteBusyId === historyDeleteTarget.id ? 'Удаляем...' : 'Удалить запрос'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {accountModalOpen && !profile.skipped && (
         <div className="profile-modal-backdrop" role="presentation" onClick={closeAccountModal}>

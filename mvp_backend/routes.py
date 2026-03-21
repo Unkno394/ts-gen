@@ -58,6 +58,7 @@ from storage import (
     confirm_generation_learning,
     create_model_training_run,
     create_training_snapshot,
+    delete_generation_history_entry,
     activate_model_training_run,
     ensure_schema_fingerprint,
     export_training_snapshot,
@@ -105,6 +106,29 @@ def _preview_text(value: str, limit: int = 200) -> str:
     if len(compact) <= limit:
         return compact
     return f'{compact[:limit]}...'
+
+
+@router.post('/source-preview')
+async def source_preview(file: UploadFile = File(...)) -> dict:
+    cleanup_expired_guest_files()
+
+    filename = file.filename or 'uploaded_file'
+    file_bytes = await file.read()
+    saved_path = save_upload(file_bytes, filename, mode='guest')
+
+    try:
+        parsed = parse_file(saved_path, filename)
+        try:
+            saved_path.unlink(missing_ok=True)
+        except PermissionError:
+            parsed.warnings.append('Temporary preview file cleanup was deferred because the file is still locked by the OS.')
+        return {'parsed_file': _model_to_dict(parsed)}
+    except ParseError as exc:
+        logger.warning('source preview parse failed: file=%s error=%s', filename, exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception('source preview failed: file=%s error=%s', filename, exc)
+        raise HTTPException(status_code=500, detail='Произошла внутренняя ошибка сервера. Попробуйте ещё раз.') from exc
 
 
 @router.post('/auth/send-code')
@@ -471,6 +495,14 @@ def history(user_id: str) -> dict:
             }
         )
     return {'items': normalized}
+
+
+@router.delete('/history/{user_id}/{generation_id}')
+def delete_history_entry(user_id: str, generation_id: int) -> dict:
+    try:
+        return delete_generation_history_entry(user_id=user_id, generation_id=generation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get('/learning/summary/{user_id}')

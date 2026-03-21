@@ -1336,6 +1336,64 @@ def get_history(user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
     return [dict(row) for row in db.all(sql, params)]
 
 
+def delete_generation_history_entry(*, user_id: str, generation_id: int) -> dict[str, Any]:
+    db = get_db()
+    internal_user_id = _lookup_internal_user_id(user_id)
+    if internal_user_id is None:
+        raise ValueError(f'History entry not found: {generation_id}')
+
+    generation_row = db.get(
+        '''
+        SELECT id
+        FROM generations
+        WHERE id = :generation_id
+          AND user_id = :user_id
+        ''',
+        {
+            'generation_id': generation_id,
+            'user_id': internal_user_id,
+        },
+    )
+    if generation_row is None:
+        raise ValueError(f'History entry not found: {generation_id}')
+
+    artifact_rows = db.all(
+        '''
+        SELECT file_path
+        FROM generation_artifacts
+        WHERE generation_id = :generation_id
+          AND file_path IS NOT NULL
+          AND trim(file_path) <> ''
+        ''',
+        {'generation_id': generation_id},
+    )
+    file_paths = [Path(str(row['file_path'])) for row in artifact_rows]
+
+    with db.transaction():
+        db.run(
+            '''
+            DELETE FROM generations
+            WHERE id = :generation_id
+              AND user_id = :user_id
+            ''',
+            {
+                'generation_id': generation_id,
+                'user_id': internal_user_id,
+            },
+        )
+
+    expires_at = _timestamp()
+    for file_path in file_paths:
+        delete_file(str(file_path))
+        _mark_uploaded_files_by_storage_prefix(file_path, status='deleted', expires_at=expires_at)
+
+    return {
+        'deleted': True,
+        'generation_id': generation_id,
+        'deleted_files': len(file_paths),
+    }
+
+
 def get_generation_by_id(entry_id: int) -> dict[str, Any] | None:
     db = get_db()
     row = db.get(

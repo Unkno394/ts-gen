@@ -1025,6 +1025,69 @@ class StorageLearningTests(unittest.TestCase):
 
         self.assertNotEqual(first_id, second_id)
 
+    def test_delete_generation_history_entry_removes_generation_and_marks_upload_deleted(self) -> None:
+        file_bytes = b'customerName,amount\nAlice,10\n'
+        saved_path = storage.save_upload(file_bytes, 'history-delete.csv', mode='authorized', user_id='user-delete')
+        upload_id = storage.record_uploaded_file(
+            file_path=saved_path,
+            original_file_name='history-delete.csv',
+            file_bytes=file_bytes,
+            mode='authorized',
+            user_id='user-delete',
+        )
+
+        generation_id = storage.save_generation(
+            user_id='user-delete',
+            file_name='history-delete.csv',
+            file_path=str(saved_path),
+            file_type='csv',
+            target_json=json.dumps({'customerName': '', 'amount': 0}, ensure_ascii=False),
+            mappings_json=json.dumps(
+                [
+                    {'source': 'customerName', 'target': 'customerName', 'confidence': 'high', 'reason': 'exact'},
+                    {'source': 'amount', 'target': 'amount', 'confidence': 'high', 'reason': 'exact'},
+                ],
+                ensure_ascii=False,
+            ),
+            generated_typescript='export function transform() { return {}; }',
+            preview_json=json.dumps([{'customerName': 'Alice', 'amount': 10}], ensure_ascii=False),
+            warnings_json=json.dumps([], ensure_ascii=False),
+            parsed_file_json=json.dumps(
+                {
+                    'file_name': 'history-delete.csv',
+                    'file_type': 'csv',
+                    'columns': ['customerName', 'amount'],
+                    'rows': [{'customerName': 'Alice', 'amount': 10}],
+                    'sheets': [],
+                    'warnings': [],
+                },
+                ensure_ascii=False,
+            ),
+            source_columns=['customerName', 'amount'],
+            upload_record_id=upload_id,
+        )
+
+        self.assertTrue(saved_path.exists())
+        self.assertEqual(len(storage.get_history('user-delete')), 1)
+
+        deletion = storage.delete_generation_history_entry(user_id='user-delete', generation_id=generation_id)
+        self.assertEqual(deletion['deleted'], True)
+        self.assertEqual(deletion['generation_id'], generation_id)
+        self.assertEqual(deletion['deleted_files'], 1)
+        self.assertEqual(storage.get_history('user-delete'), [])
+        self.assertFalse(saved_path.exists())
+
+        db = storage.get_db()
+        generation_row = db.get('SELECT id FROM generations WHERE id = :id', {'id': generation_id})
+        upload_row = db.get(
+            'SELECT generation_id, status FROM uploaded_files WHERE id = :id',
+            {'id': upload_id},
+        )
+
+        self.assertIsNone(generation_row)
+        self.assertIsNone(upload_row['generation_id'])
+        self.assertEqual(str(upload_row['status']), 'deleted')
+
 
 if __name__ == '__main__':
     unittest.main()
