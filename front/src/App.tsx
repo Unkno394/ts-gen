@@ -1,7 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { AuthScreen } from './components/AuthScreen';
+import { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { BrandLogo, SPLASH_LOGO_PATHS } from './components/BrandLogo';
-import { Workspace } from './components/Workspace';
 import { VibeBackground } from './components/VibeBackground';
 import { fetchHistory } from './lib/api';
 import type { HistoryItem, UserProfile } from './types';
@@ -9,6 +7,8 @@ import type { HistoryItem, UserProfile } from './types';
 const USER_KEY = 'tsgen.user';
 const HISTORY_KEY = 'tsgen.history';
 const SPLASH_MS = 3400;
+const AuthScreen = lazy(() => import('./components/AuthScreen').then((module) => ({ default: module.AuthScreen })));
+const Workspace = lazy(() => import('./components/Workspace').then((module) => ({ default: module.Workspace })));
 
 function readJSON<T>(key: string, fallback: T): T {
   try {
@@ -126,16 +126,22 @@ export default function App() {
   }
 
   if (!profile) {
-    return <AuthScreen onComplete={actions.login} />;
+    return (
+      <Suspense fallback={<SplashScreen />}>
+        <AuthScreen onComplete={actions.login} />
+      </Suspense>
+    );
   }
 
   return (
-    <Workspace
-      history={history}
-      onLogout={actions.logout}
-      onProfileUpdate={actions.updateProfile}
-      onSaveHistory={actions.saveHistory}
-      profile={profile}
-    />
+    <Suspense fallback={<SplashScreen />}>
+      <Workspace
+        history={history}
+        onLogout={actions.logout}
+        onProfileUpdate={actions.updateProfile}
+        onSaveHistory={actions.saveHistory}
+        profile={profile}
+      />
+    </Suspense>
   );
 }

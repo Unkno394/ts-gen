@@ -230,6 +230,68 @@ CREATE TABLE IF NOT EXISTS user_corrections (
   FOREIGN KEY (schema_fingerprint_id) REFERENCES schema_fingerprints(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS mapping_suggestions (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER,
+  generation_id INTEGER,
+  schema_fingerprint_id INTEGER,
+  source_field TEXT,
+  source_field_normalized TEXT,
+  target_field TEXT NOT NULL,
+  target_field_normalized TEXT NOT NULL,
+  confidence REAL,
+  reason TEXT,
+  status TEXT NOT NULL DEFAULT 'suggested',
+  source_of_truth TEXT NOT NULL DEFAULT 'model_suggestion',
+  model_provider TEXT,
+  model_name TEXT,
+  feedback_payload_json TEXT,
+  metadata_json TEXT,
+  reviewed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+  CHECK (status IN ('suggested', 'accepted', 'rejected')),
+  CHECK (source_of_truth IN ('deterministic_rule', 'personal_memory', 'model_suggestion', 'global_pattern', 'position_fallback', 'unresolved')),
+  CHECK (feedback_payload_json IS NULL OR json_valid(feedback_payload_json)),
+  CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (generation_id) REFERENCES generations(id) ON DELETE CASCADE,
+  FOREIGN KEY (schema_fingerprint_id) REFERENCES schema_fingerprints(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS draft_json_suggestions (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER,
+  schema_fingerprint_id INTEGER,
+  source_column TEXT NOT NULL,
+  source_column_normalized TEXT NOT NULL,
+  suggested_field TEXT NOT NULL,
+  suggested_field_normalized TEXT NOT NULL,
+  field_type TEXT NOT NULL DEFAULT 'string',
+  default_value_json TEXT,
+  confidence REAL,
+  reason TEXT,
+  status TEXT NOT NULL DEFAULT 'suggested',
+  source_of_truth TEXT NOT NULL DEFAULT 'model_suggestion',
+  model_provider TEXT,
+  model_name TEXT,
+  feedback_payload_json TEXT,
+  metadata_json TEXT,
+  reviewed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (field_type IN ('string', 'number', 'boolean', 'object', 'array', 'null', 'any')),
+  CHECK (default_value_json IS NULL OR json_valid(default_value_json)),
+  CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+  CHECK (status IN ('suggested', 'accepted', 'rejected')),
+  CHECK (source_of_truth IN ('heuristic_fallback', 'personal_memory', 'model_suggestion', 'global_pattern')),
+  CHECK (feedback_payload_json IS NULL OR json_valid(feedback_payload_json)),
+  CHECK (metadata_json IS NULL OR json_valid(metadata_json)),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (schema_fingerprint_id) REFERENCES schema_fingerprints(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS mapping_memory (
   id INTEGER PRIMARY KEY,
   user_id INTEGER,
@@ -496,6 +558,28 @@ CREATE TABLE IF NOT EXISTS model_training_runs (
   FOREIGN KEY (snapshot_id) REFERENCES training_snapshots(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS model_deployments (
+  id INTEGER PRIMARY KEY,
+  training_run_id INTEGER NOT NULL,
+  snapshot_id INTEGER NOT NULL,
+  model_family TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  base_url TEXT,
+  model_name TEXT NOT NULL,
+  artifact_uri TEXT,
+  config_json TEXT,
+  status TEXT NOT NULL DEFAULT 'inactive',
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  activated_at TEXT,
+  deactivated_at TEXT,
+  CHECK (provider IN ('ollama', 'openai_compatible', 'gigachat')),
+  CHECK (config_json IS NULL OR json_valid(config_json)),
+  CHECK (status IN ('inactive', 'active', 'retired')),
+  FOREIGN KEY (training_run_id) REFERENCES model_training_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (snapshot_id) REFERENCES training_snapshots(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS uploaded_files (
   id INTEGER PRIMARY KEY,
   user_id INTEGER,
@@ -557,6 +641,15 @@ CREATE INDEX IF NOT EXISTS idx_saved_schemas_user_updated
 
 CREATE INDEX IF NOT EXISTS idx_saved_schemas_user_category
   ON saved_schemas (user_id, category, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_mapping_suggestions_generation
+  ON mapping_suggestions (generation_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_mapping_suggestions_target_status
+  ON mapping_suggestions (target_field_normalized, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_draft_json_suggestions_schema_status
+  ON draft_json_suggestions (schema_fingerprint_id, status, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_generations_user_updated
   ON generations (user_id, updated_at DESC, id DESC);
@@ -659,6 +752,12 @@ CREATE INDEX IF NOT EXISTS idx_training_snapshots_status
 
 CREATE INDEX IF NOT EXISTS idx_model_training_runs_snapshot_status
   ON model_training_runs (snapshot_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_model_deployments_status_activated
+  ON model_deployments (status, activated_at DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_model_deployments_training_run
+  ON model_deployments (training_run_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_uploaded_files_user_uploaded
   ON uploaded_files (user_id, uploaded_at DESC);

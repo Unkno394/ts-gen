@@ -1,4 +1,16 @@
-import type { CorrectionSessionResult, GenerationResult, HistoryItem, LearningSummary, ManualCorrectionInput, UserProfile } from '../types';
+import type {
+  CorrectionSessionResult,
+  DraftJsonFeedbackResult,
+  DraftJsonResult,
+  GenerationConfirmationResult,
+  GenerationResult,
+  HistoryItem,
+  LearningEvent,
+  LearningSummary,
+  ManualCorrectionInput,
+  MappingFeedbackResult,
+  UserProfile,
+} from '../types';
 
 type GenerateParams = {
   file: File;
@@ -9,6 +21,7 @@ type GenerateParams = {
 
 type BackendGenerateResponse = {
   generation_id: string | null;
+  schema_fingerprint_id?: number | null;
   mode: 'guest' | 'authorized';
   parsed_file: {
     file_name: string;
@@ -27,6 +40,10 @@ type BackendGenerateResponse = {
     target: string;
     confidence: 'high' | 'medium' | 'low' | 'none';
     reason: string;
+    status?: 'suggested' | 'accepted' | 'rejected';
+    source_of_truth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'position_fallback' | 'unresolved';
+    suggestion_id?: number | null;
+    schema_fingerprint_id?: number | null;
   }>;
   generated_typescript: string;
   preview: Record<string, unknown>[];
@@ -58,6 +75,10 @@ type BackendHistoryResponse = {
       target: string;
       confidence: 'high' | 'medium' | 'low' | 'none';
       reason: string;
+      status?: 'suggested' | 'accepted' | 'rejected';
+      source_of_truth?: 'deterministic_rule' | 'personal_memory' | 'model_suggestion' | 'global_pattern' | 'position_fallback' | 'unresolved';
+      suggestion_id?: number | null;
+      schema_fingerprint_id?: number | null;
     }>;
     generated_typescript: string;
     preview: Record<string, unknown>[];
@@ -70,6 +91,8 @@ type BackendLearningSummaryResponse = {
   user_id: string;
   uploads: number;
   schema_fingerprints: number;
+  mapping_suggestions: number;
+  draft_json_suggestions: number;
   mapping_memory: number;
   few_shot_examples: number;
   user_templates: number;
@@ -80,6 +103,18 @@ type BackendLearningSummaryResponse = {
   global_curated_dataset_items: number;
 };
 
+type BackendLearningEventsResponse = {
+  items: Array<{
+    id: string;
+    kind: 'feedback_session' | 'few_shot_example' | 'user_template' | 'draft_memory' | 'dataset_item' | 'global_pattern';
+    stage: 'staging' | 'memory' | 'global_pattern' | 'dataset';
+    title: string;
+    description: string;
+    created_at: string;
+    metadata?: Record<string, unknown>;
+  }>;
+};
+
 type BackendCorrectionSessionResponse = {
   session_id: number;
   generation_id: number | null;
@@ -87,6 +122,54 @@ type BackendCorrectionSessionResponse = {
   correction_ids: number[];
   accepted_count: number;
   count: number;
+  reviewed_count?: number;
+  rejected_count?: number;
+  promotion?: {
+    promoted?: boolean;
+    already_promoted?: boolean;
+    few_shot_example_id?: number | null;
+    dataset_item_id?: number | null;
+    quality_score?: number | null;
+    reason?: string;
+  };
+};
+
+type BackendGenerationConfirmationResponse = {
+  generation_id: number;
+  promoted: boolean;
+  already_promoted?: boolean;
+  few_shot_example_id?: number | null;
+  dataset_item_id?: number | null;
+  quality_score?: number | null;
+  reason?: string;
+};
+
+type BackendDraftJsonResponse = {
+  schema_fingerprint_id?: number | null;
+  parsed_file: BackendGenerateResponse['parsed_file'];
+  draft_json: Record<string, unknown>;
+  field_suggestions: Array<{
+    source_column: string;
+    target_field: string;
+    default_value: unknown;
+    field_type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'null' | 'any';
+    status?: 'suggested' | 'accepted' | 'rejected';
+    source_of_truth?: 'heuristic_fallback' | 'personal_memory' | 'model_suggestion' | 'global_pattern';
+    confidence?: 'high' | 'medium' | 'low' | 'none';
+    reason?: string;
+    suggestion_id?: number | null;
+    schema_fingerprint_id?: number | null;
+  }>;
+  warnings: string[];
+};
+
+type BackendDraftJsonFeedbackResponse = {
+  schema_fingerprint_id: number;
+  draft_json: Record<string, unknown>;
+  accepted_count: number;
+  rejected_count: number;
+  saved_as_template: boolean;
+  template_name: string;
 };
 
 type AuthParams = {
@@ -118,7 +201,23 @@ type BackendVerifyResetCodeResponse = {
 
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const GENERATE_REQUEST_TIMEOUT_MS = 60_000;
+
+function resolveTimeoutMs(envKey: 'VITE_REQUEST_TIMEOUT_MS' | 'VITE_GENERATE_TIMEOUT_MS', fallbackMs: number): number {
+  const rawValue = (import.meta.env as ImportMetaEnv & { VITE_REQUEST_TIMEOUT_MS?: string; VITE_GENERATE_TIMEOUT_MS?: string })[
+    envKey
+  ]?.trim();
+  if (!rawValue) {
+    return fallbackMs;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallbackMs;
+  }
+  return parsed;
+}
+
+const GENERATE_REQUEST_TIMEOUT_MS = resolveTimeoutMs('VITE_GENERATE_TIMEOUT_MS', 180_000);
 
 function normalizeBackendError(detail: string, status?: number): string {
   const normalized = detail.trim();
@@ -362,6 +461,7 @@ export async function generateFromBackend({ file, targetJson, userId, selectedSh
   const payload = await parseJson<BackendGenerateResponse>(response);
   return {
     generationId: payload.generation_id,
+    schemaFingerprintId: payload.schema_fingerprint_id ?? null,
     parsedFile: {
       fileName: payload.parsed_file.file_name,
       extension: payload.parsed_file.file_type,
@@ -376,6 +476,10 @@ export async function generateFromBackend({ file, targetJson, userId, selectedSh
       target: item.target,
       confidence: parseConfidence(item.confidence),
       reason: item.reason,
+      status: item.status,
+      sourceOfTruth: item.source_of_truth,
+      suggestionId: item.suggestion_id ?? null,
+      schemaFingerprintId: item.schema_fingerprint_id ?? null,
     })),
     preview: payload.preview,
     warnings: payload.warnings,
@@ -413,6 +517,10 @@ export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
       target: mapping.target,
       confidence: parseConfidence(mapping.confidence),
       reason: mapping.reason,
+      status: mapping.status,
+      sourceOfTruth: mapping.source_of_truth,
+      suggestionId: mapping.suggestion_id ?? null,
+      schemaFingerprintId: mapping.schema_fingerprint_id ?? null,
     })),
     preview: item.preview,
     warnings: item.warnings,
@@ -432,6 +540,8 @@ export async function fetchLearningSummary(userId: string): Promise<LearningSumm
     userId: payload.user_id,
     uploads: payload.uploads,
     schemaFingerprints: payload.schema_fingerprints,
+    mappingSuggestions: payload.mapping_suggestions,
+    draftJsonSuggestions: payload.draft_json_suggestions,
     mappingMemory: payload.mapping_memory,
     fewShotExamples: payload.few_shot_examples,
     userTemplates: payload.user_templates,
@@ -441,6 +551,26 @@ export async function fetchLearningSummary(userId: string): Promise<LearningSumm
     globalPatternCandidates: payload.global_pattern_candidates,
     globalCuratedDatasetItems: payload.global_curated_dataset_items,
   };
+}
+
+export async function fetchLearningEvents(userId: string, limit = 20): Promise<LearningEvent[]> {
+  const response = await fetchWithTimeout(
+    buildApiUrl(`/api/learning/events/${encodeURIComponent(userId)}?limit=${encodeURIComponent(String(limit))}`),
+    {
+      method: 'GET',
+    },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+  const payload = await parseJson<BackendLearningEventsResponse>(response);
+  return payload.items.map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    stage: item.stage,
+    title: item.title,
+    description: item.description,
+    createdAt: item.created_at,
+    metadata: item.metadata ?? {},
+  }));
 }
 
 export async function saveLearningCorrections(params: {
@@ -480,5 +610,183 @@ export async function saveLearningCorrections(params: {
     correctionIds: response.correction_ids,
     acceptedCount: response.accepted_count,
     count: response.count,
+  };
+}
+
+export async function generateDraftJsonFromBackend(params: {
+  file: File;
+  userId?: string;
+  selectedSheet?: string;
+}): Promise<DraftJsonResult> {
+  const formData = new FormData();
+  formData.append('file', params.file);
+  if (params.userId) {
+    formData.append('user_id', params.userId);
+  }
+  if (params.selectedSheet) {
+    formData.append('selected_sheet', params.selectedSheet);
+  }
+
+  const response = await fetchWithTimeout(
+    buildApiUrl('/api/draft-json'),
+    {
+      method: 'POST',
+      body: formData,
+    },
+    GENERATE_REQUEST_TIMEOUT_MS
+  );
+  const payload = await parseJson<BackendDraftJsonResponse>(response);
+  return {
+    schemaFingerprintId: payload.schema_fingerprint_id ?? null,
+    parsedFile: {
+      fileName: payload.parsed_file.file_name,
+      extension: payload.parsed_file.file_type,
+      columns: payload.parsed_file.columns,
+      rows: payload.parsed_file.rows,
+      sheets: payload.parsed_file.sheets ?? [],
+      warnings: payload.parsed_file.warnings,
+    },
+    draftJson: payload.draft_json,
+    fieldSuggestions: payload.field_suggestions.map((item) => ({
+      sourceColumn: item.source_column,
+      targetField: item.target_field,
+      defaultValue: item.default_value,
+      fieldType: item.field_type,
+      status: item.status,
+      sourceOfTruth: item.source_of_truth,
+      confidence: item.confidence,
+      reason: item.reason,
+      suggestionId: item.suggestion_id ?? null,
+      schemaFingerprintId: item.schema_fingerprint_id ?? null,
+    })),
+    warnings: payload.warnings,
+  };
+}
+
+export async function sendMappingFeedback(params: {
+  userId: string;
+  generationId: number;
+  schemaFingerprintId?: number | null;
+  notes?: string;
+  metadata?: Record<string, unknown>;
+  feedback: Array<{
+    suggestionId?: number | null;
+    targetField: string;
+    status: 'suggested' | 'accepted' | 'rejected';
+    sourceField?: string | null;
+    correctedSourceField?: string | null;
+    correctedTargetField?: string | null;
+    rationale?: string | null;
+    confidenceAfter?: number | null;
+    metadata?: Record<string, unknown>;
+  }>;
+}): Promise<MappingFeedbackResult> {
+  const response = await postJson<BackendCorrectionSessionResponse>('/api/learning/mapping-feedback', {
+    user_id: params.userId,
+    generation_id: params.generationId,
+    schema_fingerprint_id: params.schemaFingerprintId ?? null,
+    notes: params.notes ?? null,
+    metadata: params.metadata ?? {},
+    feedback: params.feedback.map((item) => ({
+      suggestion_id: item.suggestionId ?? null,
+      target_field: item.targetField,
+      status: item.status,
+      source_field: item.sourceField ?? null,
+      corrected_source_field: item.correctedSourceField ?? null,
+      corrected_target_field: item.correctedTargetField ?? null,
+      rationale: item.rationale ?? null,
+      confidence_after: item.confidenceAfter ?? null,
+      metadata: item.metadata ?? {},
+    })),
+  });
+
+  return {
+    sessionId: response.session_id,
+    generationId: response.generation_id,
+    schemaFingerprintId: response.schema_fingerprint_id,
+    correctionIds: response.correction_ids,
+    acceptedCount: response.accepted_count,
+    count: response.count,
+    reviewedCount: response.reviewed_count,
+    rejectedCount: response.rejected_count,
+    promotion: response.promotion
+      ? {
+          promoted: response.promotion.promoted,
+          alreadyPromoted: response.promotion.already_promoted,
+          fewShotExampleId: response.promotion.few_shot_example_id ?? null,
+          datasetItemId: response.promotion.dataset_item_id ?? null,
+          qualityScore: response.promotion.quality_score ?? null,
+          reason: response.promotion.reason,
+        }
+      : undefined,
+  };
+}
+
+export async function confirmGenerationLearning(params: {
+  userId: string;
+  generationId: number;
+  notes?: string;
+}): Promise<GenerationConfirmationResult> {
+  const response = await postJson<BackendGenerationConfirmationResponse>('/api/learning/confirm-generation', {
+    user_id: params.userId,
+    generation_id: params.generationId,
+    notes: params.notes ?? null,
+  });
+  return {
+    generationId: response.generation_id,
+    promoted: response.promoted,
+    alreadyPromoted: response.already_promoted,
+    fewShotExampleId: response.few_shot_example_id ?? null,
+    datasetItemId: response.dataset_item_id ?? null,
+    qualityScore: response.quality_score ?? null,
+    reason: response.reason,
+  };
+}
+
+export async function saveDraftJsonFeedback(params: {
+  userId: string;
+  schemaFingerprintId: number;
+  draftJson: Record<string, unknown>;
+  templateName?: string;
+  saveAsTemplate?: boolean;
+  notes?: string;
+  metadata?: Record<string, unknown>;
+  feedback: Array<{
+    suggestionId?: number | null;
+    sourceColumn: string;
+    suggestedField: string;
+    status: 'suggested' | 'accepted' | 'rejected';
+    correctedField?: string | null;
+    rationale?: string | null;
+    confidenceAfter?: number | null;
+    metadata?: Record<string, unknown>;
+  }>;
+}): Promise<DraftJsonFeedbackResult> {
+  const response = await postJson<BackendDraftJsonFeedbackResponse>('/api/learning/draft-json-feedback', {
+    user_id: params.userId,
+    schema_fingerprint_id: params.schemaFingerprintId,
+    draft_json: params.draftJson,
+    template_name: params.templateName ?? null,
+    save_as_template: params.saveAsTemplate ?? true,
+    notes: params.notes ?? null,
+    metadata: params.metadata ?? {},
+    feedback: params.feedback.map((item) => ({
+      suggestion_id: item.suggestionId ?? null,
+      source_column: item.sourceColumn,
+      suggested_field: item.suggestedField,
+      status: item.status,
+      corrected_field: item.correctedField ?? null,
+      rationale: item.rationale ?? null,
+      confidence_after: item.confidenceAfter ?? null,
+      metadata: item.metadata ?? {},
+    })),
+  });
+  return {
+    schemaFingerprintId: response.schema_fingerprint_id,
+    draftJson: response.draft_json,
+    acceptedCount: response.accepted_count,
+    rejectedCount: response.rejected_count,
+    savedAsTemplate: response.saved_as_template,
+    templateName: response.template_name,
   };
 }

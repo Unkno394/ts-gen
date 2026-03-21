@@ -155,12 +155,8 @@ def default_value_for_type(field_type: str) -> Any:
     return ""
 
 
-def generate_draft_json(columns: list[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """
-    Главная функция:
-    columns + rows -> draft JSON
-    """
-    result: dict[str, Any] = {}
+def build_draft_field_suggestions(columns: list[str], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
     used_keys: set[str] = set()
 
     for column in columns:
@@ -171,8 +167,25 @@ def generate_draft_json(columns: list[str], rows: list[dict[str, Any]]) -> dict[
 
         sample_values = [row.get(column) for row in rows[:10]]
         field_type = infer_field_type(sample_values)
-        result[unique_key] = default_value_for_type(field_type)
+        suggestions.append(
+            {
+                "source_column": column,
+                "suggested_key": unique_key,
+                "field_type": field_type,
+                "default_value": default_value_for_type(field_type),
+            }
+        )
+    return suggestions
 
+
+def generate_draft_json(columns: list[str], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Главная функция:
+    columns + rows -> draft JSON
+    """
+    result: dict[str, Any] = {}
+    for field in build_draft_field_suggestions(columns, rows):
+        result[str(field["suggested_key"])] = field["default_value"]
     return result
 
 

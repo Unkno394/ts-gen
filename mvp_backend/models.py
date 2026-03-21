@@ -30,6 +30,19 @@ class FieldMapping(BaseModel):
     target: str
     confidence: Literal['high', 'medium', 'low', 'none']
     reason: str
+    status: Literal['suggested', 'accepted', 'rejected'] = 'accepted'
+    source_of_truth: Literal[
+        'deterministic_rule',
+        'personal_memory',
+        'model_suggestion',
+        'global_pattern',
+        'position_fallback',
+        'unresolved',
+    ] = 'deterministic_rule'
+    suggestion_id: int | None = None
+    schema_fingerprint_id: int | None = None
+    model_confidence_score: float | None = None
+    candidate_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerationResult(BaseModel):
@@ -147,3 +160,103 @@ class UserTemplatePayload(BaseModel):
     schema_fingerprint_id: int | None = None
     is_shared: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MappingFeedbackItem(BaseModel):
+    suggestion_id: int | None = None
+    target_field: str
+    status: Literal['suggested', 'accepted', 'rejected']
+    source_field: str | None = None
+    corrected_source_field: str | None = None
+    corrected_target_field: str | None = None
+    rationale: str | None = None
+    confidence_after: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MappingFeedbackPayload(BaseModel):
+    user_id: str
+    generation_id: int
+    schema_fingerprint_id: int | None = None
+    notes: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    feedback: list[MappingFeedbackItem] = Field(default_factory=list)
+
+
+class PatternPromotionPayload(BaseModel):
+    min_support_count: int = 3
+    min_distinct_users: int = 2
+    min_stability_score: float = 0.75
+    max_drift_score: float = 0.25
+
+
+class TrainingSnapshotPayload(BaseModel):
+    name: str
+    min_quality_score: float = 0.8
+    include_statuses: list[Literal['candidate', 'approved']] = Field(default_factory=lambda: ['approved'])
+    notes: str | None = None
+
+
+class TrainingRunPayload(BaseModel):
+    snapshot_id: int
+    model_family: str = 'gigachat'
+    base_model: str = 'GigaChat-2-Pro'
+    train_params: dict[str, Any] = Field(default_factory=dict)
+    notes: str | None = None
+
+
+class TrainingSnapshotExportPayload(BaseModel):
+    overwrite: bool = False
+
+
+class TrainingRunStartPayload(BaseModel):
+    trainer_mode: Literal['manifest_only'] | None = None
+    auto_activate: bool = False
+    serving_provider: Literal['gigachat'] | None = None
+    serving_base_url: str | None = None
+    serving_model_name: str | None = None
+
+
+class TrainingRunCompletionPayload(BaseModel):
+    artifact_uri: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    notes: str | None = None
+    auto_activate: bool = False
+    serving_provider: Literal['gigachat'] | None = None
+    serving_base_url: str | None = None
+    serving_model_name: str | None = None
+
+
+class TrainingRunActivationPayload(BaseModel):
+    provider: Literal['gigachat'] | None = None
+    base_url: str | None = None
+    model_name: str | None = None
+    notes: str | None = None
+
+
+class GenerationConfirmationPayload(BaseModel):
+    user_id: str
+    generation_id: int
+    notes: str | None = None
+
+
+class DraftJsonFeedbackItem(BaseModel):
+    suggestion_id: int | None = None
+    source_column: str
+    suggested_field: str
+    status: Literal['suggested', 'accepted', 'rejected']
+    corrected_field: str | None = None
+    rationale: str | None = None
+    confidence_after: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DraftJsonFeedbackPayload(BaseModel):
+    user_id: str
+    schema_fingerprint_id: int
+    draft_json: dict[str, Any]
+    template_name: str | None = None
+    save_as_template: bool = True
+    notes: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    feedback: list[DraftJsonFeedbackItem] = Field(default_factory=list)

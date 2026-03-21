@@ -10,6 +10,7 @@ import {
   Mail,
   LockKeyhole,
   LogOut,
+  Search,
   ShieldCheck,
   Sparkles,
   SquarePen,
@@ -19,20 +20,36 @@ import {
   WandSparkles,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
-import * as XLSX from 'xlsx';
+import type { WorkBook } from 'xlsx';
 import {
   changeEmailWithCode,
   changeEmailWithPassword,
   changePasswordWithBackend,
+  confirmGenerationLearning,
+  fetchLearningEvents,
   fetchLearningSummary,
+  generateDraftJsonFromBackend,
   generateFromBackend,
   requestEmailChangeCode,
   saveLearningCorrections,
+  saveDraftJsonFeedback,
+  sendMappingFeedback,
   updateProfileName,
 } from '../lib/api';
-import type { GenerationResult, HistoryItem, LearningSummary, ManualCorrectionInput, MappingInfo, ParsedFileInfo, ParsedSheetInfo, UserProfile } from '../types';
+import type {
+  DraftFieldSuggestion,
+  GenerationResult,
+  HistoryItem,
+  LearningEvent,
+  LearningSummary,
+  ManualCorrectionInput,
+  MappingInfo,
+  ParsedFileInfo,
+  ParsedSheetInfo,
+  UserProfile,
+} from '../types';
 import { VibeBackground } from './VibeBackground';
 
 type Props = {
@@ -42,6 +59,8 @@ type Props = {
   onProfileUpdate: (profile: UserProfile) => void;
   onSaveHistory: () => Promise<void>;
 };
+
+type LearningEventFilter = 'all' | LearningEvent['stage'];
 
 const defaultSchema = `{
   "customerName": "",
@@ -71,7 +90,7 @@ function buildPreviewSheet(name: string, columns: string[], rows: Record<string,
   };
 }
 
-function parseWorkbookSheets(workbook: XLSX.WorkBook): {
+function parseWorkbookSheets(workbook: WorkBook, xlsxModule: typeof import('xlsx')): {
   columns: string[];
   rows: Record<string, unknown>[];
   sheets: ParsedSheetInfo[];
@@ -79,9 +98,11 @@ function parseWorkbookSheets(workbook: XLSX.WorkBook): {
 } {
   const sheets = workbook.SheetNames.map((sheetName) => {
     const sheet = workbook.Sheets[sheetName];
-    const json = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+    const json = xlsxModule.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
     const columns = Object.keys(json[0] ?? {});
-    const rows = json.slice(0, 8).map((row) => row as Record<string, string | number | boolean | null>);
+    const rows = json
+      .slice(0, 8)
+      .map((row: Record<string, unknown>) => row as Record<string, string | number | boolean | null>);
     return buildPreviewSheet(sheetName, columns, rows);
   }).filter((sheet) => sheet.columns.length > 0 || sheet.rows.length > 0);
 
@@ -160,9 +181,10 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
   }
 
   if (extension === 'xlsx' || extension === 'xls') {
+    const XLSX = await import('xlsx');
     const buffer = await file.arrayBuffer();
     const workbook = XLSX.read(buffer, { type: 'array' });
-    const workbookPreview = parseWorkbookSheets(workbook);
+    const workbookPreview = parseWorkbookSheets(workbook, XLSX);
 
     return {
       fileName: file.name,
@@ -198,6 +220,10 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
 
 function cloneMappings(mappings: MappingInfo[]): MappingInfo[] {
   return mappings.map((mapping) => ({ ...mapping }));
+}
+
+function cloneDraftSuggestions(suggestions: DraftFieldSuggestion[]): DraftFieldSuggestion[] {
+  return suggestions.map((suggestion) => ({ ...suggestion }));
 }
 
 function buildCorrectionBaseline(generationId: string, schema: string, result: GenerationResult): CorrectionBaseline {
@@ -240,6 +266,187 @@ function confidenceToScore(confidence: MappingInfo['confidence']): number {
     default:
       return 0;
   }
+}
+
+function buildSchemaFromDraftSuggestions(suggestions: DraftFieldSuggestion[]): string {
+  const payload: Record<string, unknown> = {};
+  suggestions.forEach((suggestion) => {
+    const key = suggestion.targetField.trim();
+    if (!key) {
+      return;
+    }
+    payload[key] = suggestion.defaultValue;
+  });
+  return JSON.stringify(payload, null, 2);
+}
+
+function mappingStatusLabel(mapping: MappingInfo): string {
+  if (mapping.status === 'accepted') {
+    return 'Подтверждено';
+  }
+  if (mapping.status === 'rejected') {
+    return 'Отклонено';
+  }
+  if (mapping.sourceOfTruth === 'personal_memory') {
+    return 'Из памяти';
+  }
+  if (mapping.sourceOfTruth === 'deterministic_rule') {
+    return 'Правило';
+  }
+  if (mapping.sourceOfTruth === 'position_fallback') {
+    return 'Fallback';
+  }
+  if (mapping.sourceOfTruth === 'model_suggestion') {
+    return 'Нужно проверить';
+  }
+  return 'Черновик';
+}
+
+function draftSuggestionStatusLabel(suggestion: DraftFieldSuggestion): string {
+  if (suggestion.status === 'accepted') {
+    return 'Подтверждено';
+  }
+  if (suggestion.status === 'rejected') {
+    return 'Отклонено';
+  }
+  if (suggestion.sourceOfTruth === 'personal_memory') {
+    return 'Из памяти';
+  }
+  if (suggestion.sourceOfTruth === 'model_suggestion') {
+    return 'Модель';
+  }
+  if (suggestion.sourceOfTruth === 'global_pattern') {
+    return 'Паттерн';
+  }
+  return 'Черновик';
+}
+
+function mappingSourceLabel(mapping: MappingInfo): string {
+  if (mapping.sourceOfTruth === 'personal_memory') {
+    return 'Персональная память';
+  }
+  if (mapping.sourceOfTruth === 'global_pattern') {
+    return 'Глобальный паттерн';
+  }
+  if (mapping.sourceOfTruth === 'model_suggestion') {
+    return 'Модель';
+  }
+  if (mapping.sourceOfTruth === 'deterministic_rule') {
+    return 'Системное правило';
+  }
+  if (mapping.sourceOfTruth === 'position_fallback') {
+    return 'Fallback';
+  }
+  if (mapping.sourceOfTruth === 'unresolved') {
+    return 'Не определено';
+  }
+  return 'Источник не указан';
+}
+
+function draftSuggestionSourceLabel(suggestion: DraftFieldSuggestion): string {
+  if (suggestion.sourceOfTruth === 'personal_memory') {
+    return 'Персональная память';
+  }
+  if (suggestion.sourceOfTruth === 'global_pattern') {
+    return 'Глобальный паттерн';
+  }
+  if (suggestion.sourceOfTruth === 'model_suggestion') {
+    return 'Модель';
+  }
+  if (suggestion.sourceOfTruth === 'heuristic_fallback') {
+    return 'Эвристика';
+  }
+  return 'Источник не указан';
+}
+
+function mappingStageState(mapping: MappingInfo, generationConfirmed: boolean): 'staging' | 'memory' | 'auto' | 'rejected' {
+  if (mapping.status === 'rejected') {
+    return 'rejected';
+  }
+  if (mapping.sourceOfTruth === 'personal_memory') {
+    return 'memory';
+  }
+  if (mappingNeedsExplicitReview(mapping)) {
+    return generationConfirmed && mapping.status === 'accepted' ? 'memory' : 'staging';
+  }
+  return 'auto';
+}
+
+function draftSuggestionStageState(suggestion: DraftFieldSuggestion, draftJsonSaved: boolean): 'staging' | 'memory' | 'auto' | 'rejected' {
+  if (suggestion.status === 'rejected') {
+    return 'rejected';
+  }
+  if (suggestion.sourceOfTruth === 'personal_memory') {
+    return 'memory';
+  }
+  if (draftSuggestionNeedsExplicitReview(suggestion)) {
+    return draftJsonSaved && suggestion.status === 'accepted' ? 'memory' : 'staging';
+  }
+  return 'auto';
+}
+
+function stageStateLabel(state: 'staging' | 'memory' | 'auto' | 'rejected'): string {
+  if (state === 'memory') {
+    return 'В памяти';
+  }
+  if (state === 'staging') {
+    return 'Staging';
+  }
+  if (state === 'rejected') {
+    return 'Отклонено';
+  }
+  return 'Авто';
+}
+
+function learningEventStageLabel(stage: LearningEvent['stage']): string {
+  if (stage === 'memory') {
+    return 'Память';
+  }
+  if (stage === 'global_pattern') {
+    return 'Глобальный паттерн';
+  }
+  if (stage === 'dataset') {
+    return 'Dataset';
+  }
+  return 'Staging';
+}
+
+function learningEventFilterLabel(filter: LearningEventFilter): string {
+  if (filter === 'all') {
+    return 'Все';
+  }
+  return learningEventStageLabel(filter);
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function learningEventActionLabel(event: LearningEvent): string | null {
+  if (event.kind === 'feedback_session' || event.kind === 'few_shot_example') {
+    return 'Открыть генерацию';
+  }
+  if (event.kind === 'user_template') {
+    return 'Загрузить JSON';
+  }
+  if (event.kind === 'draft_memory') {
+    return 'Загрузить draft JSON';
+  }
+  if (event.kind === 'dataset_item') {
+    return 'Открыть связанный кейс';
+  }
+  if (event.kind === 'global_pattern') {
+    return 'Показать паттерн';
+  }
+  return null;
+}
+
+function mappingNeedsExplicitReview(mapping: MappingInfo): boolean {
+  return Boolean(mapping.suggestionId) || mapping.status === 'suggested' || mapping.sourceOfTruth === 'model_suggestion' || mapping.sourceOfTruth === 'position_fallback' || mapping.sourceOfTruth === 'unresolved';
+}
+
+function draftSuggestionNeedsExplicitReview(suggestion: DraftFieldSuggestion): boolean {
+  return Boolean(suggestion.suggestionId) || suggestion.status === 'suggested' || suggestion.sourceOfTruth === 'model_suggestion' || suggestion.sourceOfTruth === 'global_pattern';
 }
 
 function areMappingsEqual(left: MappingInfo, right: MappingInfo): boolean {
@@ -285,25 +492,51 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [passwordChangeError, setPasswordChangeError] = useState('');
   const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(null);
   const [learningSummaryError, setLearningSummaryError] = useState('');
+  const [learningEvents, setLearningEvents] = useState<LearningEvent[]>([]);
+  const [learningEventsError, setLearningEventsError] = useState('');
+  const [learningEventFilter, setLearningEventFilter] = useState<LearningEventFilter>('all');
+  const [learningEventSearch, setLearningEventSearch] = useState('');
   const [correctionBaseline, setCorrectionBaseline] = useState<CorrectionBaseline | null>(null);
   const [correctionSaveBusy, setCorrectionSaveBusy] = useState(false);
   const [correctionSaveNotice, setCorrectionSaveNotice] = useState('');
   const [correctionSaveError, setCorrectionSaveError] = useState('');
+  const [draftSuggestions, setDraftSuggestions] = useState<DraftFieldSuggestion[]>([]);
+  const [draftJsonBusy, setDraftJsonBusy] = useState(false);
+  const [draftJsonNotice, setDraftJsonNotice] = useState('');
+  const [draftJsonError, setDraftJsonError] = useState('');
+  const [draftJsonSaved, setDraftJsonSaved] = useState(false);
+  const [learningReviewBusy, setLearningReviewBusy] = useState(false);
+  const [learningReviewNotice, setLearningReviewNotice] = useState('');
+  const [learningReviewError, setLearningReviewError] = useState('');
+  const [generationConfirmed, setGenerationConfirmed] = useState(false);
+  const [mappingReviewNotes, setMappingReviewNotes] = useState<Record<string, string>>({});
+  const [draftReviewNotes, setDraftReviewNotes] = useState<Record<string, string>>({});
+  const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
+  const reviewFocusTimerRef = useRef<number | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
 
   const refreshLearningSummary = async () => {
     if (profile.skipped) {
       setLearningSummary(null);
       setLearningSummaryError('');
+      setLearningEvents([]);
+      setLearningEventsError('');
       return;
     }
 
     try {
-      const nextSummary = await fetchLearningSummary(profile.id);
+      const [nextSummary, nextEvents] = await Promise.all([
+        fetchLearningSummary(profile.id),
+        fetchLearningEvents(profile.id, 18),
+      ]);
       setLearningSummary(nextSummary);
       setLearningSummaryError('');
+      setLearningEvents(nextEvents);
+      setLearningEventsError('');
     } catch (error) {
-      setLearningSummaryError(error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.');
+      const message = error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.';
+      setLearningSummaryError(message);
+      setLearningEventsError(message);
     }
   };
 
@@ -353,6 +586,160 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     const options = schemaTargetFields.length > 0 ? schemaTargetFields : result.mappings.map((mapping) => mapping.target);
     return Array.from(new Set(options.filter(Boolean)));
   }, [result.mappings, schemaTargetFields]);
+
+  const mappingSourceOptions = useMemo(() => {
+    const sourceColumns = currentPreviewSheet?.columns ?? parsedFile?.columns ?? [];
+    const currentSources = result.mappings.map((mapping) => mapping.source).filter((value) => value && value !== 'not found');
+    return Array.from(new Set([...sourceColumns, ...currentSources])) as string[];
+  }, [currentPreviewSheet?.columns, parsedFile?.columns, result.mappings]);
+
+  const hasReviewableMappings = useMemo(() => {
+    return result.mappings.some((mapping) => mappingNeedsExplicitReview(mapping));
+  }, [result.mappings]);
+
+  const hasPendingMappingReview = useMemo(() => {
+    return result.mappings.some((mapping) => mappingNeedsExplicitReview(mapping) && (mapping.status ?? 'suggested') === 'suggested');
+  }, [result.mappings]);
+
+  const hasPendingDraftReview = useMemo(() => {
+    return draftSuggestions.some((suggestion) => draftSuggestionNeedsExplicitReview(suggestion) && (suggestion.status ?? 'suggested') === 'suggested');
+  }, [draftSuggestions]);
+
+  const hasRejectedMappingWithoutReason = useMemo(() => {
+    return result.mappings.some((mapping, index) => mappingNeedsExplicitReview(mapping) && mapping.status === 'rejected' && !mappingReviewNotes[`mapping-${index}`]?.trim());
+  }, [mappingReviewNotes, result.mappings]);
+
+  const hasRejectedDraftWithoutReason = useMemo(() => {
+    return draftSuggestions.some((suggestion, index) => draftSuggestionNeedsExplicitReview(suggestion) && suggestion.status === 'rejected' && !draftReviewNotes[`draft-${index}`]?.trim());
+  }, [draftReviewNotes, draftSuggestions]);
+
+  const pendingMappingReviewItems = useMemo(() => {
+    return result.mappings.flatMap((mapping, index) =>
+      mappingNeedsExplicitReview(mapping) && (mapping.status ?? 'suggested') === 'suggested'
+        ? [
+            {
+              id: `mapping-${index}-${mapping.target}`,
+              scrollTargetId: `mapping-review-${index}`,
+              title: mapping.target,
+              description: mapping.source && mapping.source !== 'not found' ? `source: ${mapping.source}` : 'source пока не определён',
+            },
+          ]
+        : []
+    );
+  }, [result.mappings]);
+
+  const pendingDraftReviewItems = useMemo(() => {
+    return draftSuggestions.flatMap((suggestion, index) =>
+      draftSuggestionNeedsExplicitReview(suggestion) && (suggestion.status ?? 'suggested') === 'suggested'
+        ? [
+            {
+              id: `draft-${index}-${suggestion.sourceColumn}`,
+              scrollTargetId: `draft-review-${index}`,
+              title: suggestion.targetField || suggestion.sourceColumn,
+              description: `колонка: ${suggestion.sourceColumn}`,
+            },
+          ]
+        : []
+    );
+  }, [draftSuggestions]);
+
+  const pendingReviewTotal = pendingMappingReviewItems.length + pendingDraftReviewItems.length;
+
+  const currentKnowledgeSummary = useMemo(() => {
+    const mappings = result.mappings.reduce(
+      (accumulator, mapping) => {
+        const stage = mappingStageState(mapping, generationConfirmed);
+        if (stage === 'staging') {
+          accumulator.staging += 1;
+        } else if (stage === 'memory') {
+          accumulator.memory += 1;
+        } else if (mapping.sourceOfTruth === 'global_pattern') {
+          accumulator.globalPatterns += 1;
+        } else {
+          accumulator.system += 1;
+        }
+        return accumulator;
+      },
+      { staging: 0, memory: 0, globalPatterns: 0, system: 0 }
+    );
+
+    const drafts = draftSuggestions.reduce(
+      (accumulator, suggestion) => {
+        const stage = draftSuggestionStageState(suggestion, draftJsonSaved);
+        if (stage === 'staging') {
+          accumulator.staging += 1;
+        } else if (stage === 'memory') {
+          accumulator.memory += 1;
+        } else if (suggestion.sourceOfTruth === 'global_pattern') {
+          accumulator.globalPatterns += 1;
+        } else {
+          accumulator.system += 1;
+        }
+        return accumulator;
+      },
+      { staging: 0, memory: 0, globalPatterns: 0, system: 0 }
+    );
+
+    return {
+      staging: mappings.staging + drafts.staging,
+      memory: mappings.memory + drafts.memory,
+      globalPatterns: mappings.globalPatterns + drafts.globalPatterns,
+      system: mappings.system + drafts.system,
+    };
+  }, [draftJsonSaved, draftSuggestions, generationConfirmed, result.mappings]);
+
+  const learningPipelineStats = useMemo(() => {
+    return {
+      staging: (learningSummary?.mappingSuggestions ?? 0) + (learningSummary?.draftJsonSuggestions ?? 0),
+      memory:
+        (learningSummary?.mappingMemory ?? 0) +
+        (learningSummary?.fewShotExamples ?? 0) +
+        (learningSummary?.userTemplates ?? 0) +
+        (learningSummary?.frequentDjson ?? 0),
+      globalPatterns: learningSummary?.globalPatternCandidates ?? 0,
+      dataset: learningSummary?.globalCuratedDatasetItems ?? 0,
+    };
+  }, [learningSummary]);
+
+  const learningEventCounts = useMemo(() => {
+    return learningEvents.reduce(
+      (accumulator, event) => {
+        accumulator.all += 1;
+        accumulator[event.stage] += 1;
+        return accumulator;
+      },
+      {
+        all: 0,
+        staging: 0,
+        memory: 0,
+        global_pattern: 0,
+        dataset: 0,
+      } as Record<LearningEventFilter, number>
+    );
+  }, [learningEvents]);
+
+  const filteredLearningEvents = useMemo(() => {
+    const normalizedQuery = learningEventSearch.trim().toLowerCase();
+    return learningEvents.filter((event) => {
+      const matchesFilter = learningEventFilter === 'all' || event.stage === learningEventFilter;
+      if (!matchesFilter) {
+        return false;
+      }
+      if (!normalizedQuery) {
+        return true;
+      }
+      const haystack = `${event.title} ${event.description}`.toLowerCase();
+      return haystack.includes(normalizedQuery);
+    });
+  }, [learningEventFilter, learningEventSearch, learningEvents]);
+
+  useEffect(() => {
+    return () => {
+      if (reviewFocusTimerRef.current !== null) {
+        window.clearTimeout(reviewFocusTimerRef.current);
+      }
+    };
+  }, []);
 
   const pendingCorrections = useMemo(() => {
     if (profile.skipped || !correctionBaseline) {
@@ -421,8 +808,22 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   }, [correctionBaseline, profile.skipped, result.code, result.mappings, schema]);
 
   const visibleWarnings = useMemo(() => {
-    return Array.from(new Set([...result.warnings, ...(parsedFile?.warnings ?? []), saveMessage, correctionSaveError].filter(Boolean)));
-  }, [correctionSaveError, parsedFile?.warnings, result.warnings, saveMessage]);
+    return Array.from(
+      new Set(
+        [
+          ...result.warnings,
+          ...(parsedFile?.warnings ?? []),
+          saveMessage,
+          correctionSaveNotice,
+          correctionSaveError,
+          draftJsonError,
+          learningReviewError,
+          draftJsonNotice,
+          learningReviewNotice,
+        ].filter(Boolean)
+      )
+    );
+  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, result.warnings, saveMessage]);
 
   const profileStats = useMemo(() => {
     const totalGenerations = history.length;
@@ -533,7 +934,96 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setCorrectionBaseline(profile.skipped ? null : buildCorrectionBaseline(item.id, item.schema, restoredResult));
     setCorrectionSaveNotice('');
     setCorrectionSaveError('');
+    setDraftSuggestions([]);
+    setMappingReviewNotes({});
+    setDraftReviewNotes({});
+    setDraftJsonNotice('');
+    setDraftJsonError('');
+    setDraftJsonSaved(false);
+    setLearningReviewNotice('');
+    setLearningReviewError('');
+    setGenerationConfirmed(true);
     setActiveView('generator');
+  };
+
+  const findHistoryItemByGenerationId = (generationId: unknown): HistoryItem | null => {
+    if (typeof generationId !== 'string' && typeof generationId !== 'number') {
+      return null;
+    }
+    return history.find((item) => item.id === String(generationId)) ?? null;
+  };
+
+  const isLearningEventActionable = (event: LearningEvent): boolean => {
+    const metadata = event.metadata ?? {};
+    if (event.kind === 'feedback_session' || event.kind === 'few_shot_example') {
+      return Boolean(findHistoryItemByGenerationId(metadata.generation_id ?? metadata.source_generation_id));
+    }
+    if (event.kind === 'user_template' || event.kind === 'draft_memory') {
+      return isObjectRecord(metadata.target_json);
+    }
+    if (event.kind === 'dataset_item') {
+      return (
+        Boolean(findHistoryItemByGenerationId(metadata.source_generation_id)) ||
+        (isObjectRecord(metadata.target_payload) &&
+          (isObjectRecord(metadata.target_payload.target_json) || Object.keys(metadata.target_payload).length > 0))
+      );
+    }
+    if (event.kind === 'global_pattern') {
+      return typeof metadata.target_field === 'string' && metadata.target_field.length > 0;
+    }
+    return false;
+  };
+
+  const loadSchemaFromEvent = (payload: unknown, message: string) => {
+    if (!isObjectRecord(payload)) {
+      return false;
+    }
+    setSchema(JSON.stringify(payload, null, 2));
+    setActiveView('generator');
+    setSaveMessage(message);
+    return true;
+  };
+
+  const onOpenLearningEvent = (event: LearningEvent) => {
+    const metadata = event.metadata ?? {};
+
+    const linkedHistoryItem = findHistoryItemByGenerationId(metadata.generation_id ?? metadata.source_generation_id);
+    if (linkedHistoryItem) {
+      restoreHistoryItem(linkedHistoryItem);
+      setSaveMessage(`Открыта связанная генерация: ${linkedHistoryItem.fileName}.`);
+      return;
+    }
+
+    if (event.kind === 'user_template' || event.kind === 'draft_memory') {
+      if (
+        loadSchemaFromEvent(
+          metadata.target_json,
+          event.kind === 'user_template' ? 'Шаблон загружен в Target JSON.' : 'Сохранённый draft JSON загружен в Target JSON.'
+        )
+      ) {
+        return;
+      }
+    }
+
+    if (event.kind === 'dataset_item' && isObjectRecord(metadata.target_payload)) {
+      const payload = isObjectRecord(metadata.target_payload.target_json) ? metadata.target_payload.target_json : metadata.target_payload;
+      if (loadSchemaFromEvent(payload, 'Связанный dataset item загружен в Target JSON.')) {
+        return;
+      }
+    }
+
+    if (event.kind === 'global_pattern') {
+      const targetField = typeof metadata.target_field === 'string' ? metadata.target_field : '';
+      const sourceField = typeof metadata.source_field === 'string' ? metadata.source_field : '';
+      setActiveView('generator');
+      setSaveMessage(`Глобальный паттерн: ${sourceField || 'source'} -> ${targetField || 'target'}.`);
+      const mappingIndex = result.mappings.findIndex((mapping) => mapping.target === targetField);
+      if (mappingIndex >= 0) {
+        window.setTimeout(() => {
+          scrollToReviewTarget(`mapping-review-${mappingIndex}`);
+        }, 120);
+      }
+    }
   };
 
   useEffect(() => {
@@ -566,14 +1056,21 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       }
 
       try {
-        const nextSummary = await fetchLearningSummary(profile.id);
+        const [nextSummary, nextEvents] = await Promise.all([
+          fetchLearningSummary(profile.id),
+          fetchLearningEvents(profile.id, 18),
+        ]);
         if (!cancelled) {
           setLearningSummary(nextSummary);
           setLearningSummaryError('');
+          setLearningEvents(nextEvents);
+          setLearningEventsError('');
         }
       } catch (error) {
         if (!cancelled) {
-          setLearningSummaryError(error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.');
+          const message = error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.';
+          setLearningSummaryError(message);
+          setLearningEventsError(message);
         }
       }
     }
@@ -636,6 +1133,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setSaveMessage('');
     setCorrectionBaseline(null);
     setCorrectionSaveError('');
+    setDraftSuggestions([]);
+    setMappingReviewNotes({});
+    setDraftReviewNotes({});
+    setDraftJsonNotice('');
+    setDraftJsonError('');
+    setDraftJsonSaved(false);
+    setLearningReviewNotice('');
+    setLearningReviewError('');
+    setGenerationConfirmed(false);
   };
 
   const onFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -682,6 +1188,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
 
     setBusy(true);
+    setDraftSuggestions([]);
+    setMappingReviewNotes({});
+    setDraftReviewNotes({});
+    setDraftJsonNotice('');
+    setDraftJsonError('');
+    setDraftJsonSaved(false);
+    setLearningReviewNotice('');
+    setLearningReviewError('');
+    setGenerationConfirmed(false);
     try {
       const generated = await generateFromBackend({
         file: selectedFile,
@@ -730,6 +1245,242 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
   };
 
+  const onGenerateDraftJson = async () => {
+    if (!selectedFile) {
+      setDraftJsonError('Сначала загрузите файл.');
+      return;
+    }
+
+    setDraftJsonBusy(true);
+    setDraftJsonError('');
+    setDraftJsonNotice('');
+
+    try {
+      const generated = await generateDraftJsonFromBackend({
+        file: selectedFile,
+        userId: profile.skipped ? undefined : profile.id,
+        selectedSheet:
+          parsedFile?.extension === 'xlsx' || parsedFile?.extension === 'xls'
+            ? currentPreviewSheet?.name
+            : undefined,
+      });
+
+      setParsedFile(generated.parsedFile ?? parsedFile);
+      setDraftSuggestions(cloneDraftSuggestions(generated.fieldSuggestions));
+      setDraftReviewNotes({});
+      setSchema(JSON.stringify(generated.draftJson, null, 2));
+      setDraftJsonNotice('Draft JSON построен. Проверьте названия полей и при необходимости сохраните их в память.');
+      setDraftJsonError('');
+      setDraftJsonSaved(false);
+    } catch (error) {
+      setDraftJsonError(error instanceof Error ? error.message : 'Не удалось построить draft JSON.');
+    } finally {
+      setDraftJsonBusy(false);
+    }
+  };
+
+  const onDraftSuggestionChange = (index: number, nextTargetField: string) => {
+    setDraftSuggestions((current) => {
+      const updated: DraftFieldSuggestion[] = current.map((item, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...item,
+              targetField: nextTargetField,
+              status: 'accepted' as const,
+            }
+          : item
+      );
+      setSchema(buildSchemaFromDraftSuggestions(updated));
+      return updated;
+    });
+  };
+
+  const onDraftSuggestionDecision = (index: number, nextStatus: 'accepted' | 'rejected') => {
+    setDraftSuggestions((current) => {
+      const updated: DraftFieldSuggestion[] = current.map((item, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...item,
+              status: nextStatus,
+            }
+          : item
+      );
+      setSchema(buildSchemaFromDraftSuggestions(updated.filter((item) => item.status !== 'rejected' && item.targetField.trim())));
+      return updated;
+    });
+  };
+
+  const onSaveDraftJsonLearning = async () => {
+    if (profile.skipped) {
+      setDraftJsonError('Сохранение в память доступно только после входа в аккаунт.');
+      return;
+    }
+
+    const schemaFingerprintId = draftSuggestions[0]?.schemaFingerprintId;
+    if (!schemaFingerprintId) {
+      setDraftJsonError('Сначала постройте draft JSON из файла.');
+      return;
+    }
+
+    if (hasPendingDraftReview) {
+      setDraftJsonError('Сначала разберите все предложенные поля: примите или отклоните каждый вариант.');
+      return;
+    }
+
+    if (hasRejectedDraftWithoutReason) {
+      setDraftJsonError('Для каждого отклонённого поля укажите причину, чтобы сохранить корректный feedback.');
+      return;
+    }
+
+    let draftJson: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(schema) as Record<string, unknown>;
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        throw new Error('Target JSON must be an object.');
+      }
+      draftJson = parsed;
+    } catch {
+      setDraftJsonError('Target JSON сейчас невалиден. Исправьте JSON перед сохранением.');
+      return;
+    }
+
+    setDraftJsonBusy(true);
+    setDraftJsonError('');
+    setDraftJsonNotice('');
+
+    try {
+      const result = await saveDraftJsonFeedback({
+        userId: profile.id,
+        schemaFingerprintId,
+        draftJson,
+        templateName: `${selectedFile?.name?.split('.')?.[0] ?? 'draft'} schema`,
+        saveAsTemplate: true,
+        notes: 'Draft JSON confirmed from frontend workspace.',
+        metadata: {
+          file_name: parsedFile?.fileName ?? null,
+          selected_sheet: currentPreviewSheet?.name ?? null,
+        },
+        feedback: draftSuggestions.map((suggestion, index) => {
+          const nextStatus = suggestion.status ?? 'accepted';
+          const correctedField = nextStatus === 'accepted' ? suggestion.targetField.trim() || null : null;
+          const rationale = nextStatus === 'rejected' ? draftReviewNotes[`draft-${index}`]?.trim() || 'Rejected in frontend workspace review.' : null;
+          return {
+            suggestionId: suggestion.suggestionId ?? null,
+            sourceColumn: suggestion.sourceColumn,
+            suggestedField: suggestion.targetField,
+            status: nextStatus,
+            correctedField,
+            confidenceAfter: nextStatus === 'accepted' ? 1 : 0,
+            rationale,
+          };
+        }),
+      });
+      setSchema(JSON.stringify(result.draftJson, null, 2));
+      setDraftSuggestions((current) =>
+        current.map((item) => ({
+          ...item,
+          status: item.status ?? 'accepted',
+        }))
+      );
+      setDraftJsonSaved(true);
+      setDraftJsonNotice(`Draft JSON сохранён. Шаблон "${result.templateName}" добавлен в память.`);
+      await refreshLearningSummary();
+    } catch (error) {
+      setDraftJsonError(error instanceof Error ? error.message : 'Не удалось сохранить draft JSON.');
+    } finally {
+      setDraftJsonBusy(false);
+    }
+  };
+
+  const onConfirmGeneration = async () => {
+    if (profile.skipped) {
+      setLearningReviewError('Подтверждение генерации доступно только после входа в аккаунт.');
+      return;
+    }
+
+    const generationId = Number(result.generationId);
+    if (!Number.isFinite(generationId)) {
+      setLearningReviewError('Нет generation id для подтверждения результата.');
+      return;
+    }
+
+    if (hasPendingMappingReview) {
+      setLearningReviewError('Сначала разберите все спорные маппинги: примите их или отклоните.');
+      return;
+    }
+
+    if (hasRejectedMappingWithoutReason) {
+      setLearningReviewError('Для каждого отклонённого маппинга укажите причину перед подтверждением генерации.');
+      return;
+    }
+
+    setLearningReviewBusy(true);
+    setLearningReviewError('');
+    setLearningReviewNotice('');
+
+    try {
+      const feedbackItems = result.mappings
+        .filter((mapping) => mappingNeedsExplicitReview(mapping))
+        .map((mapping, index) => {
+          const nextStatus = mapping.status ?? 'accepted';
+          const hasSource = Boolean(mapping.source && mapping.source !== 'not found');
+          const rationale = nextStatus === 'rejected' ? mappingReviewNotes[`mapping-${index}`]?.trim() || 'Rejected in frontend workspace review.' : null;
+          return {
+            suggestionId: mapping.suggestionId ?? null,
+            targetField: mapping.target,
+            status: nextStatus,
+            sourceField: hasSource ? mapping.source : null,
+            correctedSourceField: nextStatus === 'accepted' && hasSource ? mapping.source : null,
+            correctedTargetField: nextStatus === 'accepted' ? mapping.target : null,
+            confidenceAfter: confidenceToScore(mapping.confidence),
+            rationale,
+            metadata: {
+              source_of_truth: mapping.sourceOfTruth ?? null,
+            },
+          };
+        });
+
+      if (feedbackItems.length > 0) {
+        await sendMappingFeedback({
+          userId: profile.id,
+          generationId,
+          schemaFingerprintId: result.schemaFingerprintId ?? null,
+          notes: 'Generation reviewed and confirmed in frontend workspace.',
+          metadata: {
+            file_name: parsedFile?.fileName ?? null,
+            selected_sheet: currentPreviewSheet?.name ?? null,
+          },
+          feedback: feedbackItems,
+        });
+      }
+
+      const confirmation = await confirmGenerationLearning({
+        userId: profile.id,
+        generationId,
+        notes: 'Generation confirmed in frontend workspace.',
+      });
+      setGenerationConfirmed(true);
+      setResult((current) => ({
+        ...current,
+        mappings: current.mappings.map((mapping) => ({
+          ...mapping,
+          status: mapping.status ?? (mapping.source && mapping.source !== 'not found' ? 'accepted' : mapping.status),
+        })),
+      }));
+      setLearningReviewNotice(
+        confirmation.alreadyPromoted
+          ? 'Генерация уже была подтверждена раньше.'
+          : 'Генерация подтверждена и добавлена в обучающую память.'
+      );
+      await refreshLearningSummary();
+      await onSaveHistory();
+    } catch (error) {
+      setLearningReviewError(error instanceof Error ? error.message : 'Не удалось подтвердить генерацию.');
+    } finally {
+      setLearningReviewBusy(false);
+    }
+  };
+
   const onMappingTargetChange = (mappingIndex: number, nextTarget: string) => {
     setResult((current) => ({
       ...current,
@@ -740,10 +1491,91 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               target: nextTarget,
               confidence: 'high',
               reason: 'Manual override from frontend workspace',
+              status: 'accepted',
             }
           : mapping
       ),
     }));
+  };
+
+  const onMappingSourceChange = (mappingIndex: number, nextSource: string) => {
+    setResult((current) => ({
+      ...current,
+      mappings: current.mappings.map((mapping, index) =>
+        index === mappingIndex
+          ? {
+              ...mapping,
+              source: nextSource || 'not found',
+              confidence: nextSource ? 'high' : 'none',
+              reason: nextSource ? 'Manual source override from frontend workspace' : 'Source removed in frontend workspace',
+              status: nextSource ? 'accepted' : 'rejected',
+            }
+          : mapping
+      ),
+    }));
+  };
+
+  const onMappingDecision = (mappingIndex: number, nextStatus: 'accepted' | 'rejected') => {
+    setResult((current) => ({
+      ...current,
+      mappings: current.mappings.map((mapping, index) =>
+        index === mappingIndex
+          ? {
+              ...mapping,
+              status: nextStatus,
+              confidence: nextStatus === 'accepted' ? 'high' : mapping.confidence,
+              reason:
+                nextStatus === 'accepted'
+                  ? mapping.reason ?? 'Confirmed in frontend workspace'
+                  : 'Rejected in frontend workspace',
+            }
+          : mapping
+      ),
+    }));
+  };
+
+  const onMappingReviewNoteChange = (mappingIndex: number, note: string) => {
+    setMappingReviewNotes((current) => ({
+      ...current,
+      [`mapping-${mappingIndex}`]: note,
+    }));
+  };
+
+  const onDraftReviewNoteChange = (draftIndex: number, note: string) => {
+    setDraftReviewNotes((current) => ({
+      ...current,
+      [`draft-${draftIndex}`]: note,
+    }));
+  };
+
+  const scrollToReviewTarget = (targetId: string) => {
+    if (reviewFocusTimerRef.current !== null) {
+      window.clearTimeout(reviewFocusTimerRef.current);
+    }
+
+    setReviewFocusTarget(targetId);
+
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(targetId);
+      if (!target) {
+        return;
+      }
+
+      target.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+
+      window.setTimeout(() => {
+        const focusable = target.querySelector('input, select, button, textarea') as HTMLElement | null;
+        focusable?.focus({ preventScroll: true });
+      }, 220);
+    });
+
+    reviewFocusTimerRef.current = window.setTimeout(() => {
+      setReviewFocusTarget((current) => (current === targetId ? null : current));
+      reviewFocusTimerRef.current = null;
+    }, 2200);
   };
 
   const onDownload = async () => {
@@ -974,6 +1806,17 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                 <textarea className="editor-area" onChange={(event) => setSchema(event.target.value)} value={schema} />
               </div>
 
+              <div className="generator-action-row">
+                <button className="secondary-btn" disabled={draftJsonBusy || busy || !selectedFile} onClick={onGenerateDraftJson} type="button">
+                  <Sparkles size={16} /> {draftJsonBusy ? 'Строим draft JSON...' : 'Draft JSON по таблице'}
+                </button>
+                {!profile.skipped && draftSuggestions.length > 0 && (
+                  <button className="secondary-btn" disabled={draftJsonBusy || hasPendingDraftReview || hasRejectedDraftWithoutReason} onClick={onSaveDraftJsonLearning} type="button">
+                    <ShieldCheck size={16} /> {draftJsonBusy ? 'Сохраняем...' : 'Сохранить draft JSON'}
+                  </button>
+                )}
+              </div>
+
               <button className="primary-btn" disabled={busy} onClick={onGenerate} type="button">
                 <WandSparkles size={16} /> {busy ? 'Генерируем...' : 'Сгенерировать'}
               </button>
@@ -1110,34 +1953,229 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
                 <section className="insight-card">
                   <div className="pane-header">
+                    <Eye size={16} /> Ожидают проверки
+                  </div>
+                  <div className="review-queue-grid">
+                    <div className="review-queue-stat">
+                      <strong>{pendingReviewTotal}</strong>
+                      <span>всего на проверке</span>
+                    </div>
+                    <div className="review-queue-stat">
+                      <strong>{pendingMappingReviewItems.length}</strong>
+                      <span>mapping suggestions</span>
+                    </div>
+                    <div className="review-queue-stat">
+                      <strong>{pendingDraftReviewItems.length}</strong>
+                      <span>draft JSON suggestions</span>
+                    </div>
+                  </div>
+                  {pendingReviewTotal > 0 ? (
+                    <div className="review-queue-list">
+                      {pendingMappingReviewItems.map((item) => (
+                        <button className="review-queue-item review-queue-item-button" key={item.id} onClick={() => scrollToReviewTarget(item.scrollTargetId)} type="button">
+                          <strong>{item.title}</strong>
+                          <span>{item.description}</span>
+                        </button>
+                      ))}
+                      {pendingDraftReviewItems.map((item) => (
+                        <button className="review-queue-item review-queue-item-button" key={item.id} onClick={() => scrollToReviewTarget(item.scrollTargetId)} type="button">
+                          <strong>{item.title}</strong>
+                          <span>{item.description}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty-card compact">Сейчас всё разобрано. Можно сохранять draft JSON и подтверждать генерацию.</div>
+                  )}
+                  <p className="subtle-text mapping-editor-note">
+                    Пока здесь есть элементы, сохранение draft JSON и подтверждение генерации будут ждать вашего решения.
+                  </p>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
                     <SquarePen size={16} /> Mapping overrides
                   </div>
                   <div className="mapping-editor-list">
                     {result.mappings.length === 0 && <div className="empty-card compact">После генерации здесь появятся найденные соответствия.</div>}
                     {result.mappings.map((mapping, index) => (
-                      <div className="mapping-editor-row" key={`${mapping.source}-${mapping.target}-${index}`}>
-                        <div className="mapping-editor-source">
-                          <span>Source</span>
-                          <strong>{mapping.source}</strong>
+                      <div
+                        className={reviewFocusTarget === `mapping-review-${index}` ? 'mapping-editor-row review-target-focus' : 'mapping-editor-row'}
+                        id={`mapping-review-${index}`}
+                        key={`${mapping.source}-${mapping.target}-${index}`}
+                      >
+                        <div className="mapping-editor-meta">
+                          <span className={`mapping-status-chip mapping-status-${mapping.status ?? 'suggested'}`}>{mappingStatusLabel(mapping)}</span>
+                          <span className="mapping-source-chip">{mappingSourceLabel(mapping)}</span>
+                          <span className={`mapping-stage-chip mapping-stage-${mappingStageState(mapping, generationConfirmed)}`}>
+                            {stageStateLabel(mappingStageState(mapping, generationConfirmed))}
+                          </span>
+                          {mapping.reason && <span className="mapping-reason-chip">{mapping.reason}</span>}
                         </div>
-                        <select
-                          className="mapping-editor-select"
-                          disabled={mappingTargetOptions.length === 0}
-                          onChange={(event) => onMappingTargetChange(index, event.target.value)}
-                          value={mapping.target}
-                        >
-                          {mappingTargetOptions.length === 0 && <option value={mapping.target}>{mapping.target}</option>}
-                          {mappingTargetOptions.map((targetField) => (
-                            <option key={targetField} value={targetField}>
-                              {targetField}
-                            </option>
-                          ))}
-                        </select>
+                        <div className="mapping-editor-grid">
+                          <div className="mapping-editor-source">
+                            <span>Source</span>
+                            <select
+                              className="mapping-editor-select"
+                              onChange={(event) => onMappingSourceChange(index, event.target.value)}
+                              value={mapping.source === 'not found' ? '' : mapping.source}
+                            >
+                              <option value="">Не найдено</option>
+                              {mappingSourceOptions.map((sourceField) => (
+                                <option key={sourceField} value={sourceField}>
+                                  {sourceField}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="mapping-editor-source">
+                            <span>Target</span>
+                            <select
+                              className="mapping-editor-select"
+                              disabled={mappingTargetOptions.length === 0}
+                              onChange={(event) => onMappingTargetChange(index, event.target.value)}
+                              value={mapping.target}
+                            >
+                              {mappingTargetOptions.length === 0 && <option value={mapping.target}>{mapping.target}</option>}
+                              {mappingTargetOptions.map((targetField) => (
+                                <option key={targetField} value={targetField}>
+                                  {targetField}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        {mappingNeedsExplicitReview(mapping) && (
+                          <>
+                            <div className="mapping-decision-row">
+                              <button
+                                className={mapping.status === 'accepted' ? 'decision-chip active accepted' : 'decision-chip'}
+                                onClick={() => onMappingDecision(index, 'accepted')}
+                                type="button"
+                              >
+                                Принять
+                              </button>
+                              <button
+                                className={mapping.status === 'rejected' ? 'decision-chip active rejected' : 'decision-chip'}
+                                onClick={() => onMappingDecision(index, 'rejected')}
+                                type="button"
+                              >
+                                Отклонить
+                              </button>
+                            </div>
+                            {mapping.status === 'rejected' && (
+                              <label className="review-note-field">
+                                <span>Причина отклонения</span>
+                                <textarea
+                                  className="review-note-textarea"
+                                  onChange={(event) => onMappingReviewNoteChange(index, event.target.value)}
+                                  placeholder="Например: колонка означает другое поле, это не customerName."
+                                  value={mappingReviewNotes[`mapping-${index}`] ?? ''}
+                                />
+                              </label>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  {!profile.skipped && result.generationId && (
+                    <div className="learning-review-actions">
+                      <button
+                        className="primary-btn"
+                        disabled={learningReviewBusy || generationConfirmed || hasPendingMappingReview || hasRejectedMappingWithoutReason || (!hasReviewableMappings && result.mappings.length === 0)}
+                        onClick={onConfirmGeneration}
+                        type="button"
+                      >
+                        <ShieldCheck size={16} />
+                        {learningReviewBusy ? 'Подтверждаем...' : generationConfirmed ? 'Генерация подтверждена' : 'Подтвердить генерацию'}
+                      </button>
+                    </div>
+                  )}
+                  <p className="subtle-text mapping-editor-note">
+                    {hasReviewableMappings
+                      ? hasRejectedMappingWithoutReason
+                        ? 'Для всех отклонённых маппингов укажите причину. После этого генерацию можно будет подтвердить.'
+                        : 'Проверьте спорные соответствия и подтвердите генерацию, чтобы добавить результат в обучающую память.'
+                      : 'Изменения сохраняются как рабочие правки. Подтверждение закрепит результат в обучающей памяти.'}
+                  </p>
+                </section>
+
+                <section className="insight-card">
+                  <div className="pane-header">
+                    <WandSparkles size={16} /> Draft JSON naming
+                  </div>
+                  <div className="mapping-editor-list">
+                    {draftSuggestions.length === 0 && <div className="empty-card compact">После нажатия «Draft JSON по таблице» здесь появятся названия полей для проверки.</div>}
+                    {draftSuggestions.map((suggestion, index) => (
+                      <div
+                        className={reviewFocusTarget === `draft-review-${index}` ? 'mapping-editor-row review-target-focus' : 'mapping-editor-row'}
+                        id={`draft-review-${index}`}
+                        key={`${suggestion.sourceColumn}-${suggestion.targetField}-${index}`}
+                      >
+                        <div className="mapping-editor-meta">
+                          <span className={`mapping-status-chip mapping-status-${suggestion.status ?? 'suggested'}`}>{draftSuggestionStatusLabel(suggestion)}</span>
+                          <span className="mapping-source-chip">{draftSuggestionSourceLabel(suggestion)}</span>
+                          <span className={`mapping-stage-chip mapping-stage-${draftSuggestionStageState(suggestion, draftJsonSaved)}`}>
+                            {stageStateLabel(draftSuggestionStageState(suggestion, draftJsonSaved))}
+                          </span>
+                          {suggestion.reason && <span className="mapping-reason-chip">{suggestion.reason}</span>}
+                        </div>
+                        <div className="mapping-editor-grid">
+                          <div className="mapping-editor-source">
+                            <span>Source column</span>
+                            <strong>{suggestion.sourceColumn}</strong>
+                          </div>
+                          <div className="mapping-editor-source">
+                            <span>JSON field</span>
+                            <input
+                              className="mapping-editor-select"
+                              onChange={(event) => onDraftSuggestionChange(index, event.target.value)}
+                              type="text"
+                              value={suggestion.targetField}
+                            />
+                          </div>
+                        </div>
+                        {draftSuggestionNeedsExplicitReview(suggestion) && (
+                          <>
+                            <div className="mapping-decision-row">
+                              <button
+                                className={suggestion.status === 'accepted' ? 'decision-chip active accepted' : 'decision-chip'}
+                                onClick={() => onDraftSuggestionDecision(index, 'accepted')}
+                                type="button"
+                              >
+                                Принять
+                              </button>
+                              <button
+                                className={suggestion.status === 'rejected' ? 'decision-chip active rejected' : 'decision-chip'}
+                                onClick={() => onDraftSuggestionDecision(index, 'rejected')}
+                                type="button"
+                              >
+                                Отклонить
+                              </button>
+                            </div>
+                            {suggestion.status === 'rejected' && (
+                              <label className="review-note-field">
+                                <span>Причина отклонения</span>
+                                <textarea
+                                  className="review-note-textarea"
+                                  onChange={(event) => onDraftReviewNoteChange(index, event.target.value)}
+                                  placeholder="Например: такое имя поля не подходит по смыслу для этой колонки."
+                                  value={draftReviewNotes[`draft-${index}`] ?? ''}
+                                />
+                              </label>
+                            )}
+                          </>
+                        )}
                       </div>
                     ))}
                   </div>
                   <p className="subtle-text mapping-editor-note">
-                    Изменения сохраняются на сервере автоматически. Чтобы пересчитать preview и код по новой схеме, нажмите «Сгенерировать».
+                    {hasPendingDraftReview
+                      ? 'Разберите все предложенные названия. Отклонённые варианты не попадут в память и шаблоны.'
+                      : hasRejectedDraftWithoutReason
+                        ? 'Для всех отклонённых названий укажите причину. Без неё feedback не сохранится.'
+                        : 'Подтверждённые названия попадут в персональную память и шаблоны.'}
                   </p>
                 </section>
 
@@ -1157,24 +2195,42 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
                 <section className="insight-card">
                   <div className="pane-header">
-                    <Sparkles size={16} /> Server learning
+                    <Sparkles size={16} /> Состояние знаний
                   </div>
-                  <div className="profile-fun-grid">
-                    <div className="empty-card compact">
-                      <strong>{learningSummary?.uploads ?? 0}</strong>
-                      <span>uploads</span>
+                  <div className="knowledge-state-grid">
+                    <div className="knowledge-state-card">
+                      <strong>{currentKnowledgeSummary.staging}</strong>
+                      <span>в staging сейчас</span>
+                      <small>текущая генерация и draft JSON</small>
                     </div>
-                    <div className="empty-card compact">
-                      <strong>{learningSummary?.mappingMemory ?? 0}</strong>
-                      <span>mapping memory</span>
+                    <div className="knowledge-state-card">
+                      <strong>{learningPipelineStats.memory}</strong>
+                      <span>в персональной памяти</span>
+                      <small>mapping memory, шаблоны и few-shot</small>
                     </div>
-                    <div className="empty-card compact">
-                      <strong>{learningSummary?.correctionSessions ?? 0}</strong>
-                      <span>sessions</span>
+                    <div className="knowledge-state-card">
+                      <strong>{learningPipelineStats.globalPatterns}</strong>
+                      <span>глобальные паттерны</span>
+                      <small>устойчивые совпадения между пользователями</small>
                     </div>
-                    <div className="empty-card compact">
-                      <strong>{learningSummary?.userCorrections ?? 0}</strong>
-                      <span>corrections</span>
+                    <div className="knowledge-state-card">
+                      <strong>{learningPipelineStats.dataset}</strong>
+                      <span>в curated dataset</span>
+                      <small>готово для обучения локальной модели</small>
+                    </div>
+                  </div>
+                  <div className="knowledge-breakdown">
+                    <div className="knowledge-breakdown-row">
+                      <span>Текущий запуск</span>
+                      <strong>
+                        staging {currentKnowledgeSummary.staging} · память {currentKnowledgeSummary.memory} · паттерны {currentKnowledgeSummary.globalPatterns} · авто {currentKnowledgeSummary.system}
+                      </strong>
+                    </div>
+                    <div className="knowledge-breakdown-row">
+                      <span>Серверный staging</span>
+                      <strong>
+                        {learningSummary?.mappingSuggestions ?? 0} mapping · {learningSummary?.draftJsonSuggestions ?? 0} draft JSON
+                      </strong>
                     </div>
                   </div>
                   {learningSummaryError && <div className="warning-item auth-status auth-status-error">{learningSummaryError}</div>}
@@ -1320,6 +2376,76 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </button>
                     ))}
                   </div>
+                </section>
+
+                <section className="insight-card profile-history-card">
+                  <div className="pane-header">
+                    <Sparkles size={16} /> События обучения
+                  </div>
+                  <div className="event-search-wrap">
+                    <Search size={16} />
+                    <input
+                      onChange={(event) => setLearningEventSearch(event.target.value)}
+                      placeholder="Поиск по событиям обучения"
+                      type="text"
+                      value={learningEventSearch}
+                    />
+                  </div>
+                  <div className="event-filter-row">
+                    {(['all', 'staging', 'memory', 'global_pattern', 'dataset'] as LearningEventFilter[]).map((filter) => (
+                      <button
+                        className={learningEventFilter === filter ? 'event-filter-btn active' : 'event-filter-btn'}
+                        key={filter}
+                        onClick={() => setLearningEventFilter(filter)}
+                        type="button"
+                      >
+                        <span>{learningEventFilterLabel(filter)}</span>
+                        <strong>{learningEventCounts[filter]}</strong>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="profile-list">
+                    {learningEvents.length === 0 && <div className="empty-card compact">Пока нет событий обучения. Они появятся после подтверждений, сохранений в память и попадания кейсов в dataset.</div>}
+                    {learningEvents.length > 0 && filteredLearningEvents.length === 0 && (
+                      <div className="empty-card compact">
+                        {learningEventSearch.trim()
+                          ? `По запросу «${learningEventSearch.trim()}» ничего не найдено.`
+                          : `Для фильтра «${learningEventFilterLabel(learningEventFilter)}» пока нет событий.`}
+                      </div>
+                    )}
+                    {filteredLearningEvents.map((event) =>
+                      isLearningEventActionable(event) ? (
+                        <button
+                          className="profile-list-item profile-list-item-button knowledge-event-item knowledge-event-item-button"
+                          key={event.id}
+                          onClick={() => onOpenLearningEvent(event)}
+                          type="button"
+                        >
+                          <div className="knowledge-event-main">
+                            <div className="knowledge-event-top">
+                              <strong>{event.title}</strong>
+                              <span className={`knowledge-event-stage knowledge-event-stage-${event.stage}`}>{learningEventStageLabel(event.stage)}</span>
+                            </div>
+                            <span>{event.description}</span>
+                            {learningEventActionLabel(event) && <span className="knowledge-event-action">{learningEventActionLabel(event)}</span>}
+                          </div>
+                          <small>{new Date(event.createdAt).toLocaleString()}</small>
+                        </button>
+                      ) : (
+                        <div className="profile-list-item knowledge-event-item" key={event.id}>
+                          <div className="knowledge-event-main">
+                            <div className="knowledge-event-top">
+                              <strong>{event.title}</strong>
+                              <span className={`knowledge-event-stage knowledge-event-stage-${event.stage}`}>{learningEventStageLabel(event.stage)}</span>
+                            </div>
+                            <span>{event.description}</span>
+                          </div>
+                          <small>{new Date(event.createdAt).toLocaleString()}</small>
+                        </div>
+                      )
+                    )}
+                  </div>
+                  {learningEventsError && <div className="warning-item auth-status auth-status-error">{learningEventsError}</div>}
                 </section>
               </div>
             </>

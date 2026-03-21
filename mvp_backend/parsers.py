@@ -4,15 +4,21 @@ import csv
 import json
 import logging
 import sys
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
 from models import ParsedFile, ParsedSheet, TargetField
 
 try:
-    import pandas as pd
+    from openpyxl import load_workbook
 except ImportError:  # pragma: no cover - optional dependency for Excel support
-    pd = None
+    load_workbook = None
+
+try:
+    import xlrd
+except ImportError:  # pragma: no cover - optional dependency for legacy XLS support
+    xlrd = None
 
 PARSER_DIR = Path(__file__).resolve().parent / 'parser'
 if str(PARSER_DIR) not in sys.path:
@@ -119,54 +125,167 @@ def _parse_csv(file_path: Path) -> tuple[list[str], list[dict[str, Any]]]:
 
 
 def _parse_excel(file_path: Path) -> tuple[list[str], list[dict[str, Any]], list[str], list[ParsedSheet]]:
-    if pd is None:
-        raise ParseError('Excel parsing is disabled in this build. Upload CSV, DOCX, or text PDF instead.')
-
     warnings: list[str] = []
-    engine = 'openpyxl' if file_path.suffix.lower() == '.xlsx' else 'xlrd'
+    suffix = file_path.suffix.lower()
+
     try:
-        with pd.ExcelFile(file_path, engine=engine) as excel:
-            combined_columns: list[str] = []
-            combined_rows: list[dict[str, Any]] = []
-            non_empty_sheets: list[str] = []
-            sheets: list[ParsedSheet] = []
-
-            for sheet_name in excel.sheet_names:
-                df = pd.read_excel(excel, sheet_name=sheet_name, engine=engine)
-                df = df.where(pd.notnull(df), None)
-                raw_columns = df.columns.tolist()
-                if any(
-                    column is None
-                    or not isinstance(column, str)
-                    or (isinstance(column, str) and (column.strip() == '' or column.startswith('Unnamed:')))
-                    for column in raw_columns
-                ):
-                    warnings.append(
-                        f'Sheet "{sheet_name}": Excel first row is treated as column headers. Some headers are empty or non-text, so the first row may contain data instead of column names.'
-                    )
-
-                columns = [str(column) for column in raw_columns]
-                df.columns = columns
-                rows = [{str(key): value for key, value in row.items()} for row in df.to_dict(orient='records')]
-
-                if not columns and not rows:
-                    continue
-
-                non_empty_sheets.append(sheet_name)
-                sheets.append(ParsedSheet(name=sheet_name, columns=columns, rows=rows[:PREVIEW_ROW_LIMIT]))
-                for column in columns:
-                    if column not in combined_columns:
-                        combined_columns.append(column)
-                combined_rows.extend(rows)
-
-            if len(non_empty_sheets) > 1:
-                warnings.append(f'Merged {len(non_empty_sheets)} sheets: {", ".join(non_empty_sheets)}')
-            elif len(excel.sheet_names) > 1 and len(non_empty_sheets) == 1:
-                warnings.append(f'Workbook has multiple sheets. Used the only non-empty sheet: {non_empty_sheets[0]}')
-
-            return combined_columns, combined_rows[:PREVIEW_ROW_LIMIT], warnings, sheets
+        if suffix == '.xlsx':
+            return _parse_xlsx(file_path, warnings)
+        if suffix == '.xls':
+            return _parse_xls(file_path, warnings)
     except Exception as exc:  # noqa: BLE001
         raise ParseError(f'Failed to parse Excel: {exc}') from exc
+
+    raise ParseError(f'Unsupported Excel file type: {suffix}')
+
+
+def _parse_xlsx(file_path: Path, warnings: list[str]) -> tuple[list[str], list[dict[str, Any]], list[str], list[ParsedSheet]]:
+    if load_workbook is None:
+        raise ParseError('XLSX parsing is disabled in this build. Rebuild backend with openpyxl support.')
+
+    workbook = load_workbook(filename=file_path, read_only=True, data_only=True)
+    try:
+        return _collect_excel_sheets(
+            sheet_names=list(workbook.sheetnames),
+            iter_sheet_rows=lambda sheet_name: workbook[sheet_name].iter_rows(values_only=True),
+            warnings=warnings,
+        )
+    finally:
+        workbook.close()
+
+
+def _parse_xls(file_path: Path, warnings: list[str]) -> tuple[list[str], list[dict[str, Any]], list[str], list[ParsedSheet]]:
+    if xlrd is None:
+        raise ParseError('XLS parsing is disabled in this build. Rebuild backend with xlrd support or convert the file to XLSX.')
+
+    workbook = xlrd.open_workbook(file_path)
+    return _collect_excel_sheets(
+        sheet_names=list(workbook.sheet_names()),
+        iter_sheet_rows=lambda sheet_name: _iter_xls_sheet_rows(workbook, sheet_name),
+        warnings=warnings,
+    )
+
+
+def _collect_excel_sheets(
+    *,
+    sheet_names: list[str],
+    iter_sheet_rows,
+    warnings: list[str],
+) -> tuple[list[str], list[dict[str, Any]], list[str], list[ParsedSheet]]:
+    combined_columns: list[str] = []
+    combined_rows: list[dict[str, Any]] = []
+    non_empty_sheets: list[str] = []
+    sheets: list[ParsedSheet] = []
+
+    for sheet_name in sheet_names:
+        rows_iter = list(iter_sheet_rows(sheet_name))
+        columns, rows, sheet_warnings = _sheet_rows_to_records(sheet_name, rows_iter)
+        warnings.extend(sheet_warnings)
+
+        if not columns and not rows:
+            continue
+
+        non_empty_sheets.append(sheet_name)
+        sheets.append(ParsedSheet(name=sheet_name, columns=columns, rows=rows[:PREVIEW_ROW_LIMIT]))
+        for column in columns:
+            if column not in combined_columns:
+                combined_columns.append(column)
+        combined_rows.extend(rows)
+
+    if len(non_empty_sheets) > 1:
+        warnings.append(f'Merged {len(non_empty_sheets)} sheets: {", ".join(non_empty_sheets)}')
+    elif len(sheet_names) > 1 and len(non_empty_sheets) == 1:
+        warnings.append(f'Workbook has multiple sheets. Used the only non-empty sheet: {non_empty_sheets[0]}')
+
+    return combined_columns, combined_rows[:PREVIEW_ROW_LIMIT], warnings, sheets
+
+
+def _sheet_rows_to_records(sheet_name: str, rows_iter: list[tuple[Any, ...] | list[Any]]) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    if not rows_iter:
+        return [], [], warnings
+
+    raw_headers = list(rows_iter[0])
+    if not raw_headers:
+        return [], [], warnings
+
+    if any(
+        column is None
+        or not isinstance(column, str)
+        or (isinstance(column, str) and (column.strip() == '' or column.startswith('Unnamed:')))
+        for column in raw_headers
+    ):
+        warnings.append(
+            f'Sheet "{sheet_name}": Excel first row is treated as column headers. Some headers are empty or non-text, so the first row may contain data instead of column names.'
+        )
+
+    columns = [_stringify_excel_header(column, index) for index, column in enumerate(raw_headers, start=1)]
+    rows: list[dict[str, Any]] = []
+
+    for raw_row in rows_iter[1:]:
+        values = list(raw_row)
+        if not any(_has_visible_value(value) for value in values):
+            continue
+        record: dict[str, Any] = {}
+        for index, column in enumerate(columns):
+            value = values[index] if index < len(values) else None
+            record[column] = _coerce_excel_value(value)
+        rows.append(record)
+
+    return columns, rows, warnings
+
+
+def _iter_xls_sheet_rows(workbook: Any, sheet_name: str):
+    sheet = workbook.sheet_by_name(sheet_name)
+    for row_index in range(sheet.nrows):
+        yield tuple(_coerce_xls_cell(workbook, sheet.cell(row_index, col_index)) for col_index in range(sheet.ncols))
+
+
+def _coerce_xls_cell(workbook: Any, cell: Any) -> Any:
+    if xlrd is None:
+        return cell.value
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        return xlrd.xldate.xldate_as_datetime(cell.value, workbook.datemode).isoformat()
+    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
+        return bool(cell.value)
+    if cell.ctype == xlrd.XL_CELL_NUMBER:
+        if float(cell.value).is_integer():
+            return int(cell.value)
+        return float(cell.value)
+    if cell.ctype == xlrd.XL_CELL_EMPTY:
+        return None
+    return cell.value
+
+
+def _stringify_excel_header(value: Any, index: int) -> str:
+    if value is None:
+        return f'Column {index}'
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or f'Column {index}'
+    return str(value)
+
+
+def _coerce_excel_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, time):
+        return value.isoformat()
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _has_visible_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip() == '':
+        return False
+    return True
 
 
 def _parse_document(file_path: Path) -> tuple[list[str], list[dict[str, Any]], list[str]]:

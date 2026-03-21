@@ -62,6 +62,57 @@ The backend container:
 - loads mail variables from `mvp_backend/.env`
 - persists SQLite/runtime data in `mvp_backend/.runtime`
 
+## GigaChat runtime
+
+The project now uses GigaChat API as the only model runtime.
+Set the backend env like this:
+
+```env
+TSGEN_MODEL_PROVIDER=gigachat
+TSGEN_MODEL_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
+TSGEN_MODEL_NAME=GigaChat-2-Max
+TSGEN_GIGACHAT_AUTH_URL=https://ngw.devices.sberbank.ru:9443/api/v2/oauth
+TSGEN_GIGACHAT_AUTH_KEY=<authorization_key_from_gigachat_cabinet>
+TSGEN_GIGACHAT_SCOPE=GIGACHAT_API_PERS
+TSGEN_GIGACHAT_AUTH_SCHEME=Basic
+TSGEN_GIGACHAT_CA_BUNDLE=/app/certs/russian_trusted_root_ca_pem.crt
+TSGEN_GIGACHAT_SSL_VERIFY=true
+TSGEN_MODEL_TIMEOUT_SECONDS=60
+```
+
+Notes:
+
+- the backend now fetches and caches the GigaChat access token automatically
+- if you already have a short-lived access token, you can set `TSGEN_MODEL_API_KEY` and skip OAuth refresh
+- the OAuth token lifetime is 30 minutes according to the official docs
+- the backend sends candidate-ranking prompts to `POST /chat/completions`, not the full schema
+- no local model container is required anymore
+- the backend image now includes the official Russian trusted root CA bundle under `mvp_backend/certs/`
+- if OAuth fails with `CERTIFICATE_VERIFY_FAILED`, rebuild the backend image so the new CA bundle is installed
+- `TSGEN_GIGACHAT_SSL_VERIFY=false` exists only as a debugging escape hatch and should not be used in normal runtime
+
+Run:
+
+```bash
+docker compose up --build
+```
+
+### Training runtime
+
+The training/export lifecycle is handled by the backend and writes artifacts under:
+
+```text
+mvp_backend/.runtime/training/
+```
+
+The backend still supports:
+
+- dataset snapshot export
+- training run records
+- activation of a completed deployment into runtime
+
+The local trainer path was removed. Training should now be integrated through GigaChat-side fine-tuning jobs.
+
 Health check:
 
 ```powershell

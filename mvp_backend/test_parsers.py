@@ -2,37 +2,127 @@ from __future__ import annotations
 
 import shutil
 import sys
+import types
 import unittest
 import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from docx import Document
+try:
+    from docx import Document
+except ImportError:  # pragma: no cover - optional dependency in local env
+    Document = None
+    docx_stub = types.ModuleType('docx')
+
+    class _MissingDocument:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError('python-docx is not installed in the current environment')
+
+    docx_stub.Document = _MissingDocument
+    sys.modules['docx'] = docx_stub
 
 try:
-    import pandas as pd
+    import pdfplumber  # type: ignore  # noqa: F401
 except ImportError:  # pragma: no cover - optional dependency in local env
-    pd = None
+    pdfplumber_stub = types.ModuleType('pdfplumber')
+
+    class _MissingPdfContext:
+        def __enter__(self):
+            raise RuntimeError('pdfplumber is not installed in the current environment')
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    def _missing_pdf_open(*args, **kwargs):
+        return _MissingPdfContext()
+
+    pdfplumber_stub.open = _missing_pdf_open
+    sys.modules['pdfplumber'] = pdfplumber_stub
+
+try:
+    import openpyxl  # type: ignore  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency in local env
+    openpyxl = None
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+try:
+    import pydantic  # type: ignore  # noqa: F401
+except ModuleNotFoundError:
+    pydantic_stub = types.ModuleType('pydantic')
+
+    class _FieldInfo:
+        def __init__(self, default=None, default_factory=None):
+            self.default = default
+            self.default_factory = default_factory
+
+    def Field(default=None, default_factory=None):
+        return _FieldInfo(default=default, default_factory=default_factory)
+
+    class BaseModel:
+        def __init__(self, **data):
+            annotations = {}
+            for cls in reversed(self.__class__.mro()):
+                annotations.update(getattr(cls, '__annotations__', {}))
+            for key in annotations:
+                if key in data:
+                    value = data[key]
+                else:
+                    class_value = getattr(self.__class__, key, None)
+                    if isinstance(class_value, _FieldInfo):
+                        if class_value.default_factory is not None:
+                            value = class_value.default_factory()
+                        else:
+                            value = class_value.default
+                    else:
+                        value = class_value
+                setattr(self, key, value)
+
+        def dict(self):
+            return dict(self.__dict__)
+
+        def model_dump(self):
+            return dict(self.__dict__)
+
+        def copy(self, update=None):
+            payload = dict(self.__dict__)
+            payload.update(update or {})
+            return self.__class__(**payload)
+
+        def model_copy(self, update=None):
+            return self.copy(update=update)
+
+    pydantic_stub.BaseModel = BaseModel
+    pydantic_stub.Field = Field
+    sys.modules['pydantic'] = pydantic_stub
+
 from models import ParsedFile, ParsedSheet
 from parsers import ParseError, parse_file, resolve_generation_source
 
 
-class FakeExcelFile:
-    def __init__(self, sheet_names: list[str]) -> None:
-        self.sheet_names = sheet_names
+class FakeWorksheet:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self._rows = rows
 
-    def __enter__(self) -> 'FakeExcelFile':
-        return self
+    def iter_rows(self, values_only: bool = True):
+        return iter(self._rows)
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+
+class FakeWorkbook:
+    def __init__(self, sheets: dict[str, FakeWorksheet]) -> None:
+        self._sheets = sheets
+        self.sheetnames = list(sheets.keys())
+
+    def __getitem__(self, sheet_name: str) -> FakeWorksheet:
+        return self._sheets[sheet_name]
+
+    def close(self) -> None:
         return None
 
 
+@unittest.skipIf(Document is None, 'python-docx is not installed in the current environment')
 class DocumentParserTests(unittest.TestCase):
     def setUp(self) -> None:
         self.test_root = BACKEND_DIR / '.test_runtime' / 'documents' / str(uuid.uuid4())
@@ -70,13 +160,21 @@ class DocumentParserTests(unittest.TestCase):
         self.assertTrue(any('Документ загружен.' in warning for warning in parsed.warnings))
         self.assertNotIn('No columns detected in the file.', parsed.warnings)
 
-@unittest.skipIf(pd is None, 'pandas is not installed in the current environment')
+@unittest.skipIf(openpyxl is None, 'openpyxl is not installed in the current environment')
 class ExcelParserTests(unittest.TestCase):
     def test_numeric_excel_headers_are_converted_to_strings(self) -> None:
-        dataframe = pd.DataFrame([['zov', 120, 'sddf']], columns=[1223, 'hsdh', 'sdvsdv'])
-        fake_excel = FakeExcelFile(['Sheet1'])
+        fake_workbook = FakeWorkbook(
+            {
+                'Sheet1': FakeWorksheet(
+                    [
+                        (1223, 'hsdh', 'sdvsdv'),
+                        ('zov', 120, 'sddf'),
+                    ]
+                )
+            }
+        )
 
-        with patch('parsers.pd.ExcelFile', return_value=fake_excel), patch('parsers.pd.read_excel', return_value=dataframe):
+        with patch('parsers.load_workbook', return_value=fake_workbook):
             path = Path('numeric_headers.xlsx')
             parsed = parse_file(path, path.name)
 
@@ -90,11 +188,24 @@ class ExcelParserTests(unittest.TestCase):
         )
 
     def test_multiple_excel_sheets_are_merged(self) -> None:
-        fake_excel = FakeExcelFile(['Jan', 'Feb'])
-        jan = pd.DataFrame([['alice', 10]], columns=['customerName', 'amount'])
-        feb = pd.DataFrame([['bob', 20]], columns=['customerName', 'amount'])
+        fake_workbook = FakeWorkbook(
+            {
+                'Jan': FakeWorksheet(
+                    [
+                        ('customerName', 'amount'),
+                        ('alice', 10),
+                    ]
+                ),
+                'Feb': FakeWorksheet(
+                    [
+                        ('customerName', 'amount'),
+                        ('bob', 20),
+                    ]
+                ),
+            }
+        )
 
-        with patch('parsers.pd.ExcelFile', return_value=fake_excel), patch('parsers.pd.read_excel', side_effect=[jan, feb]):
+        with patch('parsers.load_workbook', return_value=fake_workbook):
             path = Path('multi_sheet.xlsx')
             parsed = parse_file(path, path.name)
 
