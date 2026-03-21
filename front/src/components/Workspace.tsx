@@ -13,6 +13,7 @@ import {
   LockKeyhole,
   LogOut,
   Search,
+  RotateCcw,
   ShieldCheck,
   Sparkles,
   SquarePen,
@@ -125,6 +126,164 @@ function buildPreviewSheet(name: string, columns: string[], rows: Record<string,
   };
 }
 
+function formatPreviewCellValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? '')).filter(Boolean).join(' | ');
+  }
+  if (value === null || value === undefined) {
+    return '';
+  }
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function isGenericFormGroupId(groupId: string): boolean {
+  const normalized = groupId.trim().toLowerCase();
+  return !normalized || normalized === 'group' || normalized === 'unknown' || normalized.startsWith('group_');
+}
+
+function isUsefulFormPreviewPair(label: string, value: unknown): boolean {
+  const normalizedLabel = label.trim().replace(/\s+/g, ' ');
+  if (!normalizedLabel || value === null || value === undefined) {
+    return false;
+  }
+  if (normalizedLabel.startsWith('•') || normalizedLabel.startsWith('-') || normalizedLabel.startsWith('*')) {
+    return false;
+  }
+  if (isGenericFormGroupId(normalizedLabel)) {
+    return false;
+  }
+
+  const valueText = formatPreviewCellValue(value).trim().replace(/\s+/g, ' ');
+  if (!valueText) {
+    return false;
+  }
+
+  const labelLetters = normalizedLabel.replace(/[^A-Za-zА-Яа-яЁё]/g, '');
+  const valueLetters = valueText.replace(/[^A-Za-zА-Яа-яЁё]/g, '');
+  if (
+    labelLetters.length >= 16 &&
+    valueLetters.length >= 8 &&
+    labelLetters === labelLetters.toUpperCase() &&
+    valueLetters === valueLetters.toUpperCase()
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildFormPreviewRowsFromParsedRows(parsedFile: ParsedFileInfo): Record<string, unknown>[] {
+  if (parsedFile.columns.length < 2 || parsedFile.rows.length === 0) {
+    return [];
+  }
+
+  const [labelColumn, valueColumn] = parsedFile.columns;
+  return parsedFile.rows.flatMap((row) => {
+    const label = String(row[labelColumn] ?? '').trim();
+    const value = row[valueColumn];
+    if (!isUsefulFormPreviewPair(label, value)) {
+      return [];
+    }
+    return [
+      {
+        field: label,
+        value: formatPreviewCellValue(value),
+        source: 'pair',
+      },
+    ];
+  });
+}
+
+function buildFormPreviewSheet(parsedFile: ParsedFileInfo): ParsedSheetInfo | null {
+  const formModel = parsedFile.formModel;
+  if (!formModel) {
+    return null;
+  }
+
+  const rows: Record<string, unknown>[] = buildFormPreviewRowsFromParsedRows(parsedFile);
+  const seenEntries = new Set<string>();
+
+  rows.forEach((row) => {
+    if (typeof row.field === 'string') {
+      seenEntries.add(`pair:${row.field}`);
+    }
+  });
+
+  if (rows.length === 0) {
+    formModel.scalars.forEach((scalar) => {
+      if (!isObjectRecord(scalar)) {
+        return;
+      }
+
+      const label = typeof scalar.label === 'string' ? scalar.label.trim() : '';
+      const value = scalar.value;
+      if (!isUsefulFormPreviewPair(label, value)) {
+        return;
+      }
+
+      const key = `scalar:${label}`;
+      if (seenEntries.has(key) || seenEntries.has(`pair:${label}`)) {
+        return;
+      }
+      seenEntries.add(key);
+      rows.push({
+        field: label,
+        value: formatPreviewCellValue(value),
+        source: 'scalar',
+      });
+    });
+  }
+
+  formModel.groups.forEach((group) => {
+    if (!isObjectRecord(group)) {
+      return;
+    }
+
+    const groupId = typeof group.group_id === 'string' ? group.group_id.trim() : '';
+    const question = typeof group.question === 'string' ? group.question.trim() : '';
+    const options = Array.isArray(group.options) ? group.options : [];
+    const selectedLabels = options
+      .filter((option): option is Record<string, unknown> => isObjectRecord(option))
+      .flatMap((option) => {
+        const label = typeof option.label === 'string' ? option.label.trim() : '';
+        return option.selected === true && label ? [label] : [];
+      });
+
+    if (selectedLabels.length === 0) {
+      return;
+    }
+
+    const label = groupId && !isGenericFormGroupId(groupId) ? groupId : question;
+    if (!label || !isUsefulFormPreviewPair(label, selectedLabels.join(' | '))) {
+      return;
+    }
+
+    const key = `group:${label}`;
+    if (seenEntries.has(key) || seenEntries.has(`pair:${label}`)) {
+      return;
+    }
+    seenEntries.add(key);
+    rows.push({
+      field: label,
+      value: selectedLabels.join(' | '),
+      source: 'group',
+    });
+  });
+
+  if (rows.length === 0) {
+    return null;
+  }
+
+  return buildPreviewSheet('Form extraction', ['field', 'value', 'source'], rows);
+}
+
 function needsBackendSourcePreview(extension: string | undefined): boolean {
   return ['pdf', 'docx', 'txt', 'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'].includes(extension ?? '');
 }
@@ -175,6 +334,27 @@ function collectParsedSourceColumns(parsedFile: ParsedFileInfo | null, currentPr
   const columns = currentPreviewSheet?.columns ?? parsedFile?.columns ?? [];
   const extractedFields = getExtractedFieldEntries(parsedFile).map((entry) => entry.label);
   return Array.from(new Set([...columns, ...extractedFields]));
+}
+
+function preferredSourceStructureTab(parsedFile: ParsedFileInfo | null): SourceStructureTab {
+  if (!parsedFile) {
+    return 'warnings';
+  }
+  if (
+    parsedFile.documentMode === 'form_layout_mode' ||
+    parsedFile.sheets.length > 0 ||
+    parsedFile.columns.length > 0 ||
+    parsedFile.rows.length > 0
+  ) {
+    return 'tables';
+  }
+  if (parsedFile.kvPairs.length > 0) {
+    return 'fields';
+  }
+  if ((parsedFile.rawText ?? '').trim().length > 0) {
+    return 'text';
+  }
+  return 'warnings';
 }
 
 function parseWorkbookSheets(workbook: WorkBook, xlsxModule: typeof import('xlsx')): {
@@ -623,6 +803,20 @@ function sourceStructureTabLabel(tab: SourceStructureTab): string {
   return 'Предупреждения';
 }
 
+function previewSectionDisplayLabel(parsedFile: ParsedFileInfo | null, totalSections: number): string {
+  if (parsedFile?.documentMode === 'form_layout_mode') {
+    return totalSections > 1 ? 'Извлечённые секции формы' : 'Извлечённая секция формы';
+  }
+  return previewSectionLabel(parsedFile?.extension, totalSections);
+}
+
+function sourceStructureTabDisplayLabel(tab: SourceStructureTab, parsedFile: ParsedFileInfo | null): string {
+  if (tab === 'tables' && parsedFile?.documentMode === 'form_layout_mode') {
+    return 'Форма';
+  }
+  return sourceStructureTabLabel(tab);
+}
+
 function draftSuggestionSourceLabel(suggestion: DraftFieldSuggestion): string {
   if (suggestion.sourceOfTruth === 'personal_memory') {
     return 'Персональная память';
@@ -855,12 +1049,16 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [repairBusy, setRepairBusy] = useState(false);
   const [repairNotice, setRepairNotice] = useState('');
   const [repairError, setRepairError] = useState('');
+  const [sourcePreviewRefreshBusy, setSourcePreviewRefreshBusy] = useState(false);
+  const [sourcePreviewRefreshNotice, setSourcePreviewRefreshNotice] = useState('');
+  const [sourcePreviewRefreshError, setSourcePreviewRefreshError] = useState('');
   const [activeRepairActionKey, setActiveRepairActionKey] = useState<string | null>(null);
   const [repairPreview, setRepairPreview] = useState<RepairPreviewResult | null>(null);
   const [sectionStateCache, setSectionStateCache] = useState<Record<string, SectionWorkspaceState>>({});
   const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
+  const previewGridWrapRef = useRef<HTMLDivElement | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
   const currentFormExplainability = result.formExplainability ?? null;
   const currentRepairPlan = currentFormExplainability?.repairPlan ?? null;
@@ -911,6 +1109,13 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       return [];
     }
 
+    if (parsedFile.documentMode === 'form_layout_mode') {
+      const formPreviewSheet = buildFormPreviewSheet(parsedFile);
+      if (formPreviewSheet) {
+        return [formPreviewSheet];
+      }
+    }
+
     if (parsedFile.sheets.length > 0) {
       return parsedFile.sheets;
     }
@@ -937,9 +1142,19 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return previewSheets.findIndex((sheet) => sheet.name === currentPreviewSheet.name);
   }, [currentPreviewSheet, previewSheets]);
 
+  useEffect(() => {
+    if (sourceStructureTab !== 'tables') {
+      return;
+    }
+    previewGridWrapRef.current?.scrollTo({ left: 0, top: 0, behavior: 'auto' });
+  }, [currentPreviewSheet?.name, parsedFile?.fileName, sourceStructureTab]);
+
   const extractedFieldEntries = useMemo(() => getExtractedFieldEntries(parsedFile), [parsedFile]);
 
   const availableSourceStructureTabs = useMemo(() => {
+    if (!parsedFile) {
+      return [];
+    }
     const tabs: SourceStructureTab[] = [];
     if (previewSheets.length > 0) {
       tabs.push('tables');
@@ -955,6 +1170,36 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
     return tabs;
   }, [extractedFieldEntries.length, parsedFile?.extractionStatus, parsedFile?.rawText, parsedFile?.sections.length, parsedFile?.textBlocks.length, parsedFile?.warnings.length, previewSheets.length]);
+
+  const normalizedSourceStructureTabs = useMemo<SourceStructureTab[]>(() => {
+    if (Array.isArray(availableSourceStructureTabs)) {
+      return availableSourceStructureTabs;
+    }
+
+    const fallbackTabs: SourceStructureTab[] = [];
+    if (previewSheets.length > 0) {
+      fallbackTabs.push('tables');
+    }
+    if (extractedFieldEntries.length > 0) {
+      fallbackTabs.push('fields');
+    }
+    if ((parsedFile?.rawText ?? '').trim().length > 0 || (parsedFile?.textBlocks.length ?? 0) > 0 || (parsedFile?.sections.length ?? 0) > 0) {
+      fallbackTabs.push('text');
+    }
+    if ((parsedFile?.warnings.length ?? 0) > 0 || !!parsedFile?.extractionStatus) {
+      fallbackTabs.push('warnings');
+    }
+    return fallbackTabs;
+  }, [
+    availableSourceStructureTabs,
+    extractedFieldEntries.length,
+    parsedFile?.extractionStatus,
+    parsedFile?.rawText,
+    parsedFile?.sections.length,
+    parsedFile?.textBlocks.length,
+    parsedFile?.warnings.length,
+    previewSheets.length,
+  ]);
 
   const currentSectionKey = useMemo(
     () => buildSectionCacheKey(parsedFile?.fileName, currentPreviewSheet?.name ?? activePreviewSheet ?? 'default'),
@@ -1227,12 +1472,14 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
           learningReviewError,
           draftJsonNotice,
           learningReviewNotice,
+          sourcePreviewRefreshNotice,
+          sourcePreviewRefreshError,
           repairNotice,
           repairError,
         ].filter(Boolean)
       )
     );
-  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, repairError, repairNotice, result.warnings, saveMessage]);
+  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, repairError, repairNotice, result.warnings, saveMessage, sourcePreviewRefreshError, sourcePreviewRefreshNotice]);
 
   const visibleTsDiagnostics = useMemo(() => result.tsDiagnostics ?? [], [result.tsDiagnostics]);
   const visiblePreviewDiagnostics = useMemo(() => result.previewDiagnostics ?? [], [result.previewDiagnostics]);
@@ -1348,15 +1595,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     };
     setResult(restoredResult);
     setActivePreviewSheet(item.selectedSheet ?? item.parsedFile?.sheets[0]?.name ?? null);
-    setSourceStructureTab(
-      item.parsedFile?.sheets.length
-        ? 'tables'
-        : item.parsedFile?.kvPairs.length
-          ? 'fields'
-          : item.parsedFile?.rawText
-            ? 'text'
-            : 'warnings'
-    );
+    setSourceStructureTab(preferredSourceStructureTab(item.parsedFile ?? null));
     setSectionStateCache({});
     setCorrectionBaseline(profile.skipped ? null : buildCorrectionBaseline(item.id, item.schema, restoredResult));
     setCorrectionSaveNotice('');
@@ -1366,6 +1605,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftReviewNotes({});
     setDraftJsonNotice('');
     setDraftJsonError('');
+    setSourcePreviewRefreshNotice('');
+    setSourcePreviewRefreshError('');
     setDraftJsonSaved(false);
     setRepairNotice('');
     setRepairError('');
@@ -1530,17 +1771,17 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   }, [activePreviewSheet, previewSheets]);
 
   useEffect(() => {
-    if (availableSourceStructureTabs.length === 0) {
+    if (normalizedSourceStructureTabs.length === 0) {
       if (sourceStructureTab !== 'warnings') {
         setSourceStructureTab('warnings');
       }
       return;
     }
 
-    if (!availableSourceStructureTabs.includes(sourceStructureTab)) {
-      setSourceStructureTab(availableSourceStructureTabs[0]);
+    if (!normalizedSourceStructureTabs.includes(sourceStructureTab)) {
+      setSourceStructureTab(normalizedSourceStructureTabs[0]);
     }
-  }, [availableSourceStructureTabs, sourceStructureTab]);
+  }, [normalizedSourceStructureTabs, sourceStructureTab]);
 
   useEffect(() => {
     setDisplayName(profile.name);
@@ -1641,7 +1882,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
-    setSourceStructureTab(parsed.sheets.length > 0 ? 'tables' : parsed.kvPairs.length > 0 ? 'fields' : parsed.rawText ? 'text' : 'warnings');
+    setSourceStructureTab(preferredSourceStructureTab(parsed));
     setSectionStateCache({});
     setAutoGenerateSectionKey(null);
     setSaveMessage('');
@@ -1771,6 +2012,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftReviewNotes({ ...nextState.draftReviewNotes });
     setDraftJsonNotice('');
     setDraftJsonError('');
+    setSourcePreviewRefreshNotice('');
+    setSourcePreviewRefreshError('');
     setRepairNotice('');
     setRepairError('');
     setActiveRepairActionKey(null);
@@ -1902,6 +2145,41 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
   };
 
+  const onRefreshSourceStructure = async () => {
+    if (!selectedFile) {
+      setSourcePreviewRefreshError('Сначала загрузите файл.');
+      return;
+    }
+
+    setSourcePreviewRefreshBusy(true);
+    setSourcePreviewRefreshNotice('');
+    setSourcePreviewRefreshError('');
+
+    try {
+      const selectedFileExtension = selectedFile.name.split('.').pop()?.toLowerCase();
+      const refreshed = needsBackendSourcePreview(selectedFileExtension)
+        ? await fetchSourcePreviewFromBackend(selectedFile)
+        : await parseFile(selectedFile);
+
+      setParsedFile(refreshed);
+      setResult((current) => ({
+        ...current,
+        parsedFile: refreshed,
+      }));
+      setActivePreviewSheet(refreshed.sheets[0]?.name ?? null);
+      setSourceStructureTab(preferredSourceStructureTab(refreshed));
+      setSectionStateCache({});
+      setAutoGenerateSectionKey(null);
+      setActiveRepairActionKey(null);
+      setRepairPreview(null);
+      setSourcePreviewRefreshNotice('Структура источника перегенерирована.');
+    } catch (error) {
+      setSourcePreviewRefreshError(error instanceof Error ? error.message : 'Не удалось перегенерировать структуру источника.');
+    } finally {
+      setSourcePreviewRefreshBusy(false);
+    }
+  };
+
   const onPreviewRepair = async (action: FormRepairAction) => {
     const currentParsed = result.parsedFile ?? parsedFile;
     if (!currentParsed) {
@@ -2010,7 +2288,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
       if (applied.persistence.persisted && !profile.skipped) {
         await onSaveHistory();
-        await refreshLearningSummary();
+        await refreshLearningData();
         setRepairNotice(
           applied.persistence.versionNumber
             ? `Repair patch применён и сохранён как версия ${applied.persistence.versionNumber}.`
@@ -2685,18 +2963,30 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
               <div className="viewer-grid">
                 <section className="viewer-pane">
-                  <div className="pane-header">
-                    <FileSpreadsheet size={16} /> Структура источника
+                  <div className="pane-header pane-header-with-action">
+                    <span className="pane-header-label">
+                      <FileSpreadsheet size={16} /> Структура источника
+                    </span>
+                    <button
+                      aria-label="Перегенерировать структуру источника"
+                      className="icon-btn copy-code-btn"
+                      disabled={!selectedFile || sourcePreviewRefreshBusy}
+                      onClick={onRefreshSourceStructure}
+                      title="Перегенерировать структуру источника"
+                      type="button"
+                    >
+                      <RotateCcw size={16} />
+                    </button>
                   </div>
                   <div className="source-structure-tabs">
-                    {availableSourceStructureTabs.map((tab) => (
+                    {normalizedSourceStructureTabs.map((tab) => (
                       <button
                         className={sourceStructureTab === tab ? 'source-structure-tab active' : 'source-structure-tab'}
                         key={tab}
                         onClick={() => setSourceStructureTab(tab)}
                         type="button"
                       >
-                        {sourceStructureTabLabel(tab)}
+                        {sourceStructureTabDisplayLabel(tab, parsedFile)}
                       </button>
                     ))}
                   </div>
@@ -2709,7 +2999,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                               <ChevronLeft size={16} />
                             </button>
                             <div className="preview-switch-info">
-                              <span>{previewSectionLabel(parsedFile?.extension, previewSheets.length)}</span>
+                              <span>{previewSectionDisplayLabel(parsedFile, previewSheets.length)}</span>
                               <strong>
                                 {currentPreviewIndex + 1} / {previewSheets.length}
                               </strong>
@@ -2738,7 +3028,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                           </div>
                         </>
                       )}
-                      <div className="data-grid-wrap">
+                      <div className="data-grid-wrap" ref={previewGridWrapRef}>
                         {currentPreviewSheet && (currentPreviewSheet.columns.length > 0 || currentPreviewSheet.rows.length > 0) ? (
                           <table className="data-grid">
                             <thead>

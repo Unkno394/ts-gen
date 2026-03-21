@@ -392,6 +392,39 @@ class DocumentParserTests(unittest.TestCase):
         self.assertEqual(resolution.resolved_by, 'fallback_blocked')
         self.assertIsNone(resolution.value)
 
+    def test_form_layout_without_target_fields_prefers_generic_form_source(self) -> None:
+        path = self.test_root / 'form_layout_generic_source.docx'
+        doc = Document()
+        table = doc.add_table(rows=8, cols=2)
+        table.rows[0].cells[0].text = 'РќР°РёРјРµРЅРѕРІР°РЅРёРµ РѕСЂРіР°РЅРёР·Р°С†РёРё'
+        table.rows[0].cells[1].text = 'РћРћРћ "Р РѕРіР° Рё РєРѕРїС‹С‚Р°"'
+        table.rows[1].cells[0].text = 'РРќРќ/РљРРћ'
+        table.rows[1].cells[1].text = '1234567890'
+        table.rows[2].cells[0].text = 'РЇРІР»СЏРµС‚СЃСЏ Р»Рё РІС‹РіРѕРґРѕРїСЂРёРѕР±СЂРµС‚Р°С‚РµР»СЊ РЅР°Р»РѕРіРѕРІС‹Рј СЂРµР·РёРґРµРЅС‚РѕРј С‚РѕР»СЊРєРѕ РІ Р Р¤'
+        table.rows[3].cells[0].text = ' '
+        table.rows[3].cells[1].text = 'Р”Рђ'
+        table.rows[4].cells[0].text = 'X'
+        table.rows[4].cells[1].text = 'РќРµ СЏРІР»СЏСЋСЃСЊ РЅР°Р»РѕРіРѕРІС‹Рј СЂРµР·РёРґРµРЅС‚РѕРј РЅРё РІ РѕРґРЅРѕРј РіРѕСЃСѓРґР°СЂСЃС‚РІРµ'
+        table.rows[5].cells[0].text = 'FATCA СЃС‚Р°С‚СѓСЃ РІС‹РіРѕРґРѕРїСЂРёРѕР±СЂРµС‚Р°С‚РµР»СЏ'
+        table.rows[6].cells[0].text = 'X'
+        table.rows[6].cells[1].text = 'РРЅРѕСЃС‚СЂР°РЅРЅС‹Рј С„РёРЅР°РЅСЃРѕРІС‹Рј РёРЅСЃС‚РёС‚СѓС‚РѕРј'
+        table.rows[7].cells[0].text = ' '
+        table.rows[7].cells[1].text = 'Р‘РѕР»РµРµ 10% Р°РєС†РёР№ РїСЂРёРЅР°РґР»РµР¶Р°С‚ РЅР°Р»РѕРіРѕРїР»Р°С‚РµР»СЊС‰РёРєР°Рј РЎРЁРђ'
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+        columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(parsed.content_type, 'form')
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertEqual(parsed.form_model.layout_meta['final_source_mode'], 'generic_form_source')
+        self.assertGreaterEqual(len(columns), 2)
+        self.assertEqual(len(rows), 1)
+        self.assertIn('fatca_beneficiary', columns)
+        self.assertTrue(any(value == '1234567890' for value in rows[0].values()))
+        self.assertIsInstance(rows[0]['fatca_beneficiary'], list)
+        self.assertIn('Generated mapping from form-aware extracted fields.', warnings)
+
     def test_form_critical_field_does_not_fall_back_to_legacy_candidates(self) -> None:
         path = self.test_root / 'critical_fallback_blocked.txt'
         path.write_text(

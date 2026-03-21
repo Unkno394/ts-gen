@@ -131,8 +131,15 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         if isinstance(layout_meta, dict) and layout_meta.get('document_mode') == 'form_layout_mode':
             document_mode = 'form_layout_mode'
 
-    warnings = [str(warning) for warning in base_result.get('warnings', [])]
+    content_type = classification['content_type']
     extraction_status = classification['extraction_status']
+    if document_mode == 'form_layout_mode' and isinstance(form_model, dict):
+        scalar_count = len([item for item in form_model.get('scalars', []) if isinstance(item, dict)])
+        group_count = len([item for item in form_model.get('groups', []) if isinstance(item, dict)])
+        if scalar_count > 0 or group_count > 0:
+            content_type = 'form'
+
+    warnings = [str(warning) for warning in base_result.get('warnings', [])]
     if extraction_status == 'requires_ocr_or_manual_input':
         warnings.append('Text layer was not extracted. OCR or manual input is required.')
     elif extraction_status == 'text_not_extracted':
@@ -140,12 +147,14 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
     elif extraction_status == 'image_parse_not_supported_yet':
         warnings.append('Image-like files are detected, but OCR-free extraction is not supported yet.')
 
-    if classification['content_type'] == 'form' and kv_pairs:
+    if content_type == 'form' and kv_pairs:
         warnings.append(f'Detected {len(kv_pairs)} extracted field(s) from a semi-structured document.')
-    elif classification['content_type'] == 'text' and raw_text:
+    elif content_type == 'text' and raw_text:
         warnings.append('Detected text document with extracted text blocks.')
     if document_mode == 'form_layout_mode':
         warnings.append('Detected form-like layout document. Form-aware extraction is enabled.')
+        if tables and classification['content_type'] in {'table', 'mixed'}:
+            warnings.append('PDF table extraction looked form-like, so preview was switched to form-aware extraction.')
 
     deduped_warnings: list[str] = []
     seen_warnings: set[str] = set()
@@ -158,7 +167,7 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
     return {
         'file_name': base_result.get('file_name', path.name),
         'file_type': base_result.get('file_type', ext),
-        'content_type': classification['content_type'],
+        'content_type': content_type,
         'extraction_status': extraction_status,
         'columns': [str(column) for column in base_result.get('columns', [])],
         'rows': [dict(row) for row in base_result.get('rows', []) if isinstance(row, dict)],

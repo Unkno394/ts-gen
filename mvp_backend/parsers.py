@@ -247,6 +247,11 @@ def resolve_generation_source(
         if form_columns and form_rows:
             return form_columns, form_rows, form_warnings
 
+    if parsed_file.document_mode == 'form_layout_mode' and not target_fields and _should_use_generic_form_source(parsed_file):
+        form_columns, form_rows, form_warnings = _resolve_generic_form_layout_source(parsed_file)
+        if form_columns and form_rows:
+            return form_columns, form_rows, form_warnings
+
     if not parsed_file.sheets:
         if parsed_file.columns or parsed_file.rows:
             return parsed_file.columns, parsed_file.rows, []
@@ -304,6 +309,7 @@ def _resolve_form_layout_source(
         form_model=_model_to_plain_dict(parsed_file.form_model),
         target_fields=target_fields,
     )
+    resolved_fields = _apply_form_pair_target_fallbacks(parsed_file, resolved_fields)
     parsed_file.form_model.resolved_fields = [FormFieldResolution(**item) for item in resolved_fields]
     parsed_file.form_model.layout_meta['requested_target_fields'] = [field.name for field in target_fields]
     pipeline_layers = dict(parsed_file.form_model.layout_meta.get('pipeline_layers') or {})
@@ -372,7 +378,7 @@ def _resolve_form_layout_source(
             field if field.field.casefold() not in {name.casefold() for name in unresolved_critical_fields}
             else field.model_copy(update={'resolved_by': 'fallback_blocked'})
             if hasattr(field, 'model_copy')
-            else FormFieldResolution(**{**field.model_dump(), 'resolved_by': 'fallback_blocked'})
+            else FormFieldResolution(**{**_model_instance_to_dict(field), 'resolved_by': 'fallback_blocked'})
             for field in parsed_file.form_model.resolved_fields
         ]
         warnings.append(
@@ -417,6 +423,364 @@ def _resolve_form_layout_source(
     )
     return [], [], _dedupe(warnings)
 
+
+def _resolve_generic_form_layout_source(
+    parsed_file: ParsedFile,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    if parsed_file.form_model is None:
+        return [], [], []
+
+    row: dict[str, Any] = {}
+    columns: list[str] = []
+    used_columns: set[str] = set()
+
+    pair_columns, pair_row = _extract_form_pairs_from_rows(parsed_file)
+    for label in pair_columns:
+        unique_label = _make_unique_source_label(label, used_columns)
+        row[unique_label] = pair_row.get(label)
+        columns.append(unique_label)
+
+    if not columns:
+        for scalar in parsed_file.form_model.scalars:
+            label = str(scalar.label or '').strip()
+            value = scalar.value
+            if not _is_useful_form_label(label, value):
+                continue
+            unique_label = _make_unique_source_label(label, used_columns)
+            row[unique_label] = value
+            columns.append(unique_label)
+
+    for group in parsed_file.form_model.groups:
+        selected_labels = [
+            str(option.label or '').strip()
+            for option in group.options
+            if option.selected and str(option.label or '').strip()
+        ]
+        if not selected_labels:
+            continue
+
+        label = _generic_form_group_label(group)
+        if not label:
+            continue
+
+        unique_label = _make_unique_source_label(label, used_columns)
+        row[unique_label] = selected_labels if group.group_type == 'multi_choice' or len(selected_labels) > 1 else selected_labels[0]
+        columns.append(unique_label)
+
+    if columns:
+        parsed_file.form_model.layout_meta['final_source_mode'] = 'generic_form_source'
+        parsed_file.form_model.layout_meta['resolved_columns'] = list(columns)
+        return columns, [row], ['Generated mapping from form-aware extracted fields.']
+
+    fallback_columns, fallback_rows = build_candidate_source(
+        [_model_to_plain_dict(candidate) for candidate in parsed_file.source_candidates]
+    )
+    if fallback_columns and fallback_rows:
+        parsed_file.form_model.layout_meta['final_source_mode'] = 'legacy_fallback'
+        parsed_file.form_model.layout_meta['legacy_fallback_columns'] = list(fallback_columns)
+        return fallback_columns, fallback_rows, ['Generated mapping from extracted fields/text candidates.']
+
+    return [], [], []
+
+
+def _should_use_generic_form_source(parsed_file: ParsedFile) -> bool:
+    if parsed_file.form_model is None:
+        return False
+    return any(any(option.selected for option in group.options) for group in parsed_file.form_model.groups)
+
+
+def _generic_form_group_label(group: QuestionGroup) -> str:
+    group_id = str(group.group_id or '').strip()
+    if group_id and not _is_generic_form_group_id(group_id):
+        return group_id
+    return str(group.question or '').strip()
+
+
+def _extract_form_pairs_from_rows(parsed_file: ParsedFile) -> tuple[list[str], dict[str, Any]]:
+    if len(parsed_file.columns) < 2 or not parsed_file.rows:
+        return [], {}
+
+    label_column = parsed_file.columns[0]
+    value_column = parsed_file.columns[1]
+    row: dict[str, Any] = {}
+    columns: list[str] = []
+
+    for source_row in parsed_file.rows:
+        label = str(source_row.get(label_column) or '').strip()
+        value = source_row.get(value_column)
+        if not _is_useful_form_label(label, value):
+            continue
+        if label in row:
+            continue
+        row[label] = value
+        columns.append(label)
+
+    return columns, row
+
+
+def _is_useful_form_label(label: str, value: Any) -> bool:
+    normalized_label = ' '.join(str(label or '').strip().split())
+    if not normalized_label or value in (None, ''):
+        return False
+    if normalized_label.startswith(('•', '-', '*')):
+        return False
+    if _is_generic_form_group_id(normalized_label.casefold()):
+        return False
+
+    value_text = ' '.join(str(value).strip().split())
+    if not value_text:
+        return False
+
+    label_letters = ''.join(ch for ch in normalized_label if ch.isalpha())
+    value_letters = ''.join(ch for ch in value_text if ch.isalpha())
+    if (
+        len(label_letters) >= 16
+        and len(value_letters) >= 8
+        and label_letters.upper() == label_letters
+        and value_letters.upper() == value_letters
+    ):
+        return False
+
+    return True
+
+
+def _is_generic_form_group_id(group_id: str) -> bool:
+    normalized_group_id = str(group_id or '').strip().casefold()
+    return not normalized_group_id or normalized_group_id in {'group', 'unknown'} or normalized_group_id.startswith('group_')
+
+
+def _apply_form_pair_target_fallbacks(
+    parsed_file: ParsedFile,
+    resolved_fields: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not resolved_fields:
+        return resolved_fields
+
+    pair_columns, pair_row = _extract_form_pairs_from_rows(parsed_file)
+    pair_labels = list(pair_columns)
+    if not pair_row and parsed_file.form_model is None:
+        return resolved_fields
+
+    updated: list[dict[str, Any]] = []
+    for item in resolved_fields:
+        status = str(item.get('status') or 'not_found')
+        if status in {'resolved', 'weak_match'} and item.get('value') is not None:
+            updated.append(item)
+            continue
+
+        fallback = _resolve_target_field_from_form_pairs(
+            field_name=str(item.get('field') or ''),
+            pair_labels=pair_labels,
+            pair_row=pair_row,
+            parsed_file=parsed_file,
+        )
+        if fallback is None:
+            updated.append(item)
+            continue
+
+        updated.append({**item, **fallback})
+
+    return updated
+
+
+def _resolve_target_field_from_form_pairs(
+    *,
+    field_name: str,
+    pair_labels: list[str],
+    pair_row: dict[str, Any],
+    parsed_file: ParsedFile,
+) -> dict[str, Any] | None:
+    normalized_field_name = str(field_name or '').strip().casefold()
+    if not normalized_field_name:
+        return None
+
+    if normalized_field_name == 'organizationname':
+        match = _find_form_pair(pair_labels, pair_row, any_terms=('наименование организации', 'полное наименование организации', 'organization name', 'company name'))
+        if match is not None:
+            return _build_form_pair_resolution(match[0], match[1])
+        return None
+
+    if normalized_field_name in {'innorkio', 'innkio'}:
+        match = _find_form_pair(pair_labels, pair_row, any_terms=('инн/кио', 'инн кио', 'инн', 'кио', 'inn', 'kio'))
+        if match is not None:
+            return _build_form_pair_resolution(match[0], match[1])
+        return None
+
+    if normalized_field_name in {'isresidentrf', 'istaxresidencyonlyrf', 'istaxresidentonlyinrussia'}:
+        match = _find_form_pair(
+            pair_labels,
+            pair_row,
+            all_terms=('выгодоприобрет', 'налогов', 'резидент'),
+            exclude_terms=('контролир',),
+        )
+        if match is None:
+            return None
+        enum_value = _infer_tax_residency_enum(match[1])
+        if enum_value is None:
+            return None
+        if normalized_field_name == 'isresidentrf':
+            return _build_form_pair_resolution(match[0], enum_value, confidence=0.72)
+        if normalized_field_name == 'istaxresidencyonlyrf':
+            return _build_form_pair_resolution(match[0], enum_value == 'YES', confidence=0.72)
+        return _build_form_pair_resolution(match[0], enum_value == 'YES', confidence=0.72)
+
+    if normalized_field_name == 'arecontrollerstaxresidentsonlyinrussia':
+        match = _find_form_pair(
+            pair_labels,
+            pair_row,
+            all_terms=('контролир', 'налогов', 'резидент'),
+        )
+        if match is None:
+            return None
+        bool_value = _infer_yes_no_boolean(match[1])
+        if bool_value is None:
+            return None
+        return _build_form_pair_resolution(match[0], bool_value, confidence=0.68)
+
+    if normalized_field_name == 'anystatementtrue':
+        bool_value = _infer_any_statement_true(parsed_file, pair_labels, pair_row)
+        if bool_value is None:
+            return None
+        return _build_form_pair_resolution('fatca_statement_group', bool_value, confidence=0.7)
+
+    if normalized_field_name == 'disregardedentityownertype':
+        match = _find_form_pair(
+            pair_labels,
+            pair_row,
+            any_terms=('disregarded entity является', 'disregarded entity owner', 'собственник owner disregarded entity является'),
+        )
+        if match is not None:
+            return _build_form_pair_resolution(match[0], match[1], confidence=0.7)
+
+        if parsed_file.form_model is not None:
+            for group in parsed_file.form_model.groups:
+                selected_labels = [
+                    str(option.label or '').strip()
+                    for option in group.options
+                    if option.selected and str(option.label or '').strip()
+                ]
+                question = str(group.question or '').strip().casefold()
+                if selected_labels and 'disregarded' in question:
+                    return _build_form_pair_resolution(group.question, selected_labels[0], confidence=0.62)
+        return None
+
+    return None
+
+
+def _find_form_pair(
+    pair_labels: list[str],
+    pair_row: dict[str, Any],
+    *,
+    any_terms: tuple[str, ...] = (),
+    all_terms: tuple[str, ...] = (),
+    exclude_terms: tuple[str, ...] = (),
+) -> tuple[str, Any] | None:
+    for label in pair_labels:
+        normalized_label = _normalize_form_lookup(label)
+        if any_terms and not any(_normalize_form_lookup(term) in normalized_label for term in any_terms):
+            continue
+        if all_terms and not all(_normalize_form_lookup(term) in normalized_label for term in all_terms):
+            continue
+        if exclude_terms and any(_normalize_form_lookup(term) in normalized_label for term in exclude_terms):
+            continue
+        return label, pair_row.get(label)
+    return None
+
+
+def _build_form_pair_resolution(label: str, value: Any, *, confidence: float = 0.74) -> dict[str, Any]:
+    return {
+        'status': 'weak_match',
+        'resolved_by': 'legacy_fallback',
+        'value': value,
+        'candidates': [],
+        'source_ref': {'source_type': 'row_pair', 'label': label},
+        'confidence': confidence,
+    }
+
+
+def _infer_tax_residency_enum(value: Any) -> str | None:
+    normalized_value = _normalize_form_lookup(value)
+    if not normalized_value:
+        return None
+    if ' x не являюсь налоговым резидентом ни в одном государстве' in normalized_value:
+        return 'NOWHERE'
+    if normalized_value.startswith('да ') or normalized_value.startswith('да,') or ' x да ' in normalized_value:
+        return 'YES'
+    if normalized_value.startswith('нет ') or normalized_value.startswith('нет,') or ' x нет ' in normalized_value:
+        return 'NO'
+    if 'не являюсь налоговым резидентом ни в одном государстве' in normalized_value:
+        return 'NOWHERE'
+    return None
+
+
+def _infer_yes_no_boolean(value: Any) -> bool | None:
+    normalized_value = _normalize_form_lookup(value)
+    if not normalized_value:
+        return None
+    if normalized_value.startswith('да ') or normalized_value.startswith('да,') or ' x да ' in normalized_value:
+        return True
+    if normalized_value.startswith('нет ') or normalized_value.startswith('нет,') or ' x нет ' in normalized_value:
+        return False
+    return None
+
+
+def _infer_any_statement_true(
+    parsed_file: ParsedFile,
+    pair_labels: list[str],
+    pair_row: dict[str, Any],
+) -> bool | None:
+    if parsed_file.form_model is not None:
+        for group in parsed_file.form_model.groups:
+            selected_labels = [
+                str(option.label or '').strip()
+                for option in group.options
+                if option.selected and str(option.label or '').strip()
+            ]
+            if selected_labels:
+                normalized_selected = ' '.join(_normalize_form_lookup(label) for label in selected_labels)
+                if 'не применим' in normalized_selected:
+                    return False
+                return True
+
+    match = _find_form_pair(pair_labels, pair_row, any_terms=('хотя бы одно из следующих утверждений', 'утверждений для выгодоприобретателя'))
+    if match is None:
+        return None
+
+    normalized_value = _normalize_form_lookup(match[1])
+    if not normalized_value:
+        return None
+    if 'не применим' in normalized_value and ' x ' not in normalized_value:
+        return False
+    return True
+
+
+def _normalize_form_lookup(value: Any) -> str:
+    text = str(value or '').casefold()
+    collapsed = ' '.join(''.join(ch if ch.isalnum() else ' ' for ch in text).split())
+    return collapsed
+
+
+def _make_unique_source_label(label: str, used_columns: set[str]) -> str:
+    if label not in used_columns:
+        used_columns.add(label)
+        return label
+
+    suffix = 2
+    while f'{label} {suffix}' in used_columns:
+        suffix += 1
+    unique_label = f'{label} {suffix}'
+    used_columns.add(unique_label)
+    return unique_label
+
+
+def _model_instance_to_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, 'model_dump'):
+        return dict(value.model_dump())
+    if hasattr(value, 'dict'):
+        return dict(value.dict())
+    if hasattr(value, '__dict__'):
+        return dict(vars(value))
+    return {}
 
 
 def _parse_csv(file_path: Path) -> tuple[list[str], list[dict[str, Any]]]:
