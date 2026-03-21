@@ -670,6 +670,7 @@ input::-ms-reveal {
   flex-direction: column;
   gap: 18px;
   padding: 18px;
+  min-height: 0;
 }
 
 .sidebar-top,
@@ -710,12 +711,30 @@ input::-ms-reveal {
   background: rgba(0, 0, 0, 0.18);
 }
 
-.sidebar-history-card {
-  min-height: 0;
+.generator-panel {
+  min-height: 520px;
 }
 
-.sidebar-history-list {
-  max-height: 220px;
+.sidebar-history-card {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.history-list.sidebar-history-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  max-height: none;
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.history-list.sidebar-history-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .generator-panel .primary-btn,
@@ -1142,6 +1161,32 @@ input::-ms-reveal {
   gap: 12px;
 }
 
+.knowledge-scroll-list {
+  --knowledge-scroll-gap: 12px;
+  --knowledge-scroll-item-min-height: 172px;
+  display: grid;
+  gap: var(--knowledge-scroll-gap);
+  max-height: calc(var(--knowledge-scroll-item-min-height) * 3 + var(--knowledge-scroll-gap) * 2);
+  padding-right: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  align-content: start;
+  scrollbar-gutter: stable;
+}
+
+.knowledge-scroll-list .profile-list-item,
+.knowledge-scroll-list .empty-card {
+  min-width: 0;
+}
+
+.knowledge-scroll-list .profile-list-item {
+  min-height: var(--knowledge-scroll-item-min-height);
+}
+
+.system-memory-list {
+  --knowledge-scroll-item-min-height: 166px;
+}
+
 .profile-list-item {
   display: flex;
   align-items: center;
@@ -1178,6 +1223,36 @@ input::-ms-reveal {
   color: rgba(255, 255, 255, 0.56);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.insight-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.insight-stat-pill {
+  display: grid;
+  gap: 4px;
+  min-height: 88px;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+  align-content: center;
+  text-align: center;
+}
+
+.insight-stat-pill strong {
+  font-size: 24px;
+}
+
+.insight-stat-pill span {
+  color: rgba(255, 255, 255, 0.56);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .event-filter-row {
@@ -1285,6 +1360,43 @@ input::-ms-reveal {
   text-transform: uppercase;
 }
 
+.knowledge-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.knowledge-inline-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(239, 245, 255, 0.9);
+  font-size: 12px;
+}
+
+.knowledge-inline-chip-accent {
+  border-color: rgba(103, 154, 255, 0.28);
+  background: rgba(53, 101, 223, 0.16);
+}
+
+.knowledge-inline-chip-personal {
+  border-color: rgba(88, 221, 184, 0.28);
+  background: rgba(26, 175, 137, 0.14);
+}
+
+.knowledge-inline-chip-muted {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.knowledge-item-note {
+  color: rgba(255, 255, 255, 0.58);
+  line-height: 1.45;
+}
+
 .knowledge-event-stage {
   display: inline-flex;
   align-items: center;
@@ -1372,36 +1484,6 @@ input::-ms-reveal {
 
 .profile-fun-grid .empty-card strong {
   font-size: 28px;
-}
-
-.semantic-graph-stats {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 14px;
-}
-
-.semantic-graph-stat {
-  display: grid;
-  gap: 4px;
-  min-height: 88px;
-  padding: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.03);
-  align-content: center;
-  text-align: center;
-}
-
-.semantic-graph-stat strong {
-  font-size: 24px;
-}
-
-.semantic-graph-stat span {
-  color: rgba(255, 255, 255, 0.56);
-  font-size: 12px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .memory-layer-grid {
@@ -1543,7 +1625,8 @@ input::-ms-reveal {
 }
 
 .semantic-graph-list {
-  gap: 10px;
+  --knowledge-scroll-gap: 10px;
+  --knowledge-scroll-item-min-height: 182px;
 }
 
 .semantic-cluster-list {
@@ -2015,61 +2098,6 @@ input::-ms-reveal {
   margin-top: 14px;
 }
 
-.knowledge-state-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.knowledge-state-card {
-  display: grid;
-  gap: 6px;
-  min-height: 112px;
-  padding: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.03);
-  align-content: center;
-}
-
-.knowledge-state-card strong {
-  font-size: 28px;
-  line-height: 1;
-}
-
-.knowledge-state-card span {
-  color: rgba(245, 248, 255, 0.88);
-}
-
-.knowledge-state-card small {
-  color: rgba(255, 255, 255, 0.56);
-  line-height: 1.45;
-}
-
-.knowledge-breakdown {
-  display: grid;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.knowledge-breakdown-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 14px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.03);
-}
-
-.knowledge-breakdown-row span {
-  color: rgba(255, 255, 255, 0.58);
-}
-
-.knowledge-breakdown-row strong {
-  text-align: right;
-}
-
 .review-queue-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2356,13 +2384,13 @@ input::-ms-reveal {
 @media (max-width: 900px) {
   .generator-action-row,
   .generation-quality-grid,
+  .insight-stat-row,
   .mapping-editor-grid,
   .review-queue-grid,
-  .knowledge-state-grid,
-  .semantic-graph-stats,
   .profile-view-grid {
     grid-template-columns: 1fr;
   }
+
 }
 
 @media (max-width: 900px) {

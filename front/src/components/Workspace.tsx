@@ -33,7 +33,6 @@ import {
   deleteHistoryEntry,
   fetchLearningEvents,
   fetchLearningMemory,
-  fetchLearningSummary,
   fetchSourcePreviewFromBackend,
   generateDraftJsonFromBackend,
   generateFromBackend,
@@ -49,7 +48,6 @@ import type {
   HistoryItem,
   LearningEvent,
   LearningMemory,
-  LearningSummary,
   OperationalMappingStatus,
   ManualCorrectionInput,
   MappingInfo,
@@ -100,6 +98,19 @@ type SectionWorkspaceState = {
   correctionBaseline: CorrectionBaseline | null;
   mappingReviewNotes: Record<string, string>;
   draftReviewNotes: Record<string, string>;
+};
+
+type InsightFeedEntry = {
+  id: string;
+  title: string;
+  badge: string;
+  badgeClassName: string;
+  categoryLabel: string;
+  categoryClassName: string;
+  description: string;
+  tags: string[];
+  note: string | null;
+  timestamp: string | null;
 };
 
 function buildPreviewSheet(name: string, columns: string[], rows: Record<string, unknown>[]): ParsedSheetInfo {
@@ -408,6 +419,10 @@ function parseMaybeJson(value: string): unknown {
   } catch {
     return value;
   }
+}
+
+function compactStrings(values: Array<string | null | undefined>): string[] {
+  return values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
 }
 
 function confidenceToScore(confidence: MappingInfo['confidence']): number {
@@ -795,8 +810,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [passwordChangeBusy, setPasswordChangeBusy] = useState(false);
   const [passwordChangeNotice, setPasswordChangeNotice] = useState('');
   const [passwordChangeError, setPasswordChangeError] = useState('');
-  const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(null);
-  const [learningSummaryError, setLearningSummaryError] = useState('');
   const [learningEvents, setLearningEvents] = useState<LearningEvent[]>([]);
   const [learningMemory, setLearningMemory] = useState<LearningMemory | null>(null);
   const [learningEventsError, setLearningEventsError] = useState('');
@@ -823,10 +836,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const reviewFocusTimerRef = useRef<number | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
 
-  const refreshLearningSummary = async () => {
+  const refreshLearningData = async () => {
     if (profile.skipped) {
-      setLearningSummary(null);
-      setLearningSummaryError('');
       setLearningEvents([]);
       setLearningMemory(null);
       setLearningEventsError('');
@@ -834,19 +845,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
 
     try {
-      const [nextSummary, nextEvents, nextMemory] = await Promise.all([
-        fetchLearningSummary(profile.id),
+      const [nextEvents, nextMemory] = await Promise.all([
         fetchLearningEvents(profile.id, 18),
         fetchLearningMemory(profile.id, 14),
       ]);
-      setLearningSummary(nextSummary);
-      setLearningSummaryError('');
       setLearningEvents(nextEvents);
       setLearningMemory(nextMemory);
       setLearningEventsError('');
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.';
-      setLearningSummaryError(message);
       setLearningEventsError(message);
     }
   };
@@ -1069,62 +1076,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const pendingReviewTotal = pendingMappingReviewItems.length + pendingDraftReviewItems.length;
 
-  const currentKnowledgeSummary = useMemo(() => {
-    const mappings = result.mappings.reduce(
-      (accumulator, mapping) => {
-        const stage = mappingStageState(mapping, generationConfirmed);
-        if (stage === 'staging') {
-          accumulator.staging += 1;
-        } else if (stage === 'memory') {
-          accumulator.memory += 1;
-        } else if (mapping.sourceOfTruth === 'global_pattern') {
-          accumulator.globalPatterns += 1;
-        } else {
-          accumulator.system += 1;
-        }
-        return accumulator;
-      },
-      { staging: 0, memory: 0, globalPatterns: 0, system: 0 }
-    );
-
-    const drafts = draftSuggestions.reduce(
-      (accumulator, suggestion) => {
-        const stage = draftSuggestionStageState(suggestion, draftJsonSaved);
-        if (stage === 'staging') {
-          accumulator.staging += 1;
-        } else if (stage === 'memory') {
-          accumulator.memory += 1;
-        } else if (suggestion.sourceOfTruth === 'global_pattern') {
-          accumulator.globalPatterns += 1;
-        } else {
-          accumulator.system += 1;
-        }
-        return accumulator;
-      },
-      { staging: 0, memory: 0, globalPatterns: 0, system: 0 }
-    );
-
-    return {
-      staging: mappings.staging + drafts.staging,
-      memory: mappings.memory + drafts.memory,
-      globalPatterns: mappings.globalPatterns + drafts.globalPatterns,
-      system: mappings.system + drafts.system,
-    };
-  }, [draftJsonSaved, draftSuggestions, generationConfirmed, result.mappings]);
-
-  const learningPipelineStats = useMemo(() => {
-    return {
-      staging: (learningSummary?.mappingSuggestions ?? 0) + (learningSummary?.draftJsonSuggestions ?? 0),
-      memory:
-        (learningSummary?.mappingMemory ?? 0) +
-        (learningSummary?.fewShotExamples ?? 0) +
-        (learningSummary?.userTemplates ?? 0) +
-        (learningSummary?.frequentDjson ?? 0),
-      globalPatterns: learningSummary?.globalPatternCandidates ?? 0,
-      dataset: learningSummary?.globalCuratedDatasetItems ?? 0,
-    };
-  }, [learningSummary]);
-
   const learningEventCounts = useMemo(() => {
     return learningEvents.reduce(
       (accumulator, event) => {
@@ -1265,88 +1216,75 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     };
   }, [history]);
 
-  const recentFiles = useMemo(() => {
-    const seen = new Set<string>();
-    return history
-      .filter((item) => {
-        if (seen.has(item.fileName)) {
-          return false;
-        }
-        seen.add(item.fileName);
-        return true;
-      })
-      .slice(0, 6)
-      .map((item) => ({
-        id: item.id,
-        fileName: item.fileName,
-        createdAt: item.createdAt,
-      }));
-  }, [history]);
-
-  const frequentSchemas = useMemo(() => {
-    const schemaMap = new Map<
-      string,
-      {
-        schema: string;
-        count: number;
-        lastUsedAt: string;
-        sampleFileName: string;
-      }
-    >();
-
-    history.forEach((item) => {
-      const existing = schemaMap.get(item.schema);
-      if (existing) {
-        existing.count += 1;
-        if (new Date(item.createdAt).getTime() > new Date(existing.lastUsedAt).getTime()) {
-          existing.lastUsedAt = item.createdAt;
-          existing.sampleFileName = item.fileName;
-        }
-        return;
-      }
-
-      schemaMap.set(item.schema, {
-        schema: item.schema,
-        count: 1,
-        lastUsedAt: item.createdAt,
-        sampleFileName: item.fileName,
-      });
-    });
-
-    return Array.from(schemaMap.values())
-      .sort((a, b) => {
-        if (b.count !== a.count) {
-          return b.count - a.count;
-        }
-        return new Date(b.lastUsedAt).getTime() - new Date(a.lastUsedAt).getTime();
-      })
-      .slice(0, 5)
-      .map((item) => {
-        let label = 'JSON шаблон';
-        try {
-          const parsed = JSON.parse(item.schema) as Record<string, unknown>;
-          const keys = Object.keys(parsed);
-          if (keys.length > 0) {
-            label = keys.slice(0, 3).join(', ');
-            if (keys.length > 3) {
-              label += ` +${keys.length - 3}`;
-            }
-          }
-        } catch {
-          label = item.sampleFileName;
-        }
-
-        return {
-          ...item,
-          label,
-        };
-      });
-  }, [history]);
-
   const semanticGraphHighlights = useMemo(() => learningMemory?.layers.semanticGraph.items ?? [], [learningMemory]);
   const semanticGraphClusters = useMemo(() => learningMemory?.layers.semanticGraph.clusters ?? [], [learningMemory]);
   const personalMemoryHighlights = useMemo(() => learningMemory?.layers.personalMemory.items ?? [], [learningMemory]);
   const globalKnowledgeHighlights = useMemo(() => learningMemory?.layers.globalKnowledge.items ?? [], [learningMemory]);
+  const systemMemoryFeed = useMemo<InsightFeedEntry[]>(() => {
+    const personalItems = personalMemoryHighlights.slice(0, 6).map((item) => ({
+      id: `personal-${item.sourceFieldNorm}-${item.targetFieldNorm}`,
+      title: `${item.sourceField ?? item.sourceFieldNorm} → ${item.targetField}`,
+      badge: item.confidenceBand,
+      badgeClassName: 'memory-band-chip',
+      categoryLabel: 'Личная память',
+      categoryClassName: 'knowledge-inline-chip knowledge-inline-chip-personal',
+      description: `usage ${item.usageCount} · accept ${item.acceptedCount} · reject ${item.rejectedCount} · schemas ${item.schemaFingerprintCount}`,
+      tags: [],
+      note: null,
+      timestamp: null,
+    }));
+
+    const globalItems = globalKnowledgeHighlights.slice(0, 6).map((item) => ({
+      id: `global-${item.candidateId}-${item.targetFieldNorm}`,
+      title: `${item.sourceField ?? item.sourceFieldNorm} → ${item.targetField ?? item.targetFieldNorm}`,
+      badge: memoryPatternStatusLabel(item.status),
+      badgeClassName: `memory-status-chip memory-status-${memoryPatternStatusTone(item.status)}`,
+      categoryLabel: 'Общий паттерн',
+      categoryClassName: 'knowledge-inline-chip knowledge-inline-chip-accent',
+      description: `support ${item.supportCount} · users ${item.uniqueUsers} · accept ${formatMetricScore(item.acceptanceRate)} · drift ${formatMetricScore(item.driftScore)}`,
+      tags: compactStrings([item.semanticRole, item.conceptCluster, ...item.domainTags.slice(0, 2)]),
+      note: item.promotionReason ? `promotion: ${item.promotionReason}` : item.rejectionReason ? `reason: ${item.rejectionReason}` : null,
+      timestamp: null,
+    }));
+
+    return [...personalItems, ...globalItems];
+  }, [globalKnowledgeHighlights, personalMemoryHighlights]);
+  const semanticGraphFeed = useMemo<InsightFeedEntry[]>(() => {
+    const clusterItems = semanticGraphClusters.slice(0, 4).map((cluster) => ({
+      id: `cluster-${cluster.clusterId}`,
+      title: `Кластер из ${cluster.size} полей`,
+      badge: 'Кластер',
+      badgeClassName: 'knowledge-inline-chip knowledge-inline-chip-accent',
+      categoryLabel: 'Семантическая группа',
+      categoryClassName: 'knowledge-inline-chip knowledge-inline-chip-muted',
+      description: `support ${cluster.supportCount} · fields ${cluster.fields.length}`,
+      tags: compactStrings([
+        ...cluster.sharedAttributes.slice(0, 2),
+        ...cluster.sharedRoles.slice(0, 2).map((role) => semanticGraphRoleLabel(role)),
+        ...cluster.entities.slice(0, 2),
+      ]),
+      note: cluster.fields
+        .slice(0, 3)
+        .map((field) => `${field.field} (${field.entityToken ?? 'any'}.${field.attributeToken ?? 'field'})`)
+        .join(' · '),
+      timestamp: null,
+    }));
+
+    const edgeItems = semanticGraphHighlights.slice(0, 8).map((edge) => ({
+      id: `edge-${edge.leftFieldNorm}-${edge.rightFieldNorm}-${edge.relationKind}`,
+      title: `${edge.leftField} ↔ ${edge.rightField}`,
+      badge: semanticGraphRelationLabel(edge.relationKind),
+      badgeClassName: `semantic-graph-kind semantic-graph-kind-${edge.relationKind}`,
+      categoryLabel: 'Semantic edge',
+      categoryClassName: 'knowledge-inline-chip knowledge-inline-chip-personal',
+      description: `${edge.leftEntityToken ?? 'any'}.${edge.leftAttributeToken ?? 'field'} · ${semanticGraphRoleLabel(edge.leftRoleLabel)} ↔ ${edge.rightEntityToken ?? 'any'}.${edge.rightAttributeToken ?? 'field'} · ${semanticGraphRoleLabel(edge.rightRoleLabel)}`,
+      tags: [`support ${edge.supportCount}`, `accepted ${edge.acceptedCount}`, `rejected ${edge.rejectedCount}`, edge.confidenceBand],
+      note: null,
+      timestamp: edge.lastSeenAt ? new Date(edge.lastSeenAt).toLocaleString() : null,
+    }));
+
+    return [...clusterItems, ...edgeItems];
+  }, [semanticGraphClusters, semanticGraphHighlights]);
 
   const restoreHistoryItem = (item: HistoryItem) => {
     setHistoryDeleteError('');
@@ -1575,22 +1513,17 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     async function loadLearningData() {
       if (profile.skipped) {
         if (!cancelled) {
-          setLearningSummary(null);
-          setLearningSummaryError('');
           setLearningMemory(null);
         }
         return;
       }
 
       try {
-        const [nextSummary, nextEvents, nextMemory] = await Promise.all([
-          fetchLearningSummary(profile.id),
+        const [nextEvents, nextMemory] = await Promise.all([
           fetchLearningEvents(profile.id, 18),
           fetchLearningMemory(profile.id, 14),
         ]);
         if (!cancelled) {
-          setLearningSummary(nextSummary);
-          setLearningSummaryError('');
           setLearningEvents(nextEvents);
           setLearningMemory(nextMemory);
           setLearningEventsError('');
@@ -1598,7 +1531,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       } catch (error) {
         if (!cancelled) {
           const message = error instanceof Error ? error.message : 'Не удалось загрузить данные обучения.';
-          setLearningSummaryError(message);
           setLearningEventsError(message);
         }
       }
@@ -1641,7 +1573,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         setCorrectionBaseline(buildCorrectionBaseline(String(saved.generationId ?? generationId), schema, result));
         setCorrectionSaveNotice(`Сервер сохранил ${saved.count} правк(и).`);
         setCorrectionSaveError('');
-        await refreshLearningSummary();
+        await refreshLearningData();
       } catch (error) {
         setCorrectionSaveError(error instanceof Error ? error.message : 'Не удалось сохранить правки на сервере.');
       } finally {
@@ -1896,7 +1828,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               : 'Generation finished, but the history list could not be refreshed.'
           );
         }
-        await refreshLearningSummary();
+        await refreshLearningData();
       } else {
         setCorrectionBaseline(null);
       }
@@ -2065,7 +1997,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       );
       setDraftJsonSaved(true);
       setDraftJsonNotice(`Draft JSON сохранён. Шаблон "${result.templateName}" добавлен в память.`);
-      await refreshLearningSummary();
+      await refreshLearningData();
     } catch (error) {
       setDraftJsonError(error instanceof Error ? error.message : 'Не удалось сохранить draft JSON.');
     } finally {
@@ -2157,7 +2089,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
           ? 'Генерация уже была подтверждена раньше.'
           : 'Генерация подтверждена и добавлена в обучающую память.'
       );
-      await refreshLearningSummary();
+      await refreshLearningData();
       await onSaveHistory();
     } catch (error) {
       setLearningReviewError(error instanceof Error ? error.message : 'Не удалось подтвердить генерацию.');
@@ -3073,48 +3005,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   </div>
                 </section>
 
-                <section className="insight-card">
-                  <div className="pane-header">
-                    <Sparkles size={16} /> Состояние знаний
-                  </div>
-                  <div className="knowledge-state-grid">
-                    <div className="knowledge-state-card">
-                      <strong>{currentKnowledgeSummary.staging}</strong>
-                      <span>в staging сейчас</span>
-                      <small>текущая генерация и draft JSON</small>
-                    </div>
-                    <div className="knowledge-state-card">
-                      <strong>{learningPipelineStats.memory}</strong>
-                      <span>в персональной памяти</span>
-                      <small>mapping memory, шаблоны и few-shot</small>
-                    </div>
-                    <div className="knowledge-state-card">
-                      <strong>{learningPipelineStats.globalPatterns}</strong>
-                      <span>глобальные паттерны</span>
-                      <small>устойчивые совпадения между пользователями</small>
-                    </div>
-                    <div className="knowledge-state-card">
-                      <strong>{learningPipelineStats.dataset}</strong>
-                      <span>в curated dataset</span>
-                      <small>готово для обучения локальной модели</small>
-                    </div>
-                  </div>
-                  <div className="knowledge-breakdown">
-                    <div className="knowledge-breakdown-row">
-                      <span>Текущий запуск</span>
-                      <strong>
-                        staging {currentKnowledgeSummary.staging} · память {currentKnowledgeSummary.memory} · паттерны {currentKnowledgeSummary.globalPatterns} · авто {currentKnowledgeSummary.system}
-                      </strong>
-                    </div>
-                    <div className="knowledge-breakdown-row">
-                      <span>Серверный staging</span>
-                      <strong>
-                        {learningSummary?.mappingSuggestions ?? 0} mapping · {learningSummary?.draftJsonSuggestions ?? 0} draft JSON
-                      </strong>
-                    </div>
-                  </div>
-                  {learningSummaryError && <div className="warning-item auth-status auth-status-error">{learningSummaryError}</div>}
-                </section>
               </div>
             </>
           ) : (
@@ -3218,134 +3108,51 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
                 <section className="insight-card">
                   <div className="pane-header">
-                    <FileSpreadsheet size={16} /> Последние файлы
-                  </div>
-                  <div className="profile-list">
-                    {recentFiles.length === 0 && <div className="empty-card compact">Пока нет загруженных файлов.</div>}
-                    {recentFiles.map((item) => (
-                      <div className="profile-list-item" key={item.id}>
-                        <div>
-                          <strong>{item.fileName}</strong>
-                          <span>{new Date(item.createdAt).toLocaleString()}</span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </section>
-
-                <section className="insight-card">
-                  <div className="pane-header">
-                    <Sparkles size={16} /> Часто используемые JSON
-                  </div>
-                  <div className="profile-list">
-                    {frequentSchemas.length === 0 && <div className="empty-card compact">Пока нет сохранённых шаблонов.</div>}
-                    {frequentSchemas.map((item) => (
-                      <button
-                        className="profile-list-item profile-list-item-button"
-                        key={`${item.label}-${item.lastUsedAt}`}
-                        onClick={() => {
-                          setSchema(item.schema);
-                          setActiveView('generator');
-                        }}
-                        type="button"
-                      >
-                        <div>
-                          <strong>{item.label}</strong>
-                          <span>Использован {item.count} раз(а) · последний файл {item.sampleFileName}</span>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </section>
-
-                <section className="insight-card">
-                  <div className="pane-header">
                     <Sparkles size={16} /> Память системы
                   </div>
-                  <div className="memory-layer-grid">
-                    <div className="memory-layer-card">
-                      <div className="memory-layer-top">
-                        <strong>Личная память</strong>
-                        <span>{learningMemory?.layers.personalMemory.counts.entries ?? 0}</span>
-                      </div>
-                      <div className="memory-layer-stats">
-                        <span>accept {learningMemory?.layers.personalMemory.counts.accepted ?? 0}</span>
-                        <span>reject {learningMemory?.layers.personalMemory.counts.rejected ?? 0}</span>
-                      </div>
-                      <div className="memory-layer-list">
-                        {personalMemoryHighlights.length === 0 && (
-                          <div className="empty-card compact">Подтверждённые пользовательские пары пока не накопились.</div>
-                        )}
-                        {personalMemoryHighlights.slice(0, 5).map((item) => (
-                          <div className="memory-layer-item" key={`${item.sourceFieldNorm}-${item.targetFieldNorm}`}>
-                            <div className="memory-layer-item-top">
-                              <strong>{item.sourceField ?? item.sourceFieldNorm} → {item.targetField}</strong>
-                              <span className="memory-band-chip">{item.confidenceBand}</span>
-                            </div>
-                            <div className="memory-layer-meta">
-                              <span>usage {item.usageCount}</span>
-                              <span>accept {item.acceptedCount}</span>
-                              <span>reject {item.rejectedCount}</span>
-                              <span>schemas {item.schemaFingerprintCount}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
+                  <div className="insight-stat-row">
+                    <div className="insight-stat-pill">
+                      <strong>{learningMemory?.layers.personalMemory.counts.entries ?? 0}</strong>
+                      <span>личная память</span>
                     </div>
-
-                    <div className="memory-layer-card">
-                      <div className="memory-layer-top">
-                        <strong>Общие паттерны</strong>
-                        <span>{learningMemory?.layers.globalKnowledge.counts.patterns ?? 0}</span>
-                      </div>
-                      <div className="memory-layer-stats">
-                        <span>promoted {learningMemory?.layers.globalKnowledge.counts.shared_promoted ?? 0}</span>
-                        <span>candidate {learningMemory?.layers.globalKnowledge.counts.shared_candidate ?? 0}</span>
-                        <span>blocked {learningMemory?.layers.globalKnowledge.counts.blocked_sensitive ?? 0}</span>
-                      </div>
-                      <div className="memory-layer-list">
-                        {globalKnowledgeHighlights.length === 0 && (
-                          <div className="empty-card compact">Общие паттерны ещё не сформированы.</div>
-                        )}
-                        {globalKnowledgeHighlights.slice(0, 6).map((item) => (
-                          <div className="memory-layer-item memory-layer-item-global" key={`${item.candidateId}-${item.targetFieldNorm}`}>
-                            <div className="memory-layer-item-top">
-                              <strong>{item.sourceField ?? item.sourceFieldNorm} → {item.targetField ?? item.targetFieldNorm}</strong>
-                              <span className={`memory-status-chip memory-status-${memoryPatternStatusTone(item.status)}`}>
-                                {memoryPatternStatusLabel(item.status)}
+                    <div className="insight-stat-pill">
+                      <strong>{learningMemory?.layers.personalMemory.counts.accepted ?? 0}</strong>
+                      <span>accepted</span>
+                    </div>
+                    <div className="insight-stat-pill">
+                      <strong>{learningMemory?.layers.globalKnowledge.counts.patterns ?? 0}</strong>
+                      <span>общие паттерны</span>
+                    </div>
+                    <div className="insight-stat-pill">
+                      <strong>{learningMemory?.layers.globalKnowledge.counts.shared_promoted ?? 0}</strong>
+                      <span>promoted</span>
+                    </div>
+                  </div>
+                  <div className="profile-list knowledge-scroll-list system-memory-list">
+                    {systemMemoryFeed.length === 0 && (
+                      <div className="empty-card compact">Подтверждённые пары и общие паттерны пока не накопились.</div>
+                    )}
+                    {systemMemoryFeed.map((item) => (
+                      <div className="profile-list-item knowledge-event-item" key={item.id}>
+                        <div className="knowledge-event-main">
+                          <div className="knowledge-event-top">
+                            <strong>{item.title}</strong>
+                            <span className={item.badgeClassName}>{item.badge}</span>
+                          </div>
+                          <span>{item.description}</span>
+                          <div className="knowledge-chip-row">
+                            <span className={item.categoryClassName}>{item.categoryLabel}</span>
+                            {item.tags.map((tag, index) => (
+                              <span className="knowledge-inline-chip knowledge-inline-chip-muted" key={`${item.id}-${index}`}>
+                                {tag}
                               </span>
-                            </div>
-                            <div className="memory-layer-tags">
-                              {item.semanticRole && <span className="memory-tag">{item.semanticRole}</span>}
-                              {item.conceptCluster && <span className="memory-tag memory-tag-accent">{item.conceptCluster}</span>}
-                              {item.domainTags.slice(0, 3).map((tag) => (
-                                <span className="memory-tag memory-tag-muted" key={`${item.candidateId}-${tag}`}>
-                                  {tag}
-                                </span>
-                              ))}
-                            </div>
-                            <div className="memory-layer-metrics">
-                              <span>support {item.supportCount}</span>
-                              <span>users {item.uniqueUsers}</span>
-                              <span>accept rate {formatMetricScore(item.acceptanceRate)}</span>
-                              <span>drift {formatMetricScore(item.driftScore)}</span>
-                            </div>
-                            <div className="memory-layer-metrics">
-                              <span>sensitivity {formatMetricScore(item.sensitivityScore)}</span>
-                              <span>generalizability {formatMetricScore(item.generalizabilityScore)}</span>
-                              <span>conflict {formatMetricScore(item.semanticConflictRate)}</span>
-                            </div>
-                            {(item.promotionReason || item.rejectionReason) && (
-                              <small className="memory-layer-reason">
-                                {item.promotionReason
-                                  ? `promotion: ${item.promotionReason}`
-                                  : `reason: ${item.rejectionReason}`}
-                              </small>
-                            )}
+                            ))}
                           </div>
-                        ))}
+                          {item.note && <span className="knowledge-item-note">{item.note}</span>}
+                        </div>
+                        {item.timestamp && <small>{item.timestamp}</small>}
                       </div>
-                    </div>
+                    ))}
                   </div>
                 </section>
 
@@ -3353,96 +3160,49 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   <div className="pane-header">
                     <Sparkles size={16} /> Семантический граф
                   </div>
-                  <div className="semantic-graph-stats">
-                    <div className="semantic-graph-stat">
+                  <div className="insight-stat-row">
+                    <div className="insight-stat-pill">
                       <strong>{learningMemory?.layers.semanticGraph.counts.nodes ?? 0}</strong>
                       <span>узлов</span>
                     </div>
-                    <div className="semantic-graph-stat">
+                    <div className="insight-stat-pill">
                       <strong>{learningMemory?.layers.semanticGraph.counts.edges ?? 0}</strong>
                       <span>рёбер</span>
                     </div>
-                    <div className="semantic-graph-stat">
+                    <div className="insight-stat-pill">
                       <strong>{learningMemory?.layers.semanticGraph.counts.accepted ?? 0}</strong>
                       <span>accepted</span>
                     </div>
-                    <div className="semantic-graph-stat">
+                    <div className="insight-stat-pill">
                       <strong>{learningMemory?.layers.semanticGraph.counts.rejected ?? 0}</strong>
                       <span>rejected</span>
                     </div>
                   </div>
-                  <div className="profile-list semantic-graph-list">
-                    {semanticGraphClusters.length > 0 && (
-                      <div className="semantic-cluster-list">
-                        {semanticGraphClusters.map((cluster) => (
-                          <div className="semantic-cluster-card" key={cluster.clusterId}>
-                            <div className="semantic-cluster-top">
-                              <strong>Кластер из {cluster.size} полей</strong>
-                              <span>support {cluster.supportCount}</span>
-                            </div>
-                            <div className="semantic-cluster-tags">
-                              {cluster.sharedAttributes.map((attribute) => (
-                                <span className="semantic-cluster-tag" key={`${cluster.clusterId}-${attribute}`}>
-                                  {attribute}
-                                </span>
-                              ))}
-                              {cluster.sharedRoles.map((role) => (
-                                <span className="semantic-cluster-tag semantic-cluster-tag-role" key={`${cluster.clusterId}-${role}`}>
-                                  {semanticGraphRoleLabel(role)}
-                                </span>
-                              ))}
-                              {cluster.entities.map((entity) => (
-                                <span className="semantic-cluster-tag semantic-cluster-tag-entity" key={`${cluster.clusterId}-${entity}`}>
-                                  {entity}
-                                </span>
-                              ))}
-                            </div>
-                            <div className="semantic-cluster-fields">
-                              {cluster.fields.map((field) => (
-                                <div className="semantic-cluster-field" key={`${cluster.clusterId}-${field.fieldNorm}`}>
-                                  <strong>{field.field}</strong>
-                                  <span>
-                                    {field.entityToken ?? 'any'}.{field.attributeToken ?? 'field'} · {semanticGraphRoleLabel(field.roleLabel)}
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {semanticGraphHighlights.length === 0 && (
+                  <div className="profile-list semantic-graph-list knowledge-scroll-list">
+                    {semanticGraphFeed.length === 0 && (
                       <div className="empty-card compact">
                         Пока граф пуст. Он начнёт расти после подтверждённых и отклонённых сопоставлений.
                       </div>
                     )}
-                    {semanticGraphHighlights.map((edge) => (
-                      <div className="profile-list-item semantic-graph-item" key={`${edge.leftFieldNorm}-${edge.rightFieldNorm}-${edge.relationKind}`}>
-                        <div className="semantic-graph-main">
-                          <div className="semantic-graph-top">
-                            <strong>
-                              {edge.leftField} ↔ {edge.rightField}
-                            </strong>
-                            <span className={`semantic-graph-kind semantic-graph-kind-${edge.relationKind}`}>
-                              {semanticGraphRelationLabel(edge.relationKind)}
-                            </span>
+                    {semanticGraphFeed.map((item) => (
+                      <div className="profile-list-item knowledge-event-item semantic-graph-item" key={item.id}>
+                        <div className="knowledge-event-main">
+                          <div className="knowledge-event-top">
+                            <strong>{item.title}</strong>
+                            <span className={item.badgeClassName}>{item.badge}</span>
                           </div>
-                          <div className="semantic-graph-meta-row">
-                            <span>
-                              {edge.leftEntityToken ?? 'any'}.{edge.leftAttributeToken ?? 'field'} · {semanticGraphRoleLabel(edge.leftRoleLabel)}
-                            </span>
-                            <span>
-                              {edge.rightEntityToken ?? 'any'}.{edge.rightAttributeToken ?? 'field'} · {semanticGraphRoleLabel(edge.rightRoleLabel)}
-                            </span>
+                          <span>{item.description}</span>
+                          <div className="knowledge-chip-row">
+                            <span className={item.categoryClassName}>{item.categoryLabel}</span>
+                            {item.tags.map((tag, index) => (
+                              <span className="knowledge-inline-chip knowledge-inline-chip-muted" key={`${item.id}-${index}`}>
+                                {tag}
+                              </span>
+                            ))}
                           </div>
-                          <div className="semantic-graph-meta-row semantic-graph-metrics">
-                            <span>support {edge.supportCount}</span>
-                            <span>accepted {edge.acceptedCount}</span>
-                            <span>rejected {edge.rejectedCount}</span>
-                            <span>{edge.confidenceBand}</span>
-                          </div>
+                          {item.note && <span className="knowledge-item-note">{item.note}</span>}
                         </div>
-                        <small>{edge.lastSeenAt ? new Date(edge.lastSeenAt).toLocaleString() : '—'}</small>
+                        {item.timestamp && <small>{item.timestamp}</small>}
                       </div>
                     ))}
                   </div>
