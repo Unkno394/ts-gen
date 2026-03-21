@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
+from auth_session import create_access_token, get_current_user, get_optional_current_user, invalidate_user_cache
 from draft_json_pipeline import generate_draft_json_for_source
 from email_service import (
     EmailDeliveryError,
@@ -149,7 +150,12 @@ def register(payload: RegisterPayload) -> dict:
 
     try:
         consume_registration_code(payload.email, payload.verification_code)
-        return register_user(name=payload.name or '', email=payload.email, password=payload.password)
+        profile = register_user(name=payload.name or '', email=payload.email, password=payload.password)
+        return {
+            **profile,
+            'access_token': create_access_token(profile['id']),
+            'token_type': 'bearer',
+        }
     except UserConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except EmailDeliveryError as exc:
@@ -193,11 +199,14 @@ def verify_reset_code(payload: VerifyResetCodePayload) -> dict:
 
 
 @router.post('/auth/send-email-change-code')
-def send_email_change_code(payload: EmailChangeCodePayload) -> dict:
+def send_email_change_code(
+    payload: EmailChangeCodePayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
-        current_email, normalized_new_email = prepare_email_change(payload.user_id, payload.new_email)
+        current_email, normalized_new_email = prepare_email_change(current_user['id'], payload.new_email)
         return request_email_change_code(
-            user_id=payload.user_id,
+            user_id=current_user['id'],
             current_email=current_email,
             new_email=normalized_new_email,
         )
@@ -208,16 +217,21 @@ def send_email_change_code(payload: EmailChangeCodePayload) -> dict:
 
 
 @router.post('/auth/change-email')
-def change_email(payload: ChangeEmailPayload) -> dict:
+def change_email(
+    payload: ChangeEmailPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         if payload.current_password and payload.current_password.strip():
-            verify_user_password(payload.user_id, payload.current_password)
+            verify_user_password(current_user['id'], payload.current_password)
         elif payload.verification_code and payload.verification_code.strip():
-            consume_email_change_code(payload.user_id, payload.new_email, payload.verification_code)
+            consume_email_change_code(current_user['id'], payload.new_email, payload.verification_code)
         else:
             raise EmailChangeError('Подтвердите смену почты паролем или кодом из письма.')
 
-        return change_user_email(payload.user_id, payload.new_email)
+        updated_profile = change_user_email(current_user['id'], payload.new_email)
+        invalidate_user_cache(current_user['id'])
+        return updated_profile
     except InvalidCredentialsError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except (UserNotFoundError, EmailChangeError) as exc:
@@ -227,17 +241,26 @@ def change_email(payload: ChangeEmailPayload) -> dict:
 
 
 @router.post('/auth/update-profile')
-def update_profile(payload: UpdateProfilePayload) -> dict:
+def update_profile(
+    payload: UpdateProfilePayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
-        return update_user_profile_name(payload.user_id, payload.name)
+        updated_profile = update_user_profile_name(current_user['id'], payload.name)
+        invalidate_user_cache(current_user['id'])
+        return updated_profile
     except (UserNotFoundError, ProfileUpdateError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post('/auth/change-password')
-def change_password(payload: ChangePasswordPayload) -> dict:
+def change_password(
+    payload: ChangePasswordPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
-        change_user_password(payload.user_id, payload.current_password, payload.new_password)
+        change_user_password(current_user['id'], payload.current_password, payload.new_password)
+        invalidate_user_cache(current_user['id'])
         return {'message': 'Пароль обновлён.'}
     except InvalidCredentialsError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
@@ -248,7 +271,12 @@ def change_password(payload: ChangePasswordPayload) -> dict:
 @router.post('/auth/login')
 def login(payload: AuthPayload) -> dict:
     try:
-        return login_user(email=payload.email, password=payload.password)
+        profile = login_user(email=payload.email, password=payload.password)
+        return {
+            **profile,
+            'access_token': create_access_token(profile['id']),
+            'token_type': 'bearer',
+        }
     except InvalidCredentialsError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
@@ -257,24 +285,25 @@ def login(payload: AuthPayload) -> dict:
 async def generate(
     file: UploadFile = File(...),
     target_json: str = Form(...),
-    user_id: str | None = Form(default=None),
     selected_sheet: str | None = Form(default=None),
     keep_guest_file: bool = Form(default=False),
+    current_user: dict[str, str] | None = Depends(get_optional_current_user),
 ) -> dict:
     cleanup_expired_guest_files()
 
     filename = file.filename or 'uploaded_file'
     file_bytes = await file.read()
-    mode = 'authorized' if user_id else 'guest'
+    resolved_user_id = current_user['id'] if current_user else None
+    mode = 'authorized' if resolved_user_id else 'guest'
 
     try:
-        saved_path = save_upload(file_bytes, filename, mode=mode, user_id=user_id)
+        saved_path = save_upload(file_bytes, filename, mode=mode, user_id=resolved_user_id)
         upload_record_id = record_uploaded_file(
             file_path=saved_path,
             original_file_name=filename,
             file_bytes=file_bytes,
             mode=mode,
-            user_id=user_id,
+            user_id=resolved_user_id,
         )
         parsed = parse_file(saved_path, filename)
         target_fields, target_payload = infer_target_fields(target_json)
@@ -285,13 +314,13 @@ async def generate(
             target_json=json.dumps(target_payload, ensure_ascii=False),
             selected_sheet=selected_sheet,
             source_columns=source_columns,
-            user_id=user_id,
+            user_id=resolved_user_id,
         )
         mapping_result = resolve_generation_mappings_detailed(
             source_columns=source_columns,
             target_fields=target_fields,
             source_rows=source_rows,
-            user_id=user_id,
+            user_id=resolved_user_id,
             schema_fingerprint_id=resolved_schema_fingerprint_id,
         )
         mappings = mapping_result['mappings']
@@ -304,9 +333,9 @@ async def generate(
 
         generation_id = None
         response_mappings = serialized_mappings
-        if user_id:
+        if resolved_user_id:
             generation_id = save_generation(
-                user_id=user_id,
+                user_id=resolved_user_id,
                 file_name=parsed.file_name,
                 file_path=str(saved_path),
                 file_type=parsed.file_type,
@@ -325,7 +354,7 @@ async def generate(
             response_mappings = save_mapping_suggestions(
                 generation_id=generation_id,
                 mappings=serialized_mappings,
-                user_id=user_id,
+                user_id=resolved_user_id,
                 schema_fingerprint_id=resolved_schema_fingerprint_id,
             )
         else:
@@ -361,7 +390,7 @@ async def generate(
         logger.warning(
             'generate parse failed: file=%s user_id=%s selected_sheet=%s target_json_preview=%s error=%s',
             filename,
-            user_id or 'guest',
+            resolved_user_id or 'guest',
             selected_sheet,
             _preview_text(target_json),
             exc,
@@ -373,7 +402,7 @@ async def generate(
         logger.exception(
             'generate failed: file=%s user_id=%s selected_sheet=%s keep_guest_file=%s error=%s',
             filename,
-            user_id or 'guest',
+            resolved_user_id or 'guest',
             selected_sheet,
             keep_guest_file,
             exc,
@@ -384,24 +413,25 @@ async def generate(
 @router.post('/draft-json')
 async def draft_json(
     file: UploadFile = File(...),
-    user_id: str | None = Form(default=None),
     selected_sheet: str | None = Form(default=None),
     keep_guest_file: bool = Form(default=False),
+    current_user: dict[str, str] | None = Depends(get_optional_current_user),
 ) -> dict:
     cleanup_expired_guest_files()
 
     filename = file.filename or 'uploaded_file'
     file_bytes = await file.read()
-    mode = 'authorized' if user_id else 'guest'
+    resolved_user_id = current_user['id'] if current_user else None
+    mode = 'authorized' if resolved_user_id else 'guest'
 
     try:
-        saved_path = save_upload(file_bytes, filename, mode=mode, user_id=user_id)
+        saved_path = save_upload(file_bytes, filename, mode=mode, user_id=resolved_user_id)
         upload_record_id = record_uploaded_file(
             file_path=saved_path,
             original_file_name=filename,
             file_bytes=file_bytes,
             mode=mode,
-            user_id=user_id,
+            user_id=resolved_user_id,
         )
         parsed = parse_file(saved_path, filename)
         source_columns, source_rows, source_warnings = resolve_generation_source(parsed, selected_sheet)
@@ -411,21 +441,21 @@ async def draft_json(
             target_json=json.dumps({}, ensure_ascii=False),
             selected_sheet=selected_sheet,
             source_columns=source_columns,
-            user_id=user_id,
+            user_id=resolved_user_id,
         )
         draft_payload, field_suggestions, draft_warnings = generate_draft_json_for_source(
             source_columns=source_columns,
             source_rows=source_rows,
-            user_id=user_id,
+            user_id=resolved_user_id,
             schema_fingerprint_id=schema_fingerprint_id,
         )
         all_warnings = parsed.warnings + source_warnings + draft_warnings
         response_field_suggestions = field_suggestions
 
-        if user_id:
+        if resolved_user_id:
             response_field_suggestions = save_draft_json_suggestions(
                 suggestions=field_suggestions,
-                user_id=user_id,
+                user_id=resolved_user_id,
                 schema_fingerprint_id=schema_fingerprint_id,
             )
 
@@ -439,7 +469,7 @@ async def draft_json(
             upload_id=upload_record_id,
             schema_fingerprint_id=schema_fingerprint_id,
             file_path=saved_path,
-            keep_file=bool(user_id) or keep_guest_file,
+            keep_file=bool(resolved_user_id) or keep_guest_file,
         )
 
         return {
@@ -454,7 +484,7 @@ async def draft_json(
         logger.warning(
             'draft-json parse failed: file=%s user_id=%s selected_sheet=%s error=%s',
             filename,
-            user_id or 'guest',
+            resolved_user_id or 'guest',
             selected_sheet,
             exc,
         )
@@ -465,7 +495,7 @@ async def draft_json(
         logger.exception(
             'draft-json failed: file=%s user_id=%s selected_sheet=%s keep_guest_file=%s error=%s',
             filename,
-            user_id or 'guest',
+            resolved_user_id or 'guest',
             selected_sheet,
             keep_guest_file,
             exc,
@@ -473,9 +503,9 @@ async def draft_json(
         raise HTTPException(status_code=500, detail='Произошла внутренняя ошибка сервера. Попробуйте ещё раз.') from exc
 
 
-@router.get('/history/{user_id}')
-def history(user_id: str) -> dict:
-    items = get_history(user_id)
+@router.get('/history')
+def history(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
+    items = get_history(current_user['id'])
     normalized = []
     for item in items:
         normalized.append(
@@ -497,38 +527,41 @@ def history(user_id: str) -> dict:
     return {'items': normalized}
 
 
-@router.delete('/history/{user_id}/{generation_id}')
-def delete_history_entry(user_id: str, generation_id: int) -> dict:
+@router.delete('/history/{generation_id}')
+def delete_history_entry(generation_id: int, current_user: dict[str, str] = Depends(get_current_user)) -> dict:
     try:
-        return delete_generation_history_entry(user_id=user_id, generation_id=generation_id)
+        return delete_generation_history_entry(user_id=current_user['id'], generation_id=generation_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get('/learning/summary/{user_id}')
-def learning_summary(user_id: str) -> dict:
-    return get_learning_summary(user_id)
+@router.get('/learning/summary')
+def learning_summary(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
+    return get_learning_summary(current_user['id'])
 
 
-@router.get('/learning/events/{user_id}')
-def learning_events(user_id: str, limit: int = 20) -> dict:
-    return {'items': list_learning_events(user_id, limit=limit)}
+@router.get('/learning/events')
+def learning_events(limit: int = 20, current_user: dict[str, str] = Depends(get_current_user)) -> dict:
+    return {'items': list_learning_events(current_user['id'], limit=limit)}
 
 
-@router.get('/learning/memory/{user_id}')
-def learning_memory(user_id: str, limit: int = 20) -> dict:
-    return get_learning_memory_layers(user_id, limit=limit)
+@router.get('/learning/memory')
+def learning_memory(limit: int = 20, current_user: dict[str, str] = Depends(get_current_user)) -> dict:
+    return get_learning_memory_layers(current_user['id'], limit=limit)
 
 
-@router.get('/learning/templates/{user_id}')
-def learning_templates(user_id: str) -> dict:
-    return {'items': list_user_templates(user_id)}
+@router.get('/learning/templates')
+def learning_templates(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
+    return {'items': list_user_templates(current_user['id'])}
 
 
 @router.post('/learning/templates')
-def learning_save_template(payload: UserTemplatePayload) -> dict:
+def learning_save_template(
+    payload: UserTemplatePayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     return save_user_template(
-        user_id=payload.user_id,
+        user_id=current_user['id'],
         name=payload.name,
         template_kind=payload.template_kind,
         template_json=payload.template_json,
@@ -543,9 +576,12 @@ def learning_save_template(payload: UserTemplatePayload) -> dict:
 
 
 @router.post('/learning/corrections')
-def learning_save_corrections(payload: CorrectionSessionPayload) -> dict:
+def learning_save_corrections(
+    payload: CorrectionSessionPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     return save_correction_session(
-        user_id=payload.user_id,
+        user_id=current_user['id'],
         generation_id=payload.generation_id,
         session_type=payload.session_type,
         schema_fingerprint_id=payload.schema_fingerprint_id,
@@ -556,9 +592,12 @@ def learning_save_corrections(payload: CorrectionSessionPayload) -> dict:
 
 
 @router.post('/learning/mapping-feedback')
-def learning_mapping_feedback(payload: MappingFeedbackPayload) -> dict:
+def learning_mapping_feedback(
+    payload: MappingFeedbackPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     return apply_mapping_feedback(
-        user_id=payload.user_id,
+        user_id=current_user['id'],
         generation_id=payload.generation_id,
         schema_fingerprint_id=payload.schema_fingerprint_id,
         notes=payload.notes,
@@ -568,10 +607,13 @@ def learning_mapping_feedback(payload: MappingFeedbackPayload) -> dict:
 
 
 @router.post('/learning/confirm-generation')
-def learning_confirm_generation(payload: GenerationConfirmationPayload) -> dict:
+def learning_confirm_generation(
+    payload: GenerationConfirmationPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return confirm_generation_learning(
-            user_id=payload.user_id,
+            user_id=current_user['id'],
             generation_id=payload.generation_id,
             notes=payload.notes,
         )
@@ -580,10 +622,13 @@ def learning_confirm_generation(payload: GenerationConfirmationPayload) -> dict:
 
 
 @router.post('/learning/draft-json-feedback')
-def learning_draft_json_feedback(payload: DraftJsonFeedbackPayload) -> dict:
+def learning_draft_json_feedback(
+    payload: DraftJsonFeedbackPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return apply_draft_json_feedback(
-            user_id=payload.user_id,
+            user_id=current_user['id'],
             schema_fingerprint_id=payload.schema_fingerprint_id,
             draft_json=payload.draft_json,
             feedback=[_model_to_dict(item) for item in payload.feedback],
@@ -597,7 +642,10 @@ def learning_draft_json_feedback(payload: DraftJsonFeedbackPayload) -> dict:
 
 
 @router.post('/learning/promote-patterns')
-def learning_promote_patterns(payload: PatternPromotionPayload) -> dict:
+def learning_promote_patterns(
+    payload: PatternPromotionPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     return promote_stable_pattern_candidates(
         min_support_count=payload.min_support_count,
         min_distinct_users=payload.min_distinct_users,
@@ -611,7 +659,10 @@ def learning_promote_patterns(payload: PatternPromotionPayload) -> dict:
 
 
 @router.post('/learning/training-snapshots')
-def learning_create_training_snapshot(payload: TrainingSnapshotPayload) -> dict:
+def learning_create_training_snapshot(
+    payload: TrainingSnapshotPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return create_training_snapshot(
             name=payload.name,
@@ -624,7 +675,11 @@ def learning_create_training_snapshot(payload: TrainingSnapshotPayload) -> dict:
 
 
 @router.post('/learning/training-snapshots/{snapshot_id}/export')
-def learning_export_training_snapshot(snapshot_id: int, payload: TrainingSnapshotExportPayload) -> dict:
+def learning_export_training_snapshot(
+    snapshot_id: int,
+    payload: TrainingSnapshotExportPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return export_training_snapshot(
             snapshot_id=snapshot_id,
@@ -635,7 +690,10 @@ def learning_export_training_snapshot(snapshot_id: int, payload: TrainingSnapsho
 
 
 @router.post('/learning/training-runs')
-def learning_create_training_run(payload: TrainingRunPayload) -> dict:
+def learning_create_training_run(
+    payload: TrainingRunPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return create_model_training_run(
             snapshot_id=payload.snapshot_id,
@@ -649,7 +707,11 @@ def learning_create_training_run(payload: TrainingRunPayload) -> dict:
 
 
 @router.post('/learning/training-runs/{training_run_id}/start')
-def learning_start_training_run(training_run_id: int, payload: TrainingRunStartPayload) -> dict:
+def learning_start_training_run(
+    training_run_id: int,
+    payload: TrainingRunStartPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return start_model_training_run(
             training_run_id=training_run_id,
@@ -664,7 +726,11 @@ def learning_start_training_run(training_run_id: int, payload: TrainingRunStartP
 
 
 @router.post('/learning/training-runs/{training_run_id}/complete')
-def learning_complete_training_run(training_run_id: int, payload: TrainingRunCompletionPayload) -> dict:
+def learning_complete_training_run(
+    training_run_id: int,
+    payload: TrainingRunCompletionPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return complete_model_training_run(
             training_run_id=training_run_id,
@@ -681,7 +747,11 @@ def learning_complete_training_run(training_run_id: int, payload: TrainingRunCom
 
 
 @router.post('/learning/training-runs/{training_run_id}/activate')
-def learning_activate_training_run(training_run_id: int, payload: TrainingRunActivationPayload) -> dict:
+def learning_activate_training_run(
+    training_run_id: int,
+    payload: TrainingRunActivationPayload,
+    current_user: dict[str, str] = Depends(get_current_user),
+) -> dict:
     try:
         return activate_model_training_run(
             training_run_id=training_run_id,
@@ -695,13 +765,13 @@ def learning_activate_training_run(training_run_id: int, payload: TrainingRunAct
 
 
 @router.get('/learning/model-runtime')
-def learning_model_runtime() -> dict:
+def learning_model_runtime(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
     return get_model_runtime_status()
 
 
-@router.get('/auth/profile/{user_id}')
-def auth_profile(user_id: str) -> dict:
+@router.get('/auth/profile')
+def auth_profile(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
     try:
-        return get_user_profile(user_id)
+        return get_user_profile(current_user['id'])
     except UserNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

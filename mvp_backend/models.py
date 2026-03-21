@@ -87,24 +87,20 @@ class VerifyResetCodePayload(BaseModel):
 
 
 class EmailChangeCodePayload(BaseModel):
-    user_id: str
     new_email: str
 
 
 class ChangeEmailPayload(BaseModel):
-    user_id: str
     new_email: str
     current_password: str | None = None
     verification_code: str | None = None
 
 
 class UpdateProfilePayload(BaseModel):
-    user_id: str
     name: str
 
 
 class ChangePasswordPayload(BaseModel):
-    user_id: str
     current_password: str
     new_password: str
 
@@ -113,6 +109,11 @@ class UserProfile(BaseModel):
     id: str
     name: str
     email: str
+
+
+class AuthenticatedUserProfile(UserProfile):
+    access_token: str
+    token_type: Literal['bearer'] = 'bearer'
 
 
 class ManualCorrection(BaseModel):
@@ -140,7 +141,6 @@ class ManualCorrection(BaseModel):
 
 
 class CorrectionSessionPayload(BaseModel):
-    user_id: str
     generation_id: int | None = None
     session_type: Literal['manual_review', 'post_generation_fix', 'template_authoring', 'feedback_loop'] = 'manual_review'
     schema_fingerprint_id: int | None = None
@@ -150,7 +150,6 @@ class CorrectionSessionPayload(BaseModel):
 
 
 class UserTemplatePayload(BaseModel):
-    user_id: str
     name: str
     template_kind: Literal['transform', 'mapping', 'postprocess', 'schema', 'hybrid'] = 'transform'
     template_json: dict[str, Any]
@@ -176,7 +175,6 @@ class MappingFeedbackItem(BaseModel):
 
 
 class MappingFeedbackPayload(BaseModel):
-    user_id: str
     generation_id: int
     schema_fingerprint_id: int | None = None
     notes: str | None = None
@@ -240,7 +238,6 @@ class TrainingRunActivationPayload(BaseModel):
 
 
 class GenerationConfirmationPayload(BaseModel):
-    user_id: str
     generation_id: int
     notes: str | None = None
 
@@ -257,7 +254,6 @@ class DraftJsonFeedbackItem(BaseModel):
 
 
 class DraftJsonFeedbackPayload(BaseModel):
-    user_id: str
     schema_fingerprint_id: int
     draft_json: dict[str, Any]
     template_name: str | None = None

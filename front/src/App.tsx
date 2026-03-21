@@ -1,7 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { BrandLogo, SPLASH_LOGO_PATHS } from './components/BrandLogo';
 import { VibeBackground } from './components/VibeBackground';
-import { fetchHistory } from './lib/api';
+import { clearAuthToken, fetchCurrentProfile, fetchHistory } from './lib/api';
 import type { HistoryItem, UserProfile } from './types';
 
 const USER_KEY = 'tsgen.user';
@@ -69,7 +69,7 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
-    async function loadHistory() {
+    async function loadSessionData() {
       if (!profile || profile.skipped) {
         setHistory([]);
         localStorage.removeItem(HISTORY_KEY);
@@ -77,7 +77,15 @@ export default function App() {
       }
 
       try {
-        const next = await fetchHistory(profile.id);
+        const nextProfile = await fetchCurrentProfile();
+        if (cancelled) {
+          return;
+        }
+
+        localStorage.setItem(USER_KEY, JSON.stringify(nextProfile));
+        setProfile(nextProfile);
+
+        const next = await fetchHistory(nextProfile.id);
         if (!cancelled) {
           setHistory(next);
           localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
@@ -85,15 +93,20 @@ export default function App() {
       } catch (error) {
         if (!cancelled) {
           console.error(error);
+          clearAuthToken();
+          localStorage.removeItem(USER_KEY);
+          localStorage.removeItem(HISTORY_KEY);
+          setHistory([]);
+          setProfile(null);
         }
       }
     }
 
-    void loadHistory();
+    void loadSessionData();
     return () => {
       cancelled = true;
     };
-  }, [profile]);
+  }, [profile?.id, profile?.skipped]);
 
   const actions = useMemo(
     () => ({
@@ -102,6 +115,7 @@ export default function App() {
         setProfile(next);
       },
       logout() {
+        clearAuthToken();
         localStorage.removeItem(USER_KEY);
         localStorage.removeItem(HISTORY_KEY);
         setHistory([]);

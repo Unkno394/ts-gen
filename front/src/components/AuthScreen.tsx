@@ -2,6 +2,7 @@ import { ArrowLeft, ArrowRight, Eye, EyeOff, KeyRound, LogIn, Mail, ShieldCheck,
 import { useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import {
+  clearAuthToken,
   completePasswordReset,
   loginWithBackend,
   registerWithBackend,
@@ -518,7 +519,10 @@ export function AuthScreen({ onComplete }: Props) {
 
             <button
               className="register-cta ghost-btn ghost-btn-v2"
-              onClick={() => onComplete({ id: crypto.randomUUID(), name: 'Guest', email: 'guest@local', skipped: true })}
+              onClick={() => {
+                clearAuthToken();
+                onComplete({ id: crypto.randomUUID(), name: 'Guest', email: 'guest@local', skipped: true });
+              }}
               type="button"
             >
               <ArrowRight size={16} />

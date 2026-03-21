@@ -343,6 +343,11 @@ type BackendUserProfile = {
   email: string;
 };
 
+type BackendAuthenticatedUserProfile = BackendUserProfile & {
+  access_token: string;
+  token_type: 'bearer';
+};
+
 type BackendSendCodeResponse = {
   message: string;
   expires_in: number;
@@ -359,6 +364,49 @@ type BackendVerifyResetCodeResponse = {
 
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const AUTH_TOKEN_KEY = 'tsgen.authToken';
+
+let authTokenCache: string | null | undefined;
+
+function readStoredAuthToken(): string | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function getAuthToken(): string | null {
+  if (authTokenCache === undefined) {
+    authTokenCache = readStoredAuthToken();
+  }
+  return authTokenCache ?? null;
+}
+
+export function setAuthToken(token: string | null): void {
+  authTokenCache = token?.trim() || null;
+
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    if (authTokenCache) {
+      localStorage.setItem(AUTH_TOKEN_KEY, authTokenCache);
+    } else {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+  } catch {
+    // Ignore storage failures and keep the in-memory token.
+  }
+}
+
+export function clearAuthToken(): void {
+  setAuthToken(null);
+}
 
 function resolveTimeoutMs(envKey: 'VITE_REQUEST_TIMEOUT_MS' | 'VITE_GENERATE_TIMEOUT_MS', fallbackMs: number): number {
   const rawValue = (import.meta.env as ImportMetaEnv & { VITE_REQUEST_TIMEOUT_MS?: string; VITE_GENERATE_TIMEOUT_MS?: string })[
@@ -453,10 +501,17 @@ async function parseJson<T>(response: Response): Promise<T> {
 async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const headers = new Headers(init.headers ?? undefined);
+  const authToken = getAuthToken();
+
+  if (authToken && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${authToken}`);
+  }
 
   try {
     return await fetch(input, {
       ...init,
+      headers,
       signal: controller.signal,
     });
   } catch (error) {
@@ -485,19 +540,47 @@ async function postJson<T>(path: string, payload: Record<string, unknown>, timeo
 }
 
 export async function registerWithBackend({ email, password, name, verificationCode }: AuthParams): Promise<UserProfile> {
-  return postJson<BackendUserProfile>('/api/auth/register', {
+  const response = await postJson<BackendAuthenticatedUserProfile>('/api/auth/register', {
     email,
     password,
     name,
     verification_code: verificationCode,
   });
+  setAuthToken(response.access_token);
+  return {
+    id: response.id,
+    name: response.name,
+    email: response.email,
+  };
 }
 
 export async function loginWithBackend({ email, password }: AuthParams): Promise<UserProfile> {
-  return postJson<BackendUserProfile>('/api/auth/login', {
+  const response = await postJson<BackendAuthenticatedUserProfile>('/api/auth/login', {
     email,
     password,
   });
+  setAuthToken(response.access_token);
+  return {
+    id: response.id,
+    name: response.name,
+    email: response.email,
+  };
+}
+
+export async function fetchCurrentProfile(): Promise<UserProfile> {
+  const response = await fetchWithTimeout(
+    buildApiUrl('/api/auth/profile'),
+    {
+      method: 'GET',
+    },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+  const payload = await parseJson<BackendUserProfile>(response);
+  return {
+    id: payload.id,
+    name: payload.name,
+    email: payload.email,
+  };
 }
 
 export async function requestRegistrationCode(email: string): Promise<{ message: string; expiresIn: number }> {
@@ -524,7 +607,6 @@ export async function requestPasswordResetCode(email: string): Promise<{ message
 
 export async function requestEmailChangeCode(params: { userId: string; newEmail: string }): Promise<{ message: string; expiresIn: number }> {
   const response = await postJson<BackendSendCodeResponse>('/api/auth/send-email-change-code', {
-    user_id: params.userId,
     new_email: params.newEmail,
   });
 
@@ -566,7 +648,6 @@ export async function completePasswordReset(params: { email: string; password: s
 
 export async function changeEmailWithPassword(params: { userId: string; newEmail: string; currentPassword: string }): Promise<UserProfile> {
   return postJson<BackendUserProfile>('/api/auth/change-email', {
-    user_id: params.userId,
     new_email: params.newEmail,
     current_password: params.currentPassword,
   });
@@ -574,7 +655,6 @@ export async function changeEmailWithPassword(params: { userId: string; newEmail
 
 export async function changeEmailWithCode(params: { userId: string; newEmail: string; verificationCode: string }): Promise<UserProfile> {
   return postJson<BackendUserProfile>('/api/auth/change-email', {
-    user_id: params.userId,
     new_email: params.newEmail,
     verification_code: params.verificationCode,
   });
@@ -582,27 +662,22 @@ export async function changeEmailWithCode(params: { userId: string; newEmail: st
 
 export async function updateProfileName(params: { userId: string; name: string }): Promise<UserProfile> {
   return postJson<BackendUserProfile>('/api/auth/update-profile', {
-    user_id: params.userId,
     name: params.name,
   });
 }
 
 export async function changePasswordWithBackend(params: { userId: string; currentPassword: string; newPassword: string }): Promise<string> {
   const response = await postJson<BackendMessageResponse>('/api/auth/change-password', {
-    user_id: params.userId,
     current_password: params.currentPassword,
     new_password: params.newPassword,
   });
   return response.message;
 }
 
-export async function generateFromBackend({ file, targetJson, userId, selectedSheet }: GenerateParams): Promise<GenerationResult> {
+export async function generateFromBackend({ file, targetJson, userId: _userId, selectedSheet }: GenerateParams): Promise<GenerationResult> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('target_json', targetJson);
-  if (userId) {
-    formData.append('user_id', userId);
-  }
   if (selectedSheet) {
     formData.append('selected_sheet', selectedSheet);
   }
@@ -654,9 +729,9 @@ export async function fetchSourcePreviewFromBackend(file: File) {
   return normalizeParsedFile(payload.parsed_file);
 }
 
-export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
+export async function fetchHistory(_userId: string): Promise<HistoryItem[]> {
   const response = await fetchWithTimeout(
-    buildApiUrl(`/api/history/${encodeURIComponent(userId)}`),
+    buildApiUrl('/api/history'),
     {
       method: 'GET',
     },
@@ -695,9 +770,9 @@ export async function fetchHistory(userId: string): Promise<HistoryItem[]> {
   }));
 }
 
-export async function deleteHistoryEntry(userId: string, generationId: string): Promise<BackendDeleteHistoryResponse> {
+export async function deleteHistoryEntry(_userId: string, generationId: string): Promise<BackendDeleteHistoryResponse> {
   const response = await fetchWithTimeout(
-    buildApiUrl(`/api/history/${encodeURIComponent(userId)}/${encodeURIComponent(generationId)}`),
+    buildApiUrl(`/api/history/${encodeURIComponent(generationId)}`),
     {
       method: 'DELETE',
     },
@@ -706,9 +781,9 @@ export async function deleteHistoryEntry(userId: string, generationId: string): 
   return parseJson<BackendDeleteHistoryResponse>(response);
 }
 
-export async function fetchLearningSummary(userId: string): Promise<LearningSummary> {
+export async function fetchLearningSummary(_userId: string): Promise<LearningSummary> {
   const response = await fetchWithTimeout(
-    buildApiUrl(`/api/learning/summary/${encodeURIComponent(userId)}`),
+    buildApiUrl('/api/learning/summary'),
     {
       method: 'GET',
     },
@@ -732,9 +807,9 @@ export async function fetchLearningSummary(userId: string): Promise<LearningSumm
   };
 }
 
-export async function fetchLearningEvents(userId: string, limit = 20): Promise<LearningEvent[]> {
+export async function fetchLearningEvents(_userId: string, limit = 20): Promise<LearningEvent[]> {
   const response = await fetchWithTimeout(
-    buildApiUrl(`/api/learning/events/${encodeURIComponent(userId)}?limit=${encodeURIComponent(String(limit))}`),
+    buildApiUrl(`/api/learning/events?limit=${encodeURIComponent(String(limit))}`),
     {
       method: 'GET',
     },
@@ -752,9 +827,9 @@ export async function fetchLearningEvents(userId: string, limit = 20): Promise<L
   }));
 }
 
-export async function fetchLearningMemory(userId: string, limit = 20): Promise<LearningMemory> {
+export async function fetchLearningMemory(_userId: string, limit = 20): Promise<LearningMemory> {
   const response = await fetchWithTimeout(
-    buildApiUrl(`/api/learning/memory/${encodeURIComponent(userId)}?limit=${encodeURIComponent(String(limit))}`),
+    buildApiUrl(`/api/learning/memory?limit=${encodeURIComponent(String(limit))}`),
     {
       method: 'GET',
     },
@@ -883,7 +958,6 @@ export async function saveLearningCorrections(params: {
   corrections: ManualCorrectionInput[];
 }): Promise<CorrectionSessionResult> {
   const response = await postJson<BackendCorrectionSessionResponse>('/api/learning/corrections', {
-    user_id: params.userId,
     generation_id: params.generationId ?? null,
     session_type: params.sessionType ?? 'manual_review',
     notes: params.notes ?? null,
@@ -921,9 +995,6 @@ export async function generateDraftJsonFromBackend(params: {
 }): Promise<DraftJsonResult> {
   const formData = new FormData();
   formData.append('file', params.file);
-  if (params.userId) {
-    formData.append('user_id', params.userId);
-  }
   if (params.selectedSheet) {
     formData.append('selected_sheet', params.selectedSheet);
   }
@@ -976,7 +1047,6 @@ export async function sendMappingFeedback(params: {
   }>;
 }): Promise<MappingFeedbackResult> {
   const response = await postJson<BackendCorrectionSessionResponse>('/api/learning/mapping-feedback', {
-    user_id: params.userId,
     generation_id: params.generationId,
     schema_fingerprint_id: params.schemaFingerprintId ?? null,
     notes: params.notes ?? null,
@@ -1022,7 +1092,6 @@ export async function confirmGenerationLearning(params: {
   notes?: string;
 }): Promise<GenerationConfirmationResult> {
   const response = await postJson<BackendGenerationConfirmationResponse>('/api/learning/confirm-generation', {
-    user_id: params.userId,
     generation_id: params.generationId,
     notes: params.notes ?? null,
   });
@@ -1057,7 +1126,6 @@ export async function saveDraftJsonFeedback(params: {
   }>;
 }): Promise<DraftJsonFeedbackResult> {
   const response = await postJson<BackendDraftJsonFeedbackResponse>('/api/learning/draft-json-feedback', {
-    user_id: params.userId,
     schema_fingerprint_id: params.schemaFingerprintId,
     draft_json: params.draftJson,
     template_name: params.templateName ?? null,
