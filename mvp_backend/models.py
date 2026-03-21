@@ -83,6 +83,8 @@ class ScalarFieldCandidate(BaseModel):
     value: Any
     source_ref: dict[str, Any] = Field(default_factory=dict)
     confidence: Literal['high', 'medium', 'low'] = 'medium'
+    confidence_score: float | None = None
+    ambiguity_reason: str | None = None
 
 
 class OptionItem(BaseModel):
@@ -90,6 +92,9 @@ class OptionItem(BaseModel):
     selected: bool = False
     marker_text: str | None = None
     source_ref: dict[str, Any] = Field(default_factory=dict)
+    selection_confidence: float | None = None
+    is_ambiguous: bool = False
+    ambiguity_reason: str | None = None
 
 
 class QuestionGroup(BaseModel):
@@ -98,6 +103,10 @@ class QuestionGroup(BaseModel):
     group_type: Literal['single_choice', 'multi_choice', 'unknown'] = 'unknown'
     options: list[OptionItem] = Field(default_factory=list)
     source_ref: dict[str, Any] = Field(default_factory=dict)
+    group_confidence: float | None = None
+    selection_confidence: float | None = None
+    is_ambiguous: bool = False
+    ambiguity_reason: str | None = None
 
 
 class FormFieldResolution(BaseModel):
@@ -113,6 +122,7 @@ class FormFieldResolution(BaseModel):
 class FormDocumentModel(BaseModel):
     scalars: list[ScalarFieldCandidate] = Field(default_factory=list)
     groups: list[QuestionGroup] = Field(default_factory=list)
+    structure: dict[str, Any] = Field(default_factory=dict)
     section_hierarchy: list[dict[str, Any]] = Field(default_factory=list)
     layout_lines: list[LayoutLine] = Field(default_factory=list)
     layout_meta: dict[str, Any] = Field(default_factory=dict)
@@ -134,6 +144,7 @@ class ParsedFile(BaseModel):
     source_candidates: list[SourceCandidate] = Field(default_factory=list)
     sheets: list[ParsedSheet] = Field(default_factory=list)
     form_model: FormDocumentModel | None = None
+    pdf_zone_summary: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 

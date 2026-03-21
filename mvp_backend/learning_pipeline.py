@@ -29,6 +29,8 @@ CANDIDATE_TOP_K = 5
 MODEL_CONFIDENCE_WEIGHT = 0.72
 CANDIDATE_PRIOR_WEIGHT = 0.28
 SEMANTIC_CONFLICT_SCORE_WEIGHT = 0.3
+PDF_LOW_CONFIDENCE_FORM_PENALTY = 0.12
+PDF_TABLE_PREFERRED_PENALTY = 0.22
 
 SEMANTIC_GROUP_KEYWORDS = {
     'created': {'created'},
@@ -80,6 +82,7 @@ def resolve_generation_mappings(
     user_id: str | None = None,
     schema_fingerprint_id: int | None = None,
     enable_semantic_graph: bool = True,
+    source_routing_context: dict[str, Any] | None = None,
 ) -> tuple[list[FieldMapping], list[str]]:
     result = resolve_generation_mappings_detailed(
         source_columns=source_columns,
@@ -88,6 +91,7 @@ def resolve_generation_mappings(
         user_id=user_id,
         schema_fingerprint_id=schema_fingerprint_id,
         enable_semantic_graph=enable_semantic_graph,
+        source_routing_context=source_routing_context,
     )
     return result['mappings'], result['warnings']
 
@@ -100,6 +104,7 @@ def resolve_generation_mappings_detailed(
     user_id: str | None = None,
     schema_fingerprint_id: int | None = None,
     enable_semantic_graph: bool = True,
+    source_routing_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     logger.info(
         'mapping pipeline start: source_columns=%d target_fields=%d user_id=%s schema_fingerprint_id=%s sample_rows=%d',
@@ -438,6 +443,13 @@ def resolve_generation_mappings_detailed(
         explain_rows.append(_build_explain_row(unresolved_mapping))
 
     resolved = [resolved_by_target[target.name] for target in target_fields]
+    resolved, routing_warnings, routing_stats = _apply_source_routing_penalties(
+        resolved=resolved,
+        source_routing_context=source_routing_context,
+    )
+    warnings.extend(routing_warnings)
+    if routing_stats:
+        stats['source_routing_adjusted'] = routing_stats['adjusted_count']
     deduped_warnings = _dedupe(warnings)
     unresolved_fields = [mapping.target for mapping in resolved if mapping.source is None]
 
@@ -888,6 +900,103 @@ def _build_explain_row(mapping: FieldMapping) -> dict[str, Any]:
         'model_confidence_score': mapping.model_confidence_score,
         'candidate_metadata': mapping.candidate_metadata,
     }
+
+
+def _apply_source_routing_penalties(
+    *,
+    resolved: list[FieldMapping],
+    source_routing_context: dict[str, Any] | None,
+) -> tuple[list[FieldMapping], list[str], dict[str, Any]]:
+    if not source_routing_context:
+        return resolved, [], {}
+
+    normalized_context = dict(source_routing_context or {})
+    pdf_zone_routing = dict(normalized_context.get('pdf_zone_routing') or {})
+    if str(normalized_context.get('file_type') or '').casefold() != 'pdf':
+        return resolved, [], {}
+    if str(normalized_context.get('document_mode') or '') != 'form_layout_mode':
+        return resolved, [], {}
+
+    penalty = 0.0
+    penalty_reason = ''
+    if pdf_zone_routing.get('prefer_table_source'):
+        penalty = PDF_TABLE_PREFERRED_PENALTY
+        penalty_reason = 'pdf_zone_prefers_table'
+    elif pdf_zone_routing.get('low_confidence_form_zones'):
+        penalty = PDF_LOW_CONFIDENCE_FORM_PENALTY
+        penalty_reason = 'low_confidence_form_zones'
+    if penalty <= 0:
+        return resolved, [], {}
+
+    adjusted_count = 0
+    adjusted: list[FieldMapping] = []
+    for mapping in resolved:
+        if mapping.source is None:
+            adjusted.append(mapping)
+            continue
+        if mapping.source_of_truth in {'position_fallback', 'unresolved'}:
+            adjusted.append(mapping)
+            continue
+
+        original_band = mapping.confidence
+        original_score = mapping.model_confidence_score
+        next_score = _downgrade_confidence_score(original_score, penalty)
+        next_band = _downgrade_confidence_band(original_band, penalty)
+        next_metadata = dict(mapping.candidate_metadata or {})
+        next_metadata.update(
+            {
+                'source_routing_penalty': penalty,
+                'source_routing_penalty_reason': penalty_reason,
+                'source_routing_context': {
+                    'document_mode': normalized_context.get('document_mode'),
+                    'final_source_mode': normalized_context.get('final_source_mode'),
+                    'best_form_confidence': pdf_zone_routing.get('best_form_confidence'),
+                    'best_table_confidence': pdf_zone_routing.get('best_table_confidence'),
+                },
+                'confidence_before_source_routing': original_band,
+                'confidence_after_source_routing': next_band,
+            }
+        )
+        adjusted.append(
+            _clone_mapping(
+                mapping,
+                confidence=next_band,
+                model_confidence_score=next_score,
+                candidate_metadata=next_metadata,
+            )
+        )
+        if next_band != original_band or next_score != original_score:
+            adjusted_count += 1
+
+    if adjusted_count == 0:
+        return adjusted, [], {}
+
+    warning = (
+        'PDF source routing lowered mapping confidence because form extraction came from weak or conflicting PDF zones.'
+    )
+    return adjusted, [warning], {'adjusted_count': adjusted_count, 'penalty_reason': penalty_reason}
+
+
+def _downgrade_confidence_score(score: float | None, penalty: float) -> float | None:
+    if score is None:
+        return None
+    return min(max(float(score) - penalty, 0.0), 1.0)
+
+
+def _downgrade_confidence_band(confidence: str, penalty: float) -> str:
+    if penalty < PDF_LOW_CONFIDENCE_FORM_PENALTY:
+        return confidence
+    if penalty >= PDF_TABLE_PREFERRED_PENALTY:
+        if confidence == 'high':
+            return 'low'
+        if confidence == 'medium':
+            return 'low'
+        return confidence
+    if confidence == 'high':
+        return 'medium'
+    if confidence == 'medium':
+        return 'low'
+    return confidence
 
 
 def _dedupe(values: list[str]) -> list[str]:

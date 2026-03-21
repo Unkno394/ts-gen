@@ -47,6 +47,8 @@ from form_layout import resolve_business_form_fields  # noqa: E402
 PREVIEW_ROW_LIMIT = 5
 SPARSE_ROW_RATIO_THRESHOLD = 0.35
 IMAGE_FILE_TYPES = {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'}
+PDF_FORM_ZONE_MIN_CONFIDENCE = 0.65
+PDF_TABLE_ZONE_MIN_CONFIDENCE = 0.7
 logger = logging.getLogger(__name__)
 
 FORM_CRITICAL_TARGET_FIELDS = {
@@ -76,6 +78,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         'source_candidates': [],
         'sheets': [],
         'form_model': None,
+        'pdf_zone_summary': {},
         'warnings': [],
     }
 
@@ -161,6 +164,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         source_candidates=list(parsed_kwargs['source_candidates']),
         sheets=list(parsed_kwargs['sheets']),
         form_model=parsed_kwargs.get('form_model'),
+        pdf_zone_summary=dict(parsed_kwargs.get('pdf_zone_summary') or {}),
         warnings=warnings,
     )
 
@@ -233,6 +237,7 @@ def coerce_parsed_file(value: Any) -> ParsedFile:
         source_candidates=source_candidates,
         sheets=sheets,
         form_model=form_model,
+        pdf_zone_summary=dict(value.get('pdf_zone_summary') or {}),
         warnings=[str(warning) for warning in value.get('warnings', [])],
     )
 
@@ -242,19 +247,30 @@ def resolve_generation_source(
     selected_sheet: str | None = None,
     target_fields: list[TargetField] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    pdf_zone_routing = _get_pdf_zone_routing_signals(parsed_file)
+    if parsed_file.form_model is not None and pdf_zone_routing:
+        parsed_file.form_model.layout_meta['pdf_zone_routing'] = dict(pdf_zone_routing)
+
     if parsed_file.document_mode == 'form_layout_mode' and target_fields:
-        form_columns, form_rows, form_warnings = _resolve_form_layout_source(parsed_file, target_fields)
-        if form_columns and form_rows:
-            return form_columns, form_rows, form_warnings
+        if not pdf_zone_routing.get('prefer_table_source'):
+            form_columns, form_rows, form_warnings = _resolve_form_layout_source(parsed_file, target_fields)
+            if form_columns and form_rows:
+                return form_columns, form_rows, form_warnings
 
     if parsed_file.document_mode == 'form_layout_mode' and not target_fields and _should_use_generic_form_source(parsed_file):
-        form_columns, form_rows, form_warnings = _resolve_generic_form_layout_source(parsed_file)
+        form_columns, form_rows, form_warnings = _resolve_generic_form_layout_source(
+            parsed_file,
+            pdf_zone_routing=pdf_zone_routing,
+        )
         if form_columns and form_rows:
             return form_columns, form_rows, form_warnings
 
     if not parsed_file.sheets:
         if parsed_file.columns or parsed_file.rows:
-            return parsed_file.columns, parsed_file.rows, []
+            warnings = []
+            if pdf_zone_routing.get('prefer_table_source'):
+                warnings.append('PDF zone routing preferred tabular extraction because table zones were stronger than form zones.')
+            return parsed_file.columns, parsed_file.rows, warnings
 
         candidate_columns, candidate_rows = build_candidate_source(
             [_model_to_plain_dict(candidate) for candidate in parsed_file.source_candidates]
@@ -426,29 +442,26 @@ def _resolve_form_layout_source(
 
 def _resolve_generic_form_layout_source(
     parsed_file: ParsedFile,
+    *,
+    pdf_zone_routing: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     if parsed_file.form_model is None:
         return [], [], []
+    if pdf_zone_routing and pdf_zone_routing.get('prefer_table_source'):
+        return [], [], ['PDF zone routing suppressed generic form source because table zones were stronger than form zones.']
 
     row: dict[str, Any] = {}
     columns: list[str] = []
     used_columns: set[str] = set()
 
-    pair_columns, pair_row = _extract_form_pairs_from_rows(parsed_file)
-    for label in pair_columns:
+    for scalar in parsed_file.form_model.scalars:
+        label = str(scalar.label or '').strip()
+        value = scalar.value
+        if not _is_useful_form_label(label, value):
+            continue
         unique_label = _make_unique_source_label(label, used_columns)
-        row[unique_label] = pair_row.get(label)
+        row[unique_label] = value
         columns.append(unique_label)
-
-    if not columns:
-        for scalar in parsed_file.form_model.scalars:
-            label = str(scalar.label or '').strip()
-            value = scalar.value
-            if not _is_useful_form_label(label, value):
-                continue
-            unique_label = _make_unique_source_label(label, used_columns)
-            row[unique_label] = value
-            columns.append(unique_label)
 
     for group in parsed_file.form_model.groups:
         selected_labels = [
@@ -466,6 +479,13 @@ def _resolve_generic_form_layout_source(
         unique_label = _make_unique_source_label(label, used_columns)
         row[unique_label] = selected_labels if group.group_type == 'multi_choice' or len(selected_labels) > 1 else selected_labels[0]
         columns.append(unique_label)
+
+    if not columns:
+        pair_columns, pair_row = _extract_form_pairs_from_rows(parsed_file)
+        for label in pair_columns:
+            unique_label = _make_unique_source_label(label, used_columns)
+            row[unique_label] = pair_row.get(label)
+            columns.append(unique_label)
 
     if columns:
         parsed_file.form_model.layout_meta['final_source_mode'] = 'generic_form_source'
@@ -486,6 +506,9 @@ def _resolve_generic_form_layout_source(
 def _should_use_generic_form_source(parsed_file: ParsedFile) -> bool:
     if parsed_file.form_model is None:
         return False
+    pdf_zone_routing = _get_pdf_zone_routing_signals(parsed_file)
+    if pdf_zone_routing.get('prefer_table_source'):
+        return False
     return any(any(option.selected for option in group.options) for group in parsed_file.form_model.groups)
 
 
@@ -504,10 +527,20 @@ def _extract_form_pairs_from_rows(parsed_file: ParsedFile) -> tuple[list[str], d
     value_column = parsed_file.columns[1]
     row: dict[str, Any] = {}
     columns: list[str] = []
+    consumed_group_rows, consumed_option_texts, consumed_question_texts = _collect_consumed_group_row_metadata(parsed_file)
 
-    for source_row in parsed_file.rows:
+    for row_index, source_row in enumerate(parsed_file.rows, start=1):
         label = str(source_row.get(label_column) or '').strip()
         value = source_row.get(value_column)
+        if _is_consumed_group_pair_candidate(
+            label=label,
+            value=value,
+            data_row_index=row_index,
+            consumed_group_rows=consumed_group_rows,
+            consumed_option_texts=consumed_option_texts,
+            consumed_question_texts=consumed_question_texts,
+        ):
+            continue
         if not _is_useful_form_label(label, value):
             continue
         if label in row:
@@ -516,6 +549,78 @@ def _extract_form_pairs_from_rows(parsed_file: ParsedFile) -> tuple[list[str], d
         columns.append(label)
 
     return columns, row
+
+
+def _collect_consumed_group_row_metadata(
+    parsed_file: ParsedFile,
+) -> tuple[set[tuple[int, int]], set[str], set[str]]:
+    if parsed_file.form_model is None:
+        return set(), set(), set()
+
+    consumed_group_rows: set[tuple[int, int]] = set()
+    consumed_option_texts: set[str] = set()
+    consumed_question_texts: set[str] = set()
+
+    for group in parsed_file.form_model.groups:
+        question_text = _normalize_form_text(group.question)
+        if question_text:
+            consumed_question_texts.add(question_text)
+
+        source_ref = dict(group.source_ref or {})
+        table_idx = source_ref.get('table_idx')
+        row_idx = source_ref.get('row_idx')
+        if isinstance(table_idx, int) and isinstance(row_idx, int):
+            consumed_group_rows.add((table_idx, row_idx))
+
+        for option in group.options:
+            option_text = _normalize_form_text(option.label)
+            if option_text:
+                consumed_option_texts.add(option_text)
+
+            option_source_ref = dict(option.source_ref or {})
+            option_table_idx = option_source_ref.get('table_idx')
+            option_row_idx = option_source_ref.get('row_idx')
+            if isinstance(option_table_idx, int) and isinstance(option_row_idx, int):
+                consumed_group_rows.add((option_table_idx, option_row_idx))
+
+    return consumed_group_rows, consumed_option_texts, consumed_question_texts
+
+
+def _is_consumed_group_pair_candidate(
+    *,
+    label: str,
+    value: Any,
+    data_row_index: int,
+    consumed_group_rows: set[tuple[int, int]],
+    consumed_option_texts: set[str],
+    consumed_question_texts: set[str],
+) -> bool:
+    if (0, data_row_index) in consumed_group_rows:
+        return True
+
+    normalized_label = _normalize_form_text(label)
+    normalized_value = _normalize_form_text(value)
+    combined = ' '.join(part for part in [normalized_label, normalized_value] if part).strip()
+    if not combined:
+        return False
+
+    if any(option_text and option_text in combined for option_text in consumed_option_texts):
+        return True
+
+    if _looks_like_option_marker_text(normalized_label) or _looks_like_option_marker_text(normalized_value):
+        if any(question_text and question_text in combined for question_text in consumed_question_texts):
+            return True
+
+    return False
+
+
+def _normalize_form_text(value: Any) -> str:
+    return ' '.join(str(value or '').strip().casefold().split())
+
+
+def _looks_like_option_marker_text(value: str) -> bool:
+    normalized_value = str(value or '').strip().casefold()
+    return normalized_value in {'x', '[x]', 'v', '[v]', '✓', '✔', '☒', '☑', 'да', 'нет', 'yes', 'no'}
 
 
 def _is_useful_form_label(label: str, value: Any) -> bool:
@@ -1104,6 +1209,7 @@ def _parse_document(file_path: Path) -> dict[str, Any]:
             'kv_pairs': kv_pairs,
             'source_candidates': source_candidates,
             'form_model': form_model,
+            'pdf_zone_summary': dict(parsed.get('pdf_zone_summary') or {}),
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception('document parser failed: file=%s error=%s', file_path.name, exc)
@@ -1217,6 +1323,7 @@ def _build_form_model(value: Any) -> FormDocumentModel | None:
     return FormDocumentModel(
         scalars=scalars,
         groups=groups,
+        structure=dict(value.get('structure') or {}),
         section_hierarchy=[dict(item) for item in value.get('section_hierarchy', []) if isinstance(item, dict)],
         layout_lines=layout_lines,
         layout_meta=dict(value.get('layout_meta') or {}),
@@ -1233,6 +1340,7 @@ def _assess_form_quality(
     final_source_mode: str,
 ) -> dict[str, Any]:
     critical_field_states = dict(form_model.layout_meta.get('critical_field_states') or {})
+    pdf_zone_routing = dict(form_model.layout_meta.get('pdf_zone_routing') or {})
     ambiguous_fields = [field.field for field in resolved_fields if field.status == 'ambiguous']
     unresolved_fields = [field.field for field in resolved_fields if field.status == 'not_found']
     repair_fields = [field.field for field in resolved_fields if field.resolved_by == 'repair_model']
@@ -1297,6 +1405,23 @@ def _assess_form_quality(
                 'target_field_count': len(target_fields),
             }
         )
+    if pdf_zone_routing.get('prefer_table_source'):
+        red_flags.append(
+            {
+                'code': 'pdf_zone_prefers_table',
+                'message': 'PDF table zones were stronger than form zones, so downstream should prefer tabular extraction.',
+                'best_form_confidence': pdf_zone_routing.get('best_form_confidence'),
+                'best_table_confidence': pdf_zone_routing.get('best_table_confidence'),
+            }
+        )
+    elif pdf_zone_routing.get('has_form_zones') and pdf_zone_routing.get('low_confidence_form_zones'):
+        red_flags.append(
+            {
+                'code': 'low_confidence_form_zones',
+                'message': 'PDF form zones were detected with low confidence and should be reviewed before relying on them.',
+                'best_form_confidence': pdf_zone_routing.get('best_form_confidence'),
+            }
+        )
 
     return {
         'needs_attention': bool(red_flags),
@@ -1312,8 +1437,72 @@ def _assess_form_quality(
         'repair_fields': repair_fields,
         'blocked_fields': blocked_fields,
         'multiple_selected_single_choice_groups': multiple_selected_single_choice_groups,
+        'pdf_zone_routing': pdf_zone_routing,
         'red_flags': red_flags,
     }
+
+
+def _get_pdf_zone_routing_signals(parsed_file: ParsedFile) -> dict[str, Any]:
+    if str(parsed_file.file_type or '').casefold() != 'pdf':
+        return {}
+
+    zone_summary = dict(parsed_file.pdf_zone_summary or {})
+    parser_outputs = dict(zone_summary.get('parser_outputs') or {})
+    table_output = dict(parser_outputs.get('table') or {})
+    form_output = dict(parser_outputs.get('form') or {})
+    text_output = dict(parser_outputs.get('text') or {})
+    noise_output = dict(parser_outputs.get('noise') or {})
+
+    table_zone_confidences = _extract_zone_confidences(table_output.get('zones'))
+    form_zone_confidences = _extract_zone_confidences(form_output.get('zones'))
+    text_zone_confidences = _extract_zone_confidences(text_output.get('zones'))
+    noise_zone_confidences = _extract_zone_confidences(noise_output.get('zones'))
+
+    best_table_confidence = max(table_zone_confidences) if table_zone_confidences else None
+    best_form_confidence = max(form_zone_confidences) if form_zone_confidences else None
+    best_text_confidence = max(text_zone_confidences) if text_zone_confidences else None
+    best_noise_confidence = max(noise_zone_confidences) if noise_zone_confidences else None
+
+    has_confident_table_zone = best_table_confidence is not None and best_table_confidence >= PDF_TABLE_ZONE_MIN_CONFIDENCE
+    has_confident_form_zone = best_form_confidence is not None and best_form_confidence >= PDF_FORM_ZONE_MIN_CONFIDENCE
+    prefer_table_source = bool(
+        has_confident_table_zone
+        and parsed_file.columns
+        and parsed_file.rows
+        and (best_form_confidence is None or best_table_confidence > best_form_confidence + 0.05)
+    )
+
+    return {
+        'available': bool(zone_summary),
+        'dominant_zone': str(zone_summary.get('dominant_zone') or ''),
+        'has_table_zones': bool(table_zone_confidences),
+        'has_form_zones': bool(form_zone_confidences),
+        'has_text_zones': bool(text_zone_confidences),
+        'has_noise_zones': bool(noise_zone_confidences),
+        'best_table_confidence': best_table_confidence,
+        'best_form_confidence': best_form_confidence,
+        'best_text_confidence': best_text_confidence,
+        'best_noise_confidence': best_noise_confidence,
+        'has_confident_table_zone': has_confident_table_zone,
+        'has_confident_form_zone': has_confident_form_zone,
+        'low_confidence_form_zones': bool(form_zone_confidences) and not has_confident_form_zone,
+        'prefer_table_source': prefer_table_source,
+    }
+
+
+def _extract_zone_confidences(value: Any) -> list[float]:
+    confidences: list[float] = []
+    for item in list(value or []):
+        if not isinstance(item, dict):
+            continue
+        zone_confidence = item.get('zone_confidence')
+        try:
+            if zone_confidence in (None, ''):
+                continue
+            confidences.append(float(zone_confidence))
+        except (TypeError, ValueError):
+            continue
+    return confidences
 
 
 def _safe_candidate_type(value: Any) -> str:

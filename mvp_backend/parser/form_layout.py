@@ -9,6 +9,12 @@ try:
 except ImportError:  # pragma: no cover - optional dependency in local env
     Document = None
 
+from form_business import (
+    _resolve_fatca_group as _resolve_fatca_group_impl,
+    _resolve_tax_residency_group as _resolve_tax_residency_group_impl,
+    resolve_business_form_fields as _resolve_business_form_fields_impl,
+    resolve_form_fields as _resolve_form_fields_impl,
+)
 from model_client import suggest_form_field_repair
 
 
@@ -22,50 +28,7 @@ PDF_MERGE_Y_THRESHOLD = 6.0
 PDF_MERGE_X_THRESHOLD = 32.0
 PDF_WRAP_Y_THRESHOLD = 14.0
 PDF_WRAP_X_THRESHOLD = 96.0
-
-ORGANIZATION_LABEL_ALIASES = (
-    'наименование организации',
-    'полное наименование организации',
-    'organization name',
-    'company name',
-    'наименование',
-)
-INN_LABEL_ALIASES = (
-    'инн',
-    'кио',
-    'инн кио',
-    'инн/кио',
-    'inn',
-    'kio',
-    'inn or kio',
-)
-TAX_GROUP_KEYWORDS = (
-    'налогов резидент',
-    'налогов резидент рф',
-    'tax residenc',
-    'resident rf',
-)
-FATCA_GROUP_KEYWORDS = ('fatca', 'foreign account tax compliance act')
-
-TAX_RESIDENCY_ENUM_MAP = {
-    'да': 'YES',
-    'yes': 'YES',
-    'не являюсь налоговым резидентом ни в одном государстве': 'NOWHERE',
-    'не являюсь налоговым резидентом': 'NOWHERE',
-    'не являюсь резидентом ни в одном государстве': 'NOWHERE',
-    'нет является резидентом иностранных государств': 'NO',
-    'нет является налоговым резидентом в иностранном государстве': 'NO',
-    'нет': 'NO',
-    'no': 'NO',
-}
-
-FATCA_OPTION_MAP = {
-    'лицом неотделимым от собственника': 'IS_DISREGARDED_ENTITY',
-    'иностранным финансовым институтом': 'IS_FATCA_FOREIGN_INSTITUTE',
-    'более 10 акций': 'TEN_OR_MORE_PERCENT_IN_USA',
-    'более 10 процентов акций': 'TEN_OR_MORE_PERCENT_IN_USA',
-    'не применимы': 'STATEMENTS_NOT_APPILCABLE',
-}
+PDF_ROW_CLUSTER_Y_THRESHOLD = 8.0
 
 
 def extract_layout_layer(
@@ -143,7 +106,15 @@ def extract_layout_layer(
         layout_meta['reading_order_mode'] = 'docx_paragraph_table_order'
     else:
         layout_lines.extend(_build_text_layout_lines(raw_text=raw_text, text_blocks=text_blocks, layout_blocks=layout_blocks))
-        if any(line.get('page') is not None for line in layout_lines):
+        has_pdf_layout_rows = False
+        if file_type == 'pdf':
+            pdf_layout_rows = _extract_pdf_layout_rows(layout_lines)
+            raw_table_rows.extend(pdf_layout_rows)
+            layout_meta['pdf_layout_row_count'] = len(pdf_layout_rows)
+            if pdf_layout_rows:
+                has_pdf_layout_rows = True
+                layout_meta['reading_order_mode'] = 'page_row_cell_order'
+        if not has_pdf_layout_rows and any(line.get('page') is not None for line in layout_lines):
             layout_meta['reading_order_mode'] = 'page_column_yx'
         elif layout_lines:
             layout_meta['reading_order_mode'] = 'line_order'
@@ -181,16 +152,27 @@ def understand_generic_form(
     layout_meta = dict(layout_layer.get('layout_meta') or {})
 
     if raw_table_rows:
-        table_scalars, table_groups = _extract_docx_form_understanding(raw_table_rows)
+        if _is_pdf_layout_rows(raw_table_rows):
+            table_scalars, table_groups = _extract_pdf_form_understanding(raw_table_rows)
+        else:
+            table_scalars, table_groups = _extract_docx_form_understanding(raw_table_rows)
         scalars.extend(table_scalars)
         groups.extend(table_groups)
+        if _has_positioned_layout_lines(layout_lines):
+            groups.extend(_extract_groups_from_layout_lines(layout_lines))
+            scalars.extend(_extract_scalars_from_layout_lines(layout_lines))
     else:
         groups.extend(_extract_groups_from_layout_lines(layout_lines))
         scalars.extend(_extract_scalars_from_layout_lines(layout_lines))
 
     groups = _dedupe_groups(groups)
     scalars = _dedupe_scalars(scalars)
+    scalars = _filter_noisy_scalars(scalars)
+    scalars = _suppress_scalars_consumed_by_groups(scalars, groups)
+    groups = _annotate_group_confidence(groups)
+    scalars = _annotate_scalar_confidence(scalars)
     section_hierarchy = _build_section_hierarchy(sections, groups)
+    structure = _build_form_structure_summary(layout_lines=layout_lines, scalars=scalars, groups=groups, sections=section_hierarchy)
 
     document_mode = 'data_table_mode'
     if groups or _looks_like_form_layout(kv_pairs=kv_pairs, groups=groups, tables=tables, layout_lines=layout_lines):
@@ -208,6 +190,7 @@ def understand_generic_form(
             'scalar_count': len(scalars),
             'group_count': len(groups),
             'section_count': len(section_hierarchy),
+            'ambiguous_group_count': int(structure.get('ambiguous_group_count') or 0),
         }
     )
     pipeline_layers['generic_form_understanding'] = generic_layer
@@ -216,6 +199,7 @@ def understand_generic_form(
     return {
         'scalars': scalars,
         'groups': groups,
+        'structure': structure,
         'section_hierarchy': section_hierarchy,
         'layout_lines': layout_lines[:120],
         'layout_meta': {
@@ -259,61 +243,11 @@ def resolve_business_form_fields(
     form_model: dict[str, Any],
     target_fields: list[Any],
 ) -> list[dict[str, Any]]:
-    target_names = [str(getattr(field, 'name', field) or '').strip() for field in target_fields]
-    scalars = [dict(item) for item in form_model.get('scalars', []) if isinstance(item, dict)]
-    groups = [dict(item) for item in form_model.get('groups', []) if isinstance(item, dict)]
-    layout_lines = [dict(item) for item in form_model.get('layout_lines', []) if isinstance(item, dict)]
-
-    tax_resolution_cache: dict[str, Any] | None = None
-    results: list[dict[str, Any]] = []
-    for target_name in target_names:
-        lower_name = target_name.casefold()
-        if lower_name == 'organizationname':
-            results.append(_resolve_scalar_with_aliases(target_name, scalars, ORGANIZATION_LABEL_ALIASES))
-            continue
-        if lower_name == 'innorkio':
-            results.append(_resolve_inn_or_kio(target_name, scalars))
-            continue
-        if lower_name == 'isresidentrf':
-            tax_resolution_cache = tax_resolution_cache or _resolve_tax_residency_group(groups, layout_lines=layout_lines)
-            results.append(
-                {
-                    'field': target_name,
-                    'status': tax_resolution_cache['status'],
-                    'resolved_by': tax_resolution_cache.get('resolved_by', 'form_resolver'),
-                    'value': tax_resolution_cache.get('enum_value'),
-                    'candidates': list(tax_resolution_cache.get('candidates', [])),
-                    'source_ref': dict(tax_resolution_cache.get('source_ref', {})),
-                    'confidence': tax_resolution_cache.get('confidence'),
-                }
-            )
-            continue
-        if lower_name == 'istaxresidencyonlyrf':
-            tax_resolution_cache = tax_resolution_cache or _resolve_tax_residency_group(groups, layout_lines=layout_lines)
-            derived_value = None
-            if tax_resolution_cache.get('enum_value') == 'YES':
-                derived_value = 'YES'
-            elif tax_resolution_cache.get('enum_value') in {'NO', 'NOWHERE'}:
-                derived_value = 'NO'
-            results.append(
-                {
-                    'field': target_name,
-                    'status': tax_resolution_cache['status'] if derived_value is not None else tax_resolution_cache['status'],
-                    'resolved_by': tax_resolution_cache.get('resolved_by', 'form_resolver'),
-                    'value': derived_value,
-                    'candidates': list(tax_resolution_cache.get('candidates', [])),
-                    'source_ref': dict(tax_resolution_cache.get('source_ref', {})),
-                    'confidence': tax_resolution_cache.get('confidence'),
-                }
-            )
-            continue
-        if lower_name == 'fatcabeneficiaryoptionlist':
-            results.append(_resolve_fatca_group(target_name, groups, layout_lines=layout_lines))
-            continue
-
-        results.append(_resolve_generic_scalar(target_name, scalars))
-
-    return results
+    return _resolve_business_form_fields_impl(
+        form_model=form_model,
+        target_fields=target_fields,
+        repair_fn=suggest_form_field_repair,
+    )
 
 
 def resolve_form_fields(
@@ -321,7 +255,11 @@ def resolve_form_fields(
     form_model: dict[str, Any],
     target_fields: list[Any],
 ) -> list[dict[str, Any]]:
-    return resolve_business_form_fields(form_model=form_model, target_fields=target_fields)
+    return _resolve_form_fields_impl(
+        form_model=form_model,
+        target_fields=target_fields,
+        repair_fn=suggest_form_field_repair,
+    )
 
 
 def _extract_docx_layout_rows(doc) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -330,16 +268,32 @@ def _extract_docx_layout_rows(doc) -> tuple[list[dict[str, Any]], list[dict[str,
     form_like_tables = 0
 
     for table_index, table in enumerate(doc.tables):
-        raw_rows: list[list[str]] = []
+        raw_rows: list[dict[str, Any]] = []
         for row_index, row in enumerate(table.rows):
             cell_texts = [_clean_text(cell.text) for cell in row.cells]
-            raw_rows.append(cell_texts)
-            for cell_index, cell_text in enumerate(cell_texts):
-                if not cell_text:
+            cell_paragraphs: list[list[str]] = []
+            for cell_index, cell in enumerate(row.cells):
+                paragraph_texts = [_clean_text(paragraph.text) for paragraph in cell.paragraphs if _clean_text(paragraph.text)]
+                cell_paragraphs.append(paragraph_texts)
+                if paragraph_texts:
+                    for paragraph_index, paragraph_text in enumerate(paragraph_texts):
+                        layout_lines.append(
+                            {
+                                'text': paragraph_text,
+                                'table_idx': table_index,
+                                'row_idx': row_index,
+                                'cell_idx': cell_index,
+                                'paragraph_idx': paragraph_index,
+                                'source_type': 'table_cell',
+                                'tokens': [],
+                            }
+                        )
+                    continue
+                if not cell_texts[cell_index]:
                     continue
                 layout_lines.append(
                     {
-                        'text': cell_text,
+                        'text': cell_texts[cell_index],
                         'table_idx': table_index,
                         'row_idx': row_index,
                         'cell_idx': cell_index,
@@ -347,19 +301,180 @@ def _extract_docx_layout_rows(doc) -> tuple[list[dict[str, Any]], list[dict[str,
                         'tokens': [],
                     }
                 )
+            raw_rows.append(
+                {
+                    'table_idx': table_index,
+                    'row_idx': row_index,
+                    'cells': cell_texts,
+                    'cell_paragraphs': cell_paragraphs,
+                }
+            )
 
-        if _is_form_like_docx_table(raw_rows):
+        if _is_form_like_docx_table([list(item.get('cells', [])) for item in raw_rows]):
             form_like_tables += 1
-            for row_index, row in enumerate(raw_rows):
-                raw_table_rows.append(
-                    {
-                        'table_idx': table_index,
-                        'row_idx': row_index,
-                        'cells': list(row),
-                    }
-                )
+            raw_table_rows.extend(raw_rows)
 
     return raw_table_rows, layout_lines, {'form_like_table_count': form_like_tables}
+
+
+def _extract_pdf_layout_rows(layout_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    positioned_lines = [
+        dict(line)
+        for line in layout_lines
+        if _clean_text(line.get('text'))
+        and line.get('page') is not None
+        and _safe_float(line.get('y')) is not None
+    ]
+    if not positioned_lines:
+        return []
+
+    ordered = sorted(
+        positioned_lines,
+        key=lambda item: (
+            int(item.get('page') or 0),
+            float(item.get('y') or 0.0),
+            float(item.get('x') or 0.0),
+        ),
+    )
+
+    clusters: list[dict[str, Any]] = []
+    for line in ordered:
+        page = int(line.get('page') or 0)
+        y = float(line.get('y') or 0.0)
+        target_cluster = None
+        for cluster in reversed(clusters):
+            if cluster['page'] != page:
+                break
+            if abs(cluster['y'] - y) <= PDF_ROW_CLUSTER_Y_THRESHOLD:
+                target_cluster = cluster
+                break
+            if y - cluster['y'] > PDF_ROW_CLUSTER_Y_THRESHOLD:
+                break
+        if target_cluster is None:
+            target_cluster = {'page': page, 'y': y, 'lines': []}
+            clusters.append(target_cluster)
+        target_cluster['lines'].append(line)
+        target_cluster['y'] = min(target_cluster['y'], y)
+
+    raw_rows: list[dict[str, Any]] = []
+    page_row_counters: dict[int, int] = {}
+    for cluster in clusters:
+        page = int(cluster['page'])
+        row_idx = page_row_counters.get(page, 0)
+        page_row_counters[page] = row_idx + 1
+        row_lines = sorted(cluster['lines'], key=lambda item: float(item.get('x') or 0.0))
+        cells: list[str] = []
+        cell_paragraphs: list[list[str]] = []
+        for line in row_lines:
+            text = _clean_text(line.get('text'))
+            if not text:
+                continue
+            cells.append(text)
+            cell_paragraphs.append([text])
+        if not any(cells):
+            continue
+        raw_rows.append(
+            {
+                'table_idx': page - 1,
+                'row_idx': row_idx,
+                'cells': cells,
+                'cell_paragraphs': cell_paragraphs,
+                'page': page,
+                'source_type': 'pdf_layout_row',
+                'row_kind': _classify_pdf_layout_row(cells),
+            }
+        )
+
+    return raw_rows
+
+
+def _extract_pdf_form_understanding(raw_table_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped_rows: dict[int, list[dict[str, Any]]] = {}
+    for item in raw_table_rows:
+        table_index = int(item.get('table_idx') or 0)
+        grouped_rows.setdefault(table_index, []).append(item)
+
+    scalars: list[dict[str, Any]] = []
+    groups: list[dict[str, Any]] = []
+    for table_index, items in grouped_rows.items():
+        ordered_rows = [
+            dict(item)
+            for item in sorted(
+                items,
+                key=lambda row: (
+                    int(row.get('page') or 0),
+                    int(row.get('row_idx') or 0),
+                ),
+            )
+        ]
+        table_scalars, table_groups = _extract_table_rows_as_form(ordered_rows, table_index=table_index)
+        for scalar in table_scalars:
+            scalar['source_ref'] = {
+                **dict(scalar.get('source_ref', {})),
+                'page': _find_pdf_row_page(ordered_rows, scalar.get('source_ref', {})),
+            }
+        for group in table_groups:
+            group['source_ref'] = {
+                **dict(group.get('source_ref', {})),
+                'page': _find_pdf_row_page(ordered_rows, group.get('source_ref', {})),
+            }
+            options = []
+            for option in group.get('options', []):
+                options.append(
+                    {
+                        **dict(option),
+                        'source_ref': {
+                            **dict(option.get('source_ref', {})),
+                            'page': _find_pdf_row_page(ordered_rows, option.get('source_ref', {})),
+                        },
+                    }
+                )
+            group['options'] = options
+        scalars.extend(table_scalars)
+        groups.extend(table_groups)
+
+    return scalars, groups
+
+
+def _find_pdf_row_page(raw_rows: list[dict[str, Any]], source_ref: dict[str, Any]) -> int | None:
+    row_idx = source_ref.get('row_idx')
+    if row_idx is None:
+        return None
+    for row in raw_rows:
+        if row.get('row_idx') == row_idx:
+            return int(row.get('page') or 0) or None
+    return None
+
+
+def _classify_pdf_layout_row(cells: list[str]) -> str:
+    non_empty = [_clean_text(cell) for cell in cells if _clean_text(cell)]
+    if not non_empty:
+        return 'empty'
+
+    if len(non_empty) == 2 and _looks_like_heading_fragment_pair(non_empty[0], non_empty[1]):
+        return 'header'
+    if any(_looks_like_section_heading_text(cell) for cell in non_empty):
+        return 'header'
+
+    question_like = any(_looks_like_question_anchor(cell) for cell in non_empty)
+    if len(non_empty) == 2 and not question_like and not any(_is_marker_cell(cell) for cell in non_empty):
+        return 'field'
+    explicit_option_like = any(_extract_option_from_text_line(cell, source_ref={}) is not None for cell in non_empty)
+    unmarked_option_like = any(_looks_like_pdf_option_start(cell) for cell in non_empty)
+
+    if question_like and (explicit_option_like or unmarked_option_like):
+        return 'mixed'
+    if explicit_option_like or unmarked_option_like:
+        return 'option'
+    if question_like:
+        return 'question'
+    if len(non_empty) == 2:
+        return 'field'
+    return 'other'
+
+
+def _is_pdf_layout_rows(raw_table_rows: list[dict[str, Any]]) -> bool:
+    return any(str(item.get('source_type') or '') == 'pdf_layout_row' for item in raw_table_rows)
 
 
 def _extract_docx_form_understanding(raw_table_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -372,7 +487,7 @@ def _extract_docx_form_understanding(raw_table_rows: list[dict[str, Any]]) -> tu
     groups: list[dict[str, Any]] = []
     for table_index, items in grouped_rows.items():
         ordered_rows = [
-            list(item.get('cells', []))
+            dict(item)
             for item in sorted(items, key=lambda row: int(row.get('row_idx') or 0))
         ]
         table_scalars, table_groups = _extract_table_rows_as_form(ordered_rows, table_index=table_index)
@@ -381,15 +496,33 @@ def _extract_docx_form_understanding(raw_table_rows: list[dict[str, Any]]) -> tu
     return scalars, groups
 
 
-def _extract_table_rows_as_form(raw_rows: list[list[str]], *, table_index: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _extract_table_rows_as_form(raw_rows: list[dict[str, Any]], *, table_index: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     scalars: list[dict[str, Any]] = []
     groups: list[dict[str, Any]] = []
     current_group: dict[str, Any] | None = None
 
-    for row_index, row in enumerate(raw_rows):
-        cells = [_clean_text(cell) for cell in row]
+    for row_position, row in enumerate(raw_rows):
+        row_index = int(row.get('row_idx') or row_position)
+        cells = [_clean_text(cell) for cell in row.get('cells', [])]
+        cell_paragraphs = [
+            [_clean_text(paragraph) for paragraph in paragraphs if _clean_text(paragraph)]
+            for paragraphs in row.get('cell_paragraphs', [])
+        ]
         non_empty = [cell for cell in cells if cell]
         if not non_empty:
+            continue
+
+        inline_group = _extract_inline_group_from_table_row(
+            cells,
+            cell_paragraphs=cell_paragraphs,
+            table_index=table_index,
+            row_index=row_index,
+        )
+        if inline_group is not None:
+            if current_group is not None and current_group.get('options'):
+                groups.append(current_group)
+            current_group = None
+            groups.append(inline_group)
             continue
 
         scalar_candidate = _extract_scalar_from_table_row(cells, table_index=table_index, row_index=row_index)
@@ -434,6 +567,111 @@ def _extract_table_rows_as_form(raw_rows: list[list[str]], *, table_index: int) 
         groups.append(current_group)
 
     return scalars, groups
+
+
+def _extract_inline_group_from_table_row(
+    cells: list[str],
+    *,
+    cell_paragraphs: list[list[str]],
+    table_index: int,
+    row_index: int,
+) -> dict[str, Any] | None:
+    non_empty = [(idx, cell) for idx, cell in enumerate(cells) if cell]
+    if len(non_empty) < 2:
+        return None
+
+    question_idx = next((idx for idx, cell in non_empty if _looks_like_question_anchor(cell)), None)
+    if question_idx is None:
+        return None
+
+    option_idx = next((idx for idx, _cell in non_empty if idx != question_idx), None)
+    if option_idx is None:
+        return None
+
+    option_paragraphs = cell_paragraphs[option_idx] if option_idx < len(cell_paragraphs) else []
+    option_paragraphs = [paragraph for paragraph in option_paragraphs if paragraph]
+    option_text = cells[option_idx]
+
+    if len(option_paragraphs) <= 1 and ';' not in option_text and not _contains_marker(option_text):
+        return None
+
+    options = _extract_options_from_docx_cell_paragraphs(
+        option_paragraphs or [option_text],
+        table_index=table_index,
+        row_index=row_index,
+        cell_idx=option_idx,
+    )
+    if not options:
+        return None
+
+    question = cells[question_idx]
+    group_id = _guess_group_id(question, table_index=table_index, row_index=row_index)
+    if any('fatca' in _normalize_phrase(option.get('label')) for option in options):
+        group_id = 'fatca_beneficiary'
+    group = {
+        'group_id': group_id,
+        'question': question,
+        'group_type': _guess_group_type_from_question(question),
+        'options': options,
+        'source_ref': {
+            'table_idx': table_index,
+            'row_idx': row_index,
+            'cell_idx': question_idx,
+            'source_type': 'table_cell',
+        },
+    }
+    group['group_type'] = _infer_group_type(group)
+    return group
+
+
+def _extract_options_from_docx_cell_paragraphs(
+    paragraphs: list[str],
+    *,
+    table_index: int,
+    row_index: int,
+    cell_idx: int,
+) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+
+    for paragraph_idx, paragraph in enumerate(paragraphs):
+        text = _clean_text(paragraph).rstrip(';').strip()
+        if not text:
+            continue
+
+        option = _extract_option_from_text_line(
+            text,
+            source_ref={
+                'table_idx': table_index,
+                'row_idx': row_index,
+                'cell_idx': cell_idx,
+                'paragraph_idx': paragraph_idx,
+                'source_type': 'table_cell',
+            },
+        )
+        if option is None:
+            option = {
+                'label': text,
+                'selected': False,
+                'marker_text': '',
+                'source_ref': {
+                    'table_idx': table_index,
+                    'row_idx': row_index,
+                    'cell_idx': cell_idx,
+                    'paragraph_idx': paragraph_idx,
+                    'source_type': 'table_cell',
+                },
+            }
+        else:
+            option['label'] = _clean_text(option.get('label')).rstrip(';').strip()
+
+        normalized_label = _normalize_phrase(option.get('label'))
+        if not normalized_label or normalized_label in seen_labels:
+            continue
+        seen_labels.add(normalized_label)
+        options.append(option)
+
+    return options
 
 
 def _build_text_layout_lines(
@@ -634,12 +872,13 @@ def _extract_groups_from_layout_lines(layout_lines: list[dict[str, Any]]) -> lis
         if not text:
             continue
 
-        if current_group is not None and _line_breaks_group_scope(current_group, line):
+        option = _extract_contextual_option_from_text_line(text, source_ref=line, current_group=current_group)
+
+        if current_group is not None and _line_breaks_group_scope(current_group, line, option=option):
             if current_group.get('options'):
                 groups.append(current_group)
             current_group = None
 
-        option = _extract_option_from_text_line(text, source_ref=line)
         if option is not None:
             if current_group is None:
                 current_group = {
@@ -653,7 +892,7 @@ def _extract_groups_from_layout_lines(layout_lines: list[dict[str, Any]]) -> lis
             current_group['group_type'] = _infer_group_type(current_group)
             continue
 
-        if current_group is not None and current_group.get('options') and _is_option_continuation_line(current_group, line):
+        if current_group is not None and current_group.get('options') and _is_group_option_continuation_line(current_group, line):
             last_option = current_group['options'][-1]
             last_option['label'] = f"{_clean_text(last_option.get('label'))} {text}".strip()
             last_option['source_ref'] = {
@@ -685,8 +924,29 @@ def _extract_groups_from_layout_lines(layout_lines: list[dict[str, Any]]) -> lis
 
 def _extract_scalars_from_layout_lines(layout_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     scalars: list[dict[str, Any]] = []
+    table_rows: dict[tuple[int, int], dict[int, str]] = {}
     for line in layout_lines:
         scalar = _parse_kv_line(line.get('text'), source_ref=line)
+        if scalar is not None:
+            scalars.append(scalar)
+        if line.get('source_type') != 'table_cell':
+            continue
+        table_idx = line.get('table_idx')
+        row_idx = line.get('row_idx')
+        cell_idx = line.get('cell_idx')
+        if not isinstance(table_idx, int) or not isinstance(row_idx, int) or not isinstance(cell_idx, int):
+            continue
+        text = _clean_text(line.get('text'))
+        if not text:
+            continue
+        table_rows.setdefault((table_idx, row_idx), {})[cell_idx] = text
+
+    for (table_idx, row_idx), row_cells in sorted(table_rows.items()):
+        if not row_cells:
+            continue
+        max_index = max(row_cells)
+        cells = [row_cells.get(index, '') for index in range(max_index + 1)]
+        scalar = _extract_scalar_from_table_row(cells, table_index=table_idx, row_index=row_idx)
         if scalar is not None:
             scalars.append(scalar)
     return scalars
@@ -702,6 +962,8 @@ def _parse_kv_line(text: Any, *, source_ref: dict[str, Any]) -> dict[str, Any] |
     label = _clean_text(match.group('label'))
     value = _clean_text(match.group('value'))
     if not label or not value:
+        return None
+    if not _is_valid_layout_kv_pair(label, value):
         return None
     return {
         'label': label,
@@ -719,6 +981,18 @@ def _extract_scalar_from_table_row(cells: list[str], *, table_index: int, row_in
         return None
     label_idx, value_idx = non_empty[0][0], non_empty[1][0]
     label, value = non_empty[0][1], non_empty[1][1]
+    if _normalize_phrase(label) == _normalize_phrase(value):
+        return None
+    if label.strip().endswith('?'):
+        return None
+    if _looks_like_question_anchor(label):
+        return None
+    if _extract_option_from_text_line(label, source_ref={'table_idx': table_index, 'row_idx': row_index}) is not None:
+        return None
+    if _looks_like_heading_fragment_pair(label, value):
+        return None
+    if _extract_option_from_text_line(value, source_ref={'table_idx': table_index, 'row_idx': row_index}) is not None:
+        return None
     if len(_tokenize(label)) > 8 or len(value) > 180:
         return None
     return {
@@ -785,440 +1059,84 @@ def _extract_option_from_text_line(text: str, *, source_ref: dict[str, Any]) -> 
     return None
 
 
-def _resolve_scalar_with_aliases(field_name: str, scalars: list[dict[str, Any]], aliases: tuple[str, ...]) -> dict[str, Any]:
-    best_match: dict[str, Any] | None = None
-    best_score = 0.0
-    near_matches: list[dict[str, Any]] = []
-    alias_tokens = [_tokenize(alias) for alias in aliases]
-
-    for scalar in scalars:
-        label_tokens = _tokenize(scalar.get('label'))
-        score = max((_token_overlap_score(label_tokens, tokens) for tokens in alias_tokens), default=0.0)
-        if score >= 0.8 and score > best_score:
-            best_match = scalar
-            best_score = score
-        elif score >= 0.6:
-            near_matches.append(scalar)
-
-    if best_match is not None:
-        return {
-            'field': field_name,
-            'status': 'resolved' if best_score >= 0.85 else 'weak_match',
-            'resolved_by': 'form_resolver',
-            'value': best_match.get('value'),
-            'candidates': [],
-            'source_ref': dict(best_match.get('source_ref', {})),
-            'confidence': round(best_score, 4),
-        }
-    if near_matches:
-        return {
-            'field': field_name,
-            'status': 'ambiguous',
-            'resolved_by': 'form_resolver',
-            'value': None,
-            'candidates': [item.get('value') for item in near_matches if item.get('value') not in (None, '')],
-            'source_ref': {},
-            'confidence': round(max((_token_overlap_score(_tokenize(item.get('label')), alias_tokens[0]) for item in near_matches), default=0.0), 4),
-        }
+def _extract_contextual_option_from_text_line(
+    text: str,
+    *,
+    source_ref: dict[str, Any],
+    current_group: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    explicit = _extract_option_from_text_line(text, source_ref=source_ref)
+    if explicit is not None:
+        explicit['selection_confidence'] = 0.96 if explicit.get('selected') else 0.88
+        return explicit
+    if current_group is None:
+        return None
+    if not _looks_like_unmarked_group_option(text, current_group=current_group, source_ref=source_ref):
+        return None
     return {
-        'field': field_name,
-        'status': 'not_found',
-        'resolved_by': 'form_resolver',
-        'value': None,
-        'candidates': [],
-        'source_ref': {},
-        'confidence': None,
+        'label': _clean_text(text),
+        'selected': False,
+        'marker_text': '',
+        'source_ref': dict(source_ref),
+        'selection_confidence': 0.45,
     }
 
 
-def _resolve_inn_or_kio(field_name: str, scalars: list[dict[str, Any]]) -> dict[str, Any]:
-    by_label = _resolve_scalar_with_aliases(field_name, scalars, INN_LABEL_ALIASES)
-    if by_label['status'] in {'resolved', 'weak_match'} and by_label.get('value') not in (None, ''):
-        return by_label
+def _looks_like_unmarked_group_option(
+    text: str,
+    *,
+    current_group: dict[str, Any],
+    source_ref: dict[str, Any],
+) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    if _parse_kv_line(cleaned, source_ref={}) is not None:
+        return False
+    if _looks_like_section_heading_text(cleaned):
+        return False
+    tokens = _tokenize(cleaned)
+    if len(tokens) < 2 or len(tokens) > 18:
+        return False
 
-    pattern = re.compile(r'\b[0-9]{8,14}\b')
-    candidates: list[str] = []
-    source_ref: dict[str, Any] = {}
-    for scalar in scalars:
-        value = str(scalar.get('value') or '').strip()
-        match = pattern.search(value)
-        if not match:
-            continue
-        candidates.append(match.group(0))
-        source_ref = dict(scalar.get('source_ref', {}))
+    source_page = source_ref.get('page')
+    group_source = dict(current_group.get('source_ref', {}))
+    if source_page is not None and group_source.get('page') is not None and source_page != group_source.get('page'):
+        return False
 
-    if len(candidates) == 1:
-        return {
-            'field': field_name,
-            'status': 'weak_match',
-            'resolved_by': 'form_resolver',
-            'value': candidates[0],
-            'candidates': [],
-            'source_ref': source_ref,
-            'confidence': 0.65,
-        }
-    if len(candidates) > 1:
-        return {
-            'field': field_name,
-            'status': 'ambiguous',
-            'resolved_by': 'form_resolver',
-            'value': None,
-            'candidates': candidates,
-            'source_ref': source_ref,
-            'confidence': 0.45,
-        }
-    return by_label
+    line_column = source_ref.get('column_id')
+    group_column = group_source.get('column_id')
+    existing_options = [option for option in current_group.get('options', []) if isinstance(option, dict)]
+    option_column = None
+    if existing_options:
+        option_column = dict(existing_options[-1].get('source_ref', {})).get('column_id')
 
+    if option_column is not None and line_column is not None and line_column != option_column:
+        return False
+    if line_column is not None and group_column is not None and line_column != group_column:
+        return True
+    if option_column is None and group_column is not None and line_column is not None and line_column == group_column:
+        return _looks_like_generic_option_start(cleaned)
+
+    if _looks_like_question_anchor(cleaned):
+        return False
+
+    if _looks_like_multi_statement_question(str(current_group.get('question') or '')):
+        return True
+
+    first_token = tokens[0]
+    if first_token in {'да', 'нет', 'yes', 'no'}:
+        return True
+    if '%' in cleaned or any(char.isdigit() for char in cleaned):
+        return True
+    return bool(existing_options)
 
 def _resolve_tax_residency_group(groups: list[dict[str, Any]], *, layout_lines: list[dict[str, Any]]) -> dict[str, Any]:
-    group = _find_best_group(groups, TAX_GROUP_KEYWORDS)
-    if group is None:
-        return {
-            'status': 'not_found',
-            'resolved_by': 'form_resolver',
-            'enum_value': None,
-            'candidates': [],
-            'source_ref': {},
-            'confidence': None,
-        }
-
-    selected_options = [option for option in group.get('options', []) if option.get('selected')]
-    if not selected_options:
-        if _should_attempt_group_repair(group=group, layout_lines=layout_lines, issue='no_selected', allow_multiple=False):
-            repaired = _repair_group_resolution(
-                target_field='isResidentRF',
-                group=group,
-                enum_map=TAX_RESIDENCY_ENUM_MAP,
-                layout_lines=layout_lines,
-                allow_multiple=False,
-            )
-            if repaired is not None:
-                return repaired
-        return {
-            'status': 'not_found',
-            'resolved_by': 'form_resolver',
-            'enum_value': None,
-            'candidates': [_map_option_enum(option.get('label'), TAX_RESIDENCY_ENUM_MAP) for option in group.get('options', [])],
-            'source_ref': dict(group.get('source_ref', {})),
-            'confidence': 0.0,
-        }
-    if len(selected_options) > 1:
-        if _should_attempt_group_repair(group=group, layout_lines=layout_lines, issue='multiple_selected', allow_multiple=False):
-            repaired = _repair_group_resolution(
-                target_field='isResidentRF',
-                group=group,
-                enum_map=TAX_RESIDENCY_ENUM_MAP,
-                layout_lines=layout_lines,
-                allow_multiple=False,
-            )
-            if repaired is not None:
-                return repaired
-        return {
-            'status': 'ambiguous',
-            'resolved_by': 'form_resolver',
-            'enum_value': None,
-            'candidates': [option.get('label') for option in selected_options],
-            'source_ref': dict(group.get('source_ref', {})),
-            'confidence': 0.35,
-        }
-
-    enum_value = _map_option_enum(selected_options[0].get('label'), TAX_RESIDENCY_ENUM_MAP)
-    if enum_value is None:
-        if _should_attempt_group_repair(group=group, layout_lines=layout_lines, issue='unmapped_selected', allow_multiple=False):
-            repaired = _repair_group_resolution(
-                target_field='isResidentRF',
-                group=group,
-                enum_map=TAX_RESIDENCY_ENUM_MAP,
-                layout_lines=layout_lines,
-                allow_multiple=False,
-            )
-            if repaired is not None:
-                return repaired
-        return {
-            'status': 'ambiguous',
-            'resolved_by': 'form_resolver',
-            'enum_value': None,
-            'candidates': [selected_options[0].get('label')],
-            'source_ref': dict(selected_options[0].get('source_ref', {})),
-            'confidence': 0.35,
-        }
-    return {
-        'status': 'resolved',
-        'resolved_by': 'form_resolver',
-        'enum_value': enum_value,
-        'candidates': [],
-        'source_ref': dict(selected_options[0].get('source_ref', {})),
-        'confidence': 0.92,
-    }
+    return _resolve_tax_residency_group_impl(groups, layout_lines=layout_lines, repair_fn=suggest_form_field_repair)
 
 
 def _resolve_fatca_group(field_name: str, groups: list[dict[str, Any]], *, layout_lines: list[dict[str, Any]]) -> dict[str, Any]:
-    group = _find_best_group(groups, FATCA_GROUP_KEYWORDS)
-    if group is None:
-        return {
-            'field': field_name,
-            'status': 'not_found',
-            'resolved_by': 'form_resolver',
-            'value': None,
-            'candidates': [],
-            'source_ref': {},
-            'confidence': None,
-        }
-
-    selected_options = [option for option in group.get('options', []) if option.get('selected')]
-    if not selected_options:
-        if _should_attempt_group_repair(group=group, layout_lines=layout_lines, issue='no_selected', allow_multiple=True):
-            repaired = _repair_group_resolution(
-                target_field=field_name,
-                group=group,
-                enum_map=FATCA_OPTION_MAP,
-                layout_lines=layout_lines,
-                allow_multiple=True,
-            )
-            if repaired is not None:
-                return {
-                    'field': field_name,
-                    'status': repaired['status'],
-                    'resolved_by': repaired['resolved_by'],
-                    'value': repaired['enum_values'],
-                    'candidates': [],
-                    'source_ref': repaired['source_ref'],
-                    'confidence': repaired['confidence'],
-                }
-        return {
-            'field': field_name,
-            'status': 'not_found',
-            'resolved_by': 'form_resolver',
-            'value': [],
-            'candidates': [],
-            'source_ref': dict(group.get('source_ref', {})),
-            'confidence': 0.0,
-        }
-
-    mapped_values: list[str] = []
-    unresolved_labels: list[str] = []
-    for option in selected_options:
-        mapped = _map_option_enum(option.get('label'), FATCA_OPTION_MAP)
-        if mapped is None:
-            unresolved_labels.append(str(option.get('label') or ''))
-            continue
-        if mapped not in mapped_values:
-            mapped_values.append(mapped)
-
-    if unresolved_labels:
-        if _should_attempt_group_repair(group=group, layout_lines=layout_lines, issue='unmapped_selected', allow_multiple=True):
-            repaired = _repair_group_resolution(
-                target_field=field_name,
-                group=group,
-                enum_map=FATCA_OPTION_MAP,
-                layout_lines=layout_lines,
-                allow_multiple=True,
-            )
-            if repaired is not None:
-                return {
-                    'field': field_name,
-                    'status': repaired['status'],
-                    'resolved_by': repaired['resolved_by'],
-                    'value': repaired['enum_values'],
-                    'candidates': [],
-                    'source_ref': repaired['source_ref'],
-                    'confidence': repaired['confidence'],
-                }
-        return {
-            'field': field_name,
-            'status': 'ambiguous',
-            'resolved_by': 'form_resolver',
-            'value': mapped_values or None,
-            'candidates': unresolved_labels,
-            'source_ref': dict(group.get('source_ref', {})),
-            'confidence': 0.45,
-        }
-
-    return {
-        'field': field_name,
-        'status': 'resolved',
-        'resolved_by': 'form_resolver',
-        'value': mapped_values,
-        'candidates': [],
-        'source_ref': dict(group.get('source_ref', {})),
-        'confidence': 0.9,
-    }
-
-
-def _repair_group_resolution(
-    *,
-    target_field: str,
-    group: dict[str, Any],
-    enum_map: dict[str, str],
-    layout_lines: list[dict[str, Any]],
-    allow_multiple: bool,
-) -> dict[str, Any] | None:
-    context_lines = _collect_group_context_lines(group, layout_lines)
-    repaired, warnings = suggest_form_field_repair(
-        target_field=target_field,
-        question=str(group.get('question') or ''),
-        options=[dict(option) for option in group.get('options', []) if isinstance(option, dict)],
-        enum_map=enum_map,
-        context_lines=context_lines,
-        allow_multiple=allow_multiple,
-    )
-    if warnings:
-        group.setdefault('repair_warnings', []).extend(warnings)
-    if not isinstance(repaired, dict):
-        return None
-
-    if allow_multiple:
-        enum_values = [str(value) for value in repaired.get('enum_values', []) if str(value).strip()]
-        if not enum_values:
-            return None
-        return {
-            'status': 'resolved',
-            'resolved_by': 'repair_model',
-            'enum_values': enum_values,
-            'source_ref': dict(group.get('source_ref', {})),
-            'confidence': float(repaired.get('confidence') or 0.6),
-        }
-
-    enum_value = repaired.get('enum_value')
-    if enum_value in (None, ''):
-        return None
-    return {
-        'status': 'resolved',
-        'resolved_by': 'repair_model',
-        'enum_value': str(enum_value),
-        'candidates': [],
-        'source_ref': dict(group.get('source_ref', {})),
-        'confidence': float(repaired.get('confidence') or 0.6),
-    }
-
-
-def _resolve_generic_scalar(field_name: str, scalars: list[dict[str, Any]]) -> dict[str, Any]:
-    target_tokens = _tokenize(field_name)
-    best_match: dict[str, Any] | None = None
-    best_score = 0.0
-
-    for scalar in scalars:
-        label_tokens = _tokenize(scalar.get('label'))
-        score = _token_overlap_score(target_tokens, label_tokens)
-        if score > best_score:
-            best_score = score
-            best_match = scalar
-
-    if best_match is None or best_score < 0.55:
-        return {
-            'field': field_name,
-            'status': 'not_found',
-            'resolved_by': 'form_resolver',
-            'value': None,
-            'candidates': [],
-            'source_ref': {},
-            'confidence': None,
-        }
-
-    return {
-        'field': field_name,
-        'status': 'weak_match' if best_score < 0.82 else 'resolved',
-        'resolved_by': 'form_resolver',
-        'value': best_match.get('value'),
-        'candidates': [],
-        'source_ref': dict(best_match.get('source_ref', {})),
-        'confidence': round(best_score, 4),
-    }
-
-
-def _find_best_group(groups: list[dict[str, Any]], keywords: tuple[str, ...]) -> dict[str, Any] | None:
-    best_group: dict[str, Any] | None = None
-    best_score = 0.0
-    for group in groups:
-        group_id = str(group.get('group_id') or '').strip().lower()
-        if group_id == 'tax_residency' and keywords == TAX_GROUP_KEYWORDS:
-            return group
-        if 'fatca' in group_id and keywords == FATCA_GROUP_KEYWORDS:
-            return group
-        question_tokens = _tokenize(group.get('question'))
-        score = max((_phrase_similarity(question_tokens, _tokenize(keyword)) for keyword in keywords), default=0.0)
-        if score > best_score:
-            best_score = score
-            best_group = group
-    if best_group is None or best_score < 0.4:
-        return None
-    return best_group
-
-
-def _collect_group_context_lines(group: dict[str, Any], layout_lines: list[dict[str, Any]]) -> list[str]:
-    question = _clean_text(group.get('question'))
-    option_labels = [_clean_text(option.get('label')) for option in group.get('options', []) if option.get('label')]
-    source_ref = dict(group.get('source_ref', {}))
-    source_page = source_ref.get('page')
-    source_column = source_ref.get('column_id')
-    source_y = _safe_float(source_ref.get('y'))
-    context: list[str] = []
-    for line in layout_lines:
-        text = _clean_text(line.get('text'))
-        if not text:
-            continue
-        if source_page is not None and line.get('page') != source_page:
-            continue
-        if source_column is not None and line.get('column_id') not in {None, source_column}:
-            continue
-        line_y = _safe_float(line.get('y'))
-        if source_y is not None and line_y is not None and abs(line_y - source_y) > 120:
-            continue
-        if question and question in text:
-            context.append(text)
-            continue
-        if any(label and label in text for label in option_labels):
-            context.append(text)
-            continue
-    if not context:
-        if question:
-            context.append(question)
-        context.extend(option_labels[:6])
-    return context[:12]
-
-
-def _should_attempt_group_repair(
-    *,
-    group: dict[str, Any],
-    layout_lines: list[dict[str, Any]],
-    issue: str,
-    allow_multiple: bool,
-) -> bool:
-    del allow_multiple
-
-    options = [option for option in group.get('options', []) if isinstance(option, dict)]
-    if len(options) < 2 or len(options) > 8:
-        return False
-
-    context_lines = _collect_group_context_lines(group, layout_lines)
-    has_wrapped_lines = len(context_lines) > max(len(options) + 2, 5)
-    has_long_option = any(len(_tokenize(option.get('label'))) >= 6 for option in options)
-    has_unknown_group_type = str(group.get('group_type') or 'unknown') == 'unknown'
-    has_marker_variance = any(
-        str(option.get('marker_text') or '').strip() not in {'', 'X', 'x', 'V', 'v', '✓', '✔', '☒', '☑'}
-        for option in options
-    )
-    complex_group = has_wrapped_lines or has_long_option or has_unknown_group_type or has_marker_variance
-
-    if issue in {'multiple_selected', 'unmapped_selected'}:
-        return complex_group
-    if issue == 'no_selected':
-        return complex_group and any(_contains_marker(line) for line in context_lines)
-    return False
-
-
-def _map_option_enum(label: Any, enum_map: dict[str, str]) -> str | None:
-    label_tokens = _tokenize(label)
-    best_value = None
-    best_score = 0.0
-    for human_label, enum_value in enum_map.items():
-        score = _phrase_similarity(label_tokens, _tokenize(human_label))
-        if score > best_score:
-            best_score = score
-            best_value = enum_value
-    if best_score < 0.45:
-        return None
-    return best_value
+    return _resolve_fatca_group_impl(field_name, groups, layout_lines=layout_lines, repair_fn=suggest_form_field_repair)
 
 
 def _looks_like_form_layout(
@@ -1239,6 +1157,21 @@ def _looks_like_form_layout(
     return False
 
 
+def _has_positioned_layout_lines(layout_lines: list[dict[str, Any]]) -> bool:
+    return any(line.get('page') is not None for line in layout_lines)
+
+
+def _looks_like_cross_column_group_attachment(group: dict[str, Any], line: dict[str, Any]) -> bool:
+    text = _clean_text(line.get('text'))
+    if not text:
+        return False
+    if _extract_contextual_option_from_text_line(text, source_ref=line, current_group=group) is not None:
+        return True
+    if group.get('options') and _is_group_option_continuation_line(group, line):
+        return True
+    return False
+
+
 def _should_merge_wrapped_option_line(current: dict[str, Any], candidate: dict[str, Any]) -> bool:
     current_text = _clean_text(current.get('text'))
     candidate_text = _clean_text(candidate.get('text'))
@@ -1253,6 +1186,8 @@ def _should_merge_wrapped_option_line(current: dict[str, Any], candidate: dict[s
         return False
 
     if _extract_option_from_text_line(candidate_text, source_ref=candidate) is not None:
+        return False
+    if _looks_like_pdf_option_start(candidate_text):
         return False
     if _looks_like_question_anchor(candidate_text) or _parse_kv_line(candidate_text, source_ref=candidate) is not None:
         return False
@@ -1272,7 +1207,12 @@ def _should_merge_wrapped_option_line(current: dict[str, Any], candidate: dict[s
     return True
 
 
-def _line_breaks_group_scope(group: dict[str, Any], line: dict[str, Any]) -> bool:
+def _line_breaks_group_scope(
+    group: dict[str, Any],
+    line: dict[str, Any],
+    *,
+    option: dict[str, Any] | None = None,
+) -> bool:
     source_ref = dict(group.get('source_ref', {}))
     source_page = source_ref.get('page')
     line_page = line.get('page')
@@ -1282,6 +1222,8 @@ def _line_breaks_group_scope(group: dict[str, Any], line: dict[str, Any]) -> boo
     source_column = source_ref.get('column_id')
     line_column = line.get('column_id')
     if source_column is not None and line_column is not None and source_column != line_column:
+        if option is not None or _looks_like_cross_column_group_attachment(group, line):
+            return False
         return True
 
     return False
@@ -1318,6 +1260,35 @@ def _is_option_continuation_line(group: dict[str, Any], line: dict[str, Any]) ->
     return True
 
 
+def _is_group_option_continuation_line(group: dict[str, Any], line: dict[str, Any]) -> bool:
+    if _is_option_continuation_line(group, line):
+        text = _clean_text(line.get('text'))
+        if not text:
+            return True
+        last_option = group.get('options', [])[-1]
+        last_marker = str(last_option.get('marker_text') or '').strip()
+        if last_marker or bool(last_option.get('selected')):
+            return False
+        if _looks_like_generic_option_start(text):
+            return False
+        return True
+
+    text = _clean_text(line.get('text'))
+    if not text or not group.get('options'):
+        return False
+    if _looks_like_multi_statement_question(str(group.get('question') or '')) and _looks_like_generic_continuation_fragment(text):
+        return True
+
+    if _looks_like_question_anchor(text):
+        return False
+    if _parse_kv_line(text, source_ref=line) is not None:
+        return False
+    if _extract_contextual_option_from_text_line(text, source_ref=line, current_group=group) is not None:
+        return False
+
+    return False
+
+
 def _is_form_like_docx_table(raw_rows: list[list[str]]) -> bool:
     if not raw_rows:
         return False
@@ -1333,10 +1304,10 @@ def _is_form_like_docx_table(raw_rows: list[list[str]]) -> bool:
 
 
 def _looks_like_question_anchor(text: str) -> bool:
-    normalized = _normalize_phrase(text)
-    if any(keyword in normalized for keyword in FATCA_GROUP_KEYWORDS):
-        return True
-    if 'налогов' in normalized and 'резидент' in normalized:
+    normalized = _clean_text(text)
+    if _looks_like_generic_option_start(normalized):
+        return False
+    if '?' in normalized and len(_tokenize(normalized)) >= 3:
         return True
     return len(_tokenize(text)) >= 5 and len(text) >= 24
 
@@ -1355,7 +1326,7 @@ def _guess_group_id(text: str, *, table_index: int | None = None, row_index: int
 
 def _guess_group_type_from_question(text: str) -> str:
     normalized = _normalize_phrase(text)
-    if 'fatca' in normalized:
+    if _looks_like_multi_statement_question(text):
         return 'multi_choice'
     if any(word in normalized for word in ('один', 'single', 'только')):
         return 'single_choice'
@@ -1370,6 +1341,51 @@ def _infer_group_type(group: dict[str, Any]) -> str:
     if selected_count > 1:
         return 'multi_choice'
     return 'single_choice'
+
+
+def _looks_like_multi_statement_question(text: Any) -> bool:
+    normalized = _normalize_phrase(text)
+    return any(
+        phrase in normalized
+        for phrase in (
+            'хотя бы одно',
+            'одно из следующих',
+            'следующих утверждений',
+            'one of the following',
+            'following statements',
+        )
+    )
+
+
+def _looks_like_generic_option_start(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    tokens = _tokenize(cleaned)
+    if not tokens:
+        return False
+    if len(tokens) >= 2 and tokens[1] in {'ли'}:
+        return False
+    if cleaned.endswith('?'):
+        return False
+    first = tokens[0]
+    if first in {'да', 'нет', 'yes', 'no', 'не'}:
+        return True
+    if '%' in cleaned or any(char.isdigit() for char in cleaned):
+        return True
+    return False
+
+
+def _looks_like_generic_continuation_fragment(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    if _looks_like_generic_option_start(cleaned):
+        return False
+    tokens = _tokenize(cleaned)
+    if len(tokens) > 8:
+        return False
+    return cleaned[:1].isupper() or cleaned.startswith(('(', '/', '-'))
 
 
 def _build_section_hierarchy(
@@ -1408,6 +1424,125 @@ def _build_section_hierarchy(
     return hierarchy
 
 
+def _annotate_scalar_confidence(scalars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    annotated: list[dict[str, Any]] = []
+    for scalar in scalars:
+        source_ref = dict(scalar.get('source_ref', {}))
+        source_type = str(source_ref.get('source_type') or '')
+        confidence_band = str(scalar.get('confidence') or 'medium')
+        score = 0.72
+        if source_type == 'table_cell':
+            score = 0.88
+        elif source_type == 'paragraph':
+            score = 0.7
+        elif source_type == 'line':
+            score = 0.74
+        if confidence_band == 'high':
+            score = max(score, 0.85)
+        elif confidence_band == 'low':
+            score = min(score, 0.58)
+        annotated.append(
+            {
+                **scalar,
+                'confidence_score': round(score, 4),
+                'ambiguity_reason': None,
+            }
+        )
+    return annotated
+
+
+def _annotate_group_confidence(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    annotated: list[dict[str, Any]] = []
+    for group in groups:
+        options = [dict(option) for option in group.get('options', []) if isinstance(option, dict)]
+        selected_options = [option for option in options if option.get('selected')]
+        explicit_marker_count = sum(1 for option in options if str(option.get('marker_text') or '').strip())
+        is_ambiguous = False
+        ambiguity_reason = None
+        if str(group.get('group_type') or 'unknown') == 'single_choice' and len(selected_options) > 1:
+            is_ambiguous = True
+            ambiguity_reason = 'multiple_selected_options'
+        elif not options:
+            is_ambiguous = True
+            ambiguity_reason = 'group_without_options'
+
+        group_score = 0.45
+        if str(group.get('question') or '').strip():
+            group_score += 0.15
+        if len(options) >= 2:
+            group_score += 0.15
+        if explicit_marker_count:
+            group_score += 0.15
+        if group.get('source_ref'):
+            group_score += 0.05
+        if is_ambiguous:
+            group_score -= 0.15
+        group_score = max(0.0, min(group_score, 0.99))
+
+        if len(selected_options) == 1:
+            selection_score = 0.95 if str(selected_options[0].get('marker_text') or '').strip() else 0.7
+        elif len(selected_options) > 1:
+            selection_score = 0.25
+        else:
+            selection_score = 0.0 if not options else 0.35
+
+        annotated_options: list[dict[str, Any]] = []
+        for option in options:
+            option_score = option.get('selection_confidence')
+            if option_score is None:
+                option_score = 0.95 if option.get('selected') and str(option.get('marker_text') or '').strip() else 0.55
+                if option.get('selected') and not str(option.get('marker_text') or '').strip():
+                    option_score = 0.7
+                if not option.get('selected') and not str(option.get('marker_text') or '').strip():
+                    option_score = 0.45
+            annotated_options.append(
+                {
+                    **option,
+                    'selection_confidence': round(float(option_score), 4),
+                    'is_ambiguous': is_ambiguous and option.get('selected', False),
+                    'ambiguity_reason': ambiguity_reason if is_ambiguous and option.get('selected', False) else None,
+                }
+            )
+
+        annotated.append(
+            {
+                **group,
+                'options': annotated_options,
+                'group_confidence': round(group_score, 4),
+                'selection_confidence': round(selection_score, 4),
+                'is_ambiguous': is_ambiguous,
+                'ambiguity_reason': ambiguity_reason,
+            }
+        )
+    return annotated
+
+
+def _build_form_structure_summary(
+    *,
+    layout_lines: list[dict[str, Any]],
+    scalars: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    option_count = sum(len(list(group.get('options') or [])) for group in groups)
+    selected_option_count = sum(
+        1
+        for group in groups
+        for option in list(group.get('options') or [])
+        if isinstance(option, dict) and option.get('selected')
+    )
+    ambiguous_group_count = sum(1 for group in groups if group.get('is_ambiguous'))
+    return {
+        'layout_line_count': len(layout_lines),
+        'scalar_count': len(scalars),
+        'group_count': len(groups),
+        'option_count': option_count,
+        'selected_option_count': selected_option_count,
+        'section_count': len(sections),
+        'ambiguous_group_count': ambiguous_group_count,
+    }
+
+
 def _dedupe_scalars(scalars: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -1422,6 +1557,104 @@ def _dedupe_scalars(scalars: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _suppress_scalars_consumed_by_groups(
+    scalars: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not scalars or not groups:
+        return scalars
+
+    consumed_source_refs: list[dict[str, Any]] = []
+    consumed_option_texts: set[str] = set()
+    consumed_question_texts: set[str] = set()
+
+    for group in groups:
+        source_ref = dict(group.get('source_ref', {}))
+        if source_ref:
+            consumed_source_refs.append(source_ref)
+
+        question_text = _normalize_phrase(group.get('question'))
+        if question_text:
+            consumed_question_texts.add(question_text)
+
+        for option in group.get('options', []):
+            option_ref = dict(option.get('source_ref', {}))
+            if option_ref:
+                consumed_source_refs.append(option_ref)
+
+            option_text = _normalize_phrase(option.get('label'))
+            if option_text:
+                consumed_option_texts.add(option_text)
+
+    filtered: list[dict[str, Any]] = []
+    for scalar in scalars:
+        label = str(scalar.get('label') or '').strip()
+        value = str(scalar.get('value') or '').strip()
+        normalized_label = _normalize_phrase(label)
+        normalized_value = _normalize_phrase(value)
+        source_ref = dict(scalar.get('source_ref', {}))
+
+        if any(_source_refs_overlap(source_ref, consumed_ref) for consumed_ref in consumed_source_refs):
+            continue
+        if normalized_label and normalized_label in consumed_option_texts:
+            continue
+        if normalized_value and normalized_value in consumed_option_texts:
+            continue
+        if normalized_label and normalized_label in consumed_question_texts:
+            continue
+        if normalized_value and normalized_value in consumed_question_texts:
+            continue
+
+        filtered.append(scalar)
+
+    return filtered
+
+
+def _source_refs_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if not left or not right:
+        return False
+
+    shared_scalar_keys = ('line_id', 'block_id', 'paragraph_idx', 'cell_idx')
+    for key in shared_scalar_keys:
+        left_value = left.get(key)
+        right_value = right.get(key)
+        if left_value is not None and right_value is not None and left_value == right_value:
+            if _shared_parent_context_matches(left, right):
+                return True
+
+    table_left = left.get('table_idx')
+    table_right = right.get('table_idx')
+    row_left = left.get('row_idx')
+    row_right = right.get('row_idx')
+    if table_left is not None and table_right is not None and row_left is not None and row_right is not None:
+        return table_left == table_right and row_left == row_right
+
+    page_left = left.get('page')
+    page_right = right.get('page')
+    line_left = left.get('line_id')
+    line_right = right.get('line_id')
+    if page_left is not None and page_right is not None and line_left is not None and line_right is not None:
+        return page_left == page_right and line_left == line_right
+
+    return False
+
+
+def _shared_parent_context_matches(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    table_left = left.get('table_idx')
+    table_right = right.get('table_idx')
+    row_left = left.get('row_idx')
+    row_right = right.get('row_idx')
+    if table_left is not None and table_right is not None and row_left is not None and row_right is not None:
+        return table_left == table_right and row_left == row_right
+
+    page_left = left.get('page')
+    page_right = right.get('page')
+    if page_left is not None and page_right is not None:
+        return page_left == page_right
+
+    return True
+
+
 def _dedupe_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[tuple[str, tuple[str, ...]]] = set()
@@ -1434,6 +1667,83 @@ def _dedupe_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         result.append(group)
     return result
+
+
+def _filter_noisy_scalars(scalars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for scalar in scalars:
+        label = str(scalar.get('label') or '').strip()
+        value = str(scalar.get('value') or '').strip()
+        if not _is_useful_scalar_candidate(label, value):
+            continue
+        filtered.append(scalar)
+    return filtered
+
+
+def _is_useful_scalar_candidate(label: str, value: str) -> bool:
+    normalized_label = _clean_text(label)
+    normalized_value = _clean_text(value)
+    if not normalized_label or not normalized_value:
+        return False
+    if _looks_like_heading_fragment_pair(normalized_label, normalized_value):
+        return False
+    return True
+
+
+def _is_valid_layout_kv_pair(label: str, value: str) -> bool:
+    normalized_label = _clean_text(label)
+    normalized_value = _clean_text(value)
+    if not normalized_label or not normalized_value:
+        return False
+    if len(normalized_label) > 80:
+        return False
+    if len(_tokenize(normalized_label)) > 8:
+        return False
+    if len(normalized_value) > 260:
+        return False
+    if _looks_like_heading_fragment_pair(normalized_label, normalized_value):
+        return False
+    return True
+
+
+def _looks_like_heading_fragment_pair(label: str, value: str) -> bool:
+    if not _looks_like_section_heading_text(label):
+        return False
+    if any(ch.isdigit() for ch in f'{label} {value}'):
+        return False
+    if len(_tokenize(value)) < 2:
+        return False
+    return _uppercase_ratio(value) >= 0.55 or _looks_like_section_heading_text(value)
+
+
+def _looks_like_section_heading_text(text: str) -> bool:
+    tokens = _tokenize(text)
+    if len(tokens) < 2:
+        return False
+    heading_keywords = {
+        'сведения',
+        'информация',
+        'данные',
+        'анкета',
+        'раздел',
+        'часть',
+        'приложение',
+    }
+    if tokens[0] in heading_keywords:
+        return True
+    return _uppercase_ratio(text) >= 0.9 and len(tokens) >= 4
+
+
+def _looks_like_pdf_option_start(text: str) -> bool:
+    return _looks_like_generic_option_start(text)
+
+
+def _uppercase_ratio(text: str) -> float:
+    letters = [char for char in str(text or '') if char.isalpha()]
+    if not letters:
+        return 0.0
+    uppercase = sum(1 for char in letters if char.isupper())
+    return uppercase / len(letters)
 
 
 def _clean_text(value: Any) -> str:

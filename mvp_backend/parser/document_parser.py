@@ -97,6 +97,7 @@ def _parse_image_like_file(path: Path) -> dict[str, Any]:
 
 def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]) -> dict[str, Any]:
     tables = [table for table in base_result.get('tables', []) if isinstance(table, dict)]
+    zone_summary = dict(base_result.get('zone_summary') or {})
     raw_text = normalize_text(base_result.get('text', ''))
     layout_blocks = [dict(block) for block in base_result.get('blocks', []) if isinstance(block, dict)]
     text_blocks = split_text_blocks(raw_text)
@@ -104,12 +105,19 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
     kv_pairs = extract_kv_pairs(raw_text)
     text_facts = extract_text_facts(raw_text)
     classification = classify_document(file_type=ext, tables=tables, raw_text=raw_text, kv_pairs=kv_pairs)
-    source_candidates = build_source_candidates(
-        tables=tables,
-        kv_pairs=kv_pairs,
-        text_facts=text_facts,
-        sections=sections,
-    )
+    if ext == 'pdf' and zone_summary:
+        classification = {
+            'content_type': str(zone_summary.get('content_type') or classification['content_type']),
+            'extraction_status': str(zone_summary.get('extraction_status') or classification['extraction_status']),
+        }
+        raw_text, text_blocks, sections, kv_pairs, text_facts = _merge_pdf_zone_results(
+            raw_text=raw_text,
+            text_blocks=text_blocks,
+            sections=sections,
+            kv_pairs=kv_pairs,
+            text_facts=text_facts,
+            zone_summary=zone_summary,
+        )
     layout_layer = extract_layout_layer(
         file_path=path,
         file_type=ext,
@@ -130,6 +138,18 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         layout_meta = form_model.get('layout_meta')
         if isinstance(layout_meta, dict) and layout_meta.get('document_mode') == 'form_layout_mode':
             document_mode = 'form_layout_mode'
+            kv_pairs, text_facts = _suppress_consumed_group_fragments(
+                kv_pairs=kv_pairs,
+                text_facts=text_facts,
+                form_model=form_model,
+            )
+
+    source_candidates = build_source_candidates(
+        tables=tables,
+        kv_pairs=kv_pairs,
+        text_facts=text_facts,
+        sections=sections,
+    )
 
     content_type = classification['content_type']
     extraction_status = classification['extraction_status']
@@ -154,7 +174,18 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
     if document_mode == 'form_layout_mode':
         warnings.append('Detected form-like layout document. Form-aware extraction is enabled.')
         if tables and classification['content_type'] in {'table', 'mixed'}:
-            warnings.append('PDF table extraction looked form-like, so preview was switched to form-aware extraction.')
+            warnings.append('Extracted table looked form-like, so preview was switched to form-aware extraction.')
+    if ext == 'pdf' and zone_summary:
+        zone_counts = dict(zone_summary.get('counts') or {})
+        warnings.append(
+            'PDF zoning summary: '
+            f"table={int(zone_counts.get('table') or 0)}, "
+            f"form={int(zone_counts.get('form') or 0)}, "
+            f"text={int(zone_counts.get('text') or 0)}, "
+            f"noise={int(zone_counts.get('noise') or 0)}."
+        )
+        region_count = len([item for item in zone_summary.get('region_zones', []) if isinstance(item, dict)])
+        warnings.append(f'PDF zoning regions: {region_count}.')
 
     deduped_warnings: list[str] = []
     seen_warnings: set[str] = set()
@@ -181,8 +212,171 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         'source_candidates': source_candidates,
         'document_mode': document_mode,
         'form_model': form_model,
+        'pdf_zone_summary': zone_summary if ext == 'pdf' else {},
         'warnings': deduped_warnings,
     }
+
+
+def _merge_pdf_zone_results(
+    *,
+    raw_text: str,
+    text_blocks: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    kv_pairs: list[dict[str, Any]],
+    text_facts: list[dict[str, Any]],
+    zone_summary: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    parser_outputs = dict(zone_summary.get('parser_outputs') or {})
+    text_output = dict(parser_outputs.get('text') or {})
+    form_output = dict(parser_outputs.get('form') or {})
+    noise_output = dict(parser_outputs.get('noise') or {})
+    text_regions = [dict(item) for item in text_output.get('regions', []) if isinstance(item, dict)]
+    form_regions = [dict(item) for item in form_output.get('regions', []) if isinstance(item, dict)]
+    noise_regions = [dict(item) for item in noise_output.get('regions', []) if isinstance(item, dict)]
+    if not text_regions and not form_regions and not noise_regions:
+        region_zones = [dict(item) for item in zone_summary.get('region_zones', []) if isinstance(item, dict)]
+    else:
+        region_zones = text_regions + form_regions + noise_regions
+    if not region_zones:
+        return raw_text, text_blocks, sections, kv_pairs, text_facts
+
+    non_noise_regions = [zone for zone in region_zones if str(zone.get('zone_type') or '') in {'text', 'form'}]
+    if not text_regions:
+        text_regions = [zone for zone in region_zones if str(zone.get('zone_type') or '') == 'text']
+    if not noise_regions:
+        noise_regions = [zone for zone in region_zones if str(zone.get('zone_type') or '') == 'noise']
+
+    preferred_regions = text_regions or non_noise_regions
+    preferred_text = '\n\n'.join(str(zone.get('text') or '').strip() for zone in preferred_regions if str(zone.get('text') or '').strip())
+    merged_text = normalize_text(preferred_text) or raw_text
+
+    merged_text_blocks = []
+    for index, zone in enumerate(non_noise_regions, start=1):
+        text = str(zone.get('text') or '').strip()
+        if not text:
+            continue
+        merged_text_blocks.append(
+            {
+                'id': str(zone.get('zone_id') or f'pdf-zone-{index}'),
+                'kind': 'paragraph',
+                'text': text,
+                'label': str(zone.get('zone_type') or ''),
+            }
+        )
+    if not merged_text_blocks:
+        merged_text_blocks = text_blocks
+
+    merged_sections = extract_sections(merged_text) if merged_text else sections
+    filtered_kv_pairs = _filter_pdf_structured_items_by_zones(
+        items=kv_pairs,
+        allowed_regions=non_noise_regions,
+        excluded_regions=noise_regions,
+    )
+    filtered_text_facts = _filter_pdf_structured_items_by_zones(
+        items=text_facts,
+        allowed_regions=text_regions or non_noise_regions,
+        excluded_regions=noise_regions,
+    )
+    return merged_text, merged_text_blocks, merged_sections, filtered_kv_pairs, filtered_text_facts
+
+
+def _filter_pdf_structured_items_by_zones(
+    *,
+    items: list[dict[str, Any]],
+    allowed_regions: list[dict[str, Any]],
+    excluded_regions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not items:
+        return items
+    allowed_texts = [_normalize_form_text(zone.get('text')) for zone in allowed_regions if _normalize_form_text(zone.get('text'))]
+    excluded_texts = [_normalize_form_text(zone.get('text')) for zone in excluded_regions if _normalize_form_text(zone.get('text'))]
+    if not allowed_texts and not excluded_texts:
+        return items
+
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        label = _normalize_form_text(item.get('label'))
+        value = _normalize_form_text(item.get('value'))
+        combined = ' '.join(part for part in (label, value) if part).strip()
+        if not combined:
+            continue
+        if any(excluded and combined in excluded for excluded in excluded_texts):
+            continue
+        if allowed_texts and not any(combined in allowed or label and label in allowed or value and value in allowed for allowed in allowed_texts):
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _suppress_consumed_group_fragments(
+    *,
+    kv_pairs: list[dict[str, Any]],
+    text_facts: list[dict[str, Any]],
+    form_model: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    consumed_option_texts: set[str] = set()
+    consumed_question_texts: set[str] = set()
+
+    for group in [item for item in form_model.get('groups', []) if isinstance(item, dict)]:
+        question_text = _normalize_form_text(group.get('question'))
+        if question_text:
+            consumed_question_texts.add(question_text)
+        for option in [item for item in group.get('options', []) if isinstance(item, dict)]:
+            option_text = _normalize_form_text(option.get('label'))
+            if option_text:
+                consumed_option_texts.add(option_text)
+
+    if not consumed_option_texts and not consumed_question_texts:
+        return kv_pairs, text_facts
+
+    filtered_pairs = [
+        pair
+        for pair in kv_pairs
+        if not _is_consumed_group_fragment(
+            label=pair.get('label'),
+            value=pair.get('value'),
+            consumed_option_texts=consumed_option_texts,
+            consumed_question_texts=consumed_question_texts,
+        )
+    ]
+    filtered_facts = [
+        fact
+        for fact in text_facts
+        if not _is_consumed_group_fragment(
+            label=fact.get('label'),
+            value=fact.get('value'),
+            consumed_option_texts=consumed_option_texts,
+            consumed_question_texts=consumed_question_texts,
+        )
+    ]
+    return filtered_pairs, filtered_facts
+
+
+def _is_consumed_group_fragment(
+    *,
+    label: Any,
+    value: Any,
+    consumed_option_texts: set[str],
+    consumed_question_texts: set[str],
+) -> bool:
+    normalized_label = _normalize_form_text(label)
+    normalized_value = _normalize_form_text(value)
+    combined = ' '.join(part for part in [normalized_label, normalized_value] if part).strip()
+    if not combined:
+        return False
+
+    if any(option_text and option_text in combined for option_text in consumed_option_texts):
+        return True
+
+    marker_like = normalized_label in {'x', '[x]', 'v', '[v]', '✓', '✔', '☒', '☑', 'да', 'нет', 'yes', 'no'}
+    if marker_like and any(question_text and question_text in combined for question_text in consumed_question_texts):
+        return True
+
+    return False
+
+
+def _normalize_form_text(value: Any) -> str:
+    return ' '.join(str(value or '').strip().casefold().split())
 
 
 if __name__ == "__main__":

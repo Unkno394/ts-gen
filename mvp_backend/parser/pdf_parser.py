@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import Any
 
 import pdfplumber
+from pdf_zoning import classify_pdf_document_zones
 
 
 TEXT_MIN_LENGTH = 40
 LINE_Y_TOLERANCE = 4.0
+LINE_SEGMENT_GAP_THRESHOLD = 60.0
 LINE_COLUMN_GAP_THRESHOLD = 120.0
 
 
@@ -55,6 +57,7 @@ def extract_tables_from_pdf(path: str | Path) -> list[dict[str, Any]]:
                             "name": f"Page {page_index} · Table {table_index}",
                             "columns": columns,
                             "rows": rows,
+                            "raw_rows": normalized_rows,
                         }
                     )
 
@@ -107,38 +110,57 @@ def extract_layout_lines_from_pdf(path: str | Path) -> list[dict[str, Any]]:
 def parse_pdf(path: str | Path) -> dict[str, Any]:
     warnings: list[str] = []
     layout_lines = extract_layout_lines_from_pdf(path)
-
     tables = extract_tables_from_pdf(path)
+    direct_text = extract_text_from_pdf(path)
+    zone_summary = classify_pdf_document_zones(
+        tables=tables,
+        layout_lines=layout_lines,
+        raw_text=direct_text,
+    )
+    data_tables = [dict(table) for table in list(zone_summary.get('data_tables') or [])]
+    form_tables = [dict(table) for table in list(zone_summary.get('form_tables') or [])]
+    synthetic_form_blocks = _build_form_blocks_from_tables(form_tables) if form_tables and not layout_lines else []
+    blocks = layout_lines or synthetic_form_blocks
+
     if tables:
-        columns = tables[0]["columns"]
-        rows = tables[0]["rows"]
-        extracted_text = extract_text_from_pdf(path)
-        if len(tables) > 1:
-            warnings.append(f"Found {len(tables)} tables in PDF.")
+        warnings.append(f"Found {len(tables)} tables in PDF.")
+    if data_tables:
+        warnings.append(
+            f"PDF zoning classified {len(data_tables)} table zone(s)."
+        )
+    if form_tables:
+        warnings.append(
+            f"PDF zoning classified {len(form_tables)} form-like table zone(s)."
+        )
+    if data_tables:
+        columns = data_tables[0]["columns"]
+        rows = data_tables[0]["rows"]
         return {
             "file_name": Path(path).name,
             "file_type": "pdf",
-            "content_type": "table",
+            "content_type": str(zone_summary.get('content_type') or 'table'),
             "columns": columns,
             "rows": rows,
-            "tables": tables,
-            "text": extracted_text,
-            "blocks": layout_lines,
+            "tables": data_tables,
+            "text": direct_text,
+            "blocks": blocks,
+            "zone_summary": zone_summary,
             "warnings": warnings,
         }
 
-    direct_text = extract_text_from_pdf(path)
-    if len(direct_text) >= TEXT_MIN_LENGTH or layout_lines:
-        warnings.append("No tables found in PDF. Returned extracted text only.")
+    if len(direct_text) >= TEXT_MIN_LENGTH or blocks:
+        if not data_tables:
+            warnings.append("No data-table zones found in PDF. Returned zoned text/layout extraction.")
         return {
             "file_name": Path(path).name,
             "file_type": "pdf",
-            "content_type": "text",
+            "content_type": str(zone_summary.get('content_type') or 'text'),
             "columns": [],
             "rows": [],
-            "tables": [],
+            "tables": data_tables,
             "text": direct_text,
-            "blocks": layout_lines or [{"type": "paragraph", "text": direct_text}],
+            "blocks": blocks or [{"type": "paragraph", "text": direct_text}],
+            "zone_summary": zone_summary,
             "warnings": warnings,
         }
 
@@ -146,14 +168,48 @@ def parse_pdf(path: str | Path) -> dict[str, Any]:
     return {
         "file_name": Path(path).name,
         "file_type": "pdf",
-        "content_type": "text",
+        "content_type": str(zone_summary.get('content_type') or 'text'),
         "columns": [],
         "rows": [],
-        "tables": [],
+        "tables": data_tables,
         "text": "",
-        "blocks": layout_lines,
+        "blocks": blocks,
+        "zone_summary": zone_summary,
         "warnings": warnings,
     }
+
+
+def _build_form_blocks_from_tables(form_tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for table_index, table in enumerate(form_tables):
+        raw_rows = [row for row in list(table.get('raw_rows') or []) if isinstance(row, list)]
+        if not raw_rows:
+            columns = [str(column or '').strip() for column in list(table.get('columns') or [])]
+            raw_rows = [[column for column in columns]]
+            for row in [item for item in list(table.get('rows') or []) if isinstance(item, dict)]:
+                raw_rows.append([str(row.get(column) or '').strip() for column in columns])
+        for row_index, row_cells in enumerate(raw_rows):
+            row_y = float(len(blocks) * 14)
+            for cell_index, raw_value in enumerate(row_cells):
+                value = str(raw_value or '').strip()
+                if not value:
+                    continue
+                blocks.append(
+                    {
+                        'id': f'pdf-form-table-{table_index + 1}-row-{row_index}-cell-{cell_index + 1}',
+                        'type': 'line',
+                        'text': value,
+                        'page': 1,
+                        'column_id': cell_index + 1,
+                        'x': 20.0 + cell_index * 280.0,
+                        'y': row_y,
+                        'width': None,
+                        'height': None,
+                        'source_type': 'line',
+                        'tokens': [],
+                    }
+                )
+    return blocks
 
 
 def _group_words_into_lines(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -244,7 +300,7 @@ def _split_line_segments(
             segments[-1]
             and previous_right is not None
             and token_left is not None
-            and token_left - previous_right > LINE_COLUMN_GAP_THRESHOLD
+            and token_left - previous_right > LINE_SEGMENT_GAP_THRESHOLD
         ):
             segments.append([])
         segments[-1].append(token)

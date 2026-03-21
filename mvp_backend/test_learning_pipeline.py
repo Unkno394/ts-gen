@@ -266,6 +266,81 @@ class LearningPipelineTests(unittest.TestCase):
                 self.assertGreater(penalty, 0.0)
                 self.assertEqual(conflict_label, expected_label)
 
+    def test_pdf_low_confidence_form_zone_lowers_mapping_confidence(self) -> None:
+        with patch(
+            'learning_pipeline.rank_mapping_candidate',
+            return_value=(
+                {
+                    'target': 'mainComment',
+                    'best_candidate': 'Комментарий клиента',
+                    'confidence': 0.91,
+                    'reason': 'semantic_comment_match',
+                },
+                [],
+            ),
+        ):
+            result = resolve_generation_mappings_detailed(
+                source_columns=['Комментарий клиента'],
+                source_rows=[{'Комментарий клиента': 'test'}],
+                target_fields=[TargetField(name='mainComment', type='string')],
+                user_id='pipeline-user',
+                schema_fingerprint_id=3,
+                source_routing_context={
+                    'file_type': 'pdf',
+                    'document_mode': 'form_layout_mode',
+                    'final_source_mode': 'form_resolver',
+                    'pdf_zone_routing': {
+                        'low_confidence_form_zones': True,
+                        'best_form_confidence': 0.58,
+                        'best_table_confidence': 0.0,
+                    },
+                },
+            )
+
+        mapping = result['mappings'][0]
+        self.assertEqual(mapping.source, 'Комментарий клиента')
+        self.assertEqual(mapping.source_of_truth, 'model_suggestion')
+        self.assertEqual(mapping.confidence, 'low')
+        self.assertLess(mapping.model_confidence_score or 0.0, 0.91)
+        self.assertEqual(mapping.candidate_metadata.get('source_routing_penalty_reason'), 'low_confidence_form_zones')
+        self.assertTrue(any('lowered mapping confidence' in warning for warning in result['warnings']))
+
+    def test_pdf_table_preference_lowers_mapping_confidence_more_aggressively(self) -> None:
+        with patch(
+            'learning_pipeline.rank_mapping_candidate',
+            return_value=(
+                {
+                    'target': 'mainComment',
+                    'best_candidate': 'Комментарий клиента',
+                    'confidence': 0.91,
+                    'reason': 'semantic_comment_match',
+                },
+                [],
+            ),
+        ):
+            result = resolve_generation_mappings_detailed(
+                source_columns=['Комментарий клиента'],
+                source_rows=[{'Комментарий клиента': 'test'}],
+                target_fields=[TargetField(name='mainComment', type='string')],
+                user_id='pipeline-user',
+                schema_fingerprint_id=4,
+                source_routing_context={
+                    'file_type': 'pdf',
+                    'document_mode': 'form_layout_mode',
+                    'final_source_mode': 'form_resolver',
+                    'pdf_zone_routing': {
+                        'prefer_table_source': True,
+                        'best_form_confidence': 0.42,
+                        'best_table_confidence': 0.92,
+                    },
+                },
+            )
+
+        mapping = result['mappings'][0]
+        self.assertEqual(mapping.confidence, 'low')
+        self.assertEqual(mapping.candidate_metadata.get('source_routing_penalty_reason'), 'pdf_zone_prefers_table')
+        self.assertEqual(result['explainability']['mapping_stats']['source_routing_adjusted'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -855,9 +855,6 @@ CREATE INDEX IF NOT EXISTS idx_pattern_candidates_status
 CREATE INDEX IF NOT EXISTS idx_pattern_candidates_fields
   ON pattern_candidates (source_field_normalized, target_field_normalized);
 
-CREATE INDEX IF NOT EXISTS idx_pattern_candidates_cluster
-  ON pattern_candidates (concept_cluster, semantic_role, status);
-
 CREATE INDEX IF NOT EXISTS idx_sensitive_token_registry_lookup
   ON sensitive_token_registry (token, scope, user_id, is_active);
 

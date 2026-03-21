@@ -210,6 +210,13 @@ export type GenerationResult = {
   previewDiagnostics?: ValidationDiagnostic[];
   mappingOperationalStatus?: OperationalMappingStatus | null;
   mappingEvalMetrics?: TrueQualityMetrics | null;
+  sourceQualityAdjustment?: {
+    applied: boolean;
+    adjustedCount: number;
+    reasons: Record<string, number>;
+    affectedTargets: string[];
+    strongestPenalty: number;
+  } | null;
   tsSyntaxValid?: boolean;
   tsRuntimePreviewValid?: boolean;
   outputSchemaValid?: boolean;
@@ -264,6 +271,7 @@ export type GenerationValidation = {
   qualitySummary?: {
     operationalMappingStatus?: OperationalMappingStatus | null;
     trueQualityMetrics?: TrueQualityMetrics | null;
+    sourceQualityAdjustment?: GenerationResult['sourceQualityAdjustment'];
     tsSyntaxValid?: boolean;
     tsRuntimePreviewValid?: boolean;
     outputSchemaValid?: boolean;

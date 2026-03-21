@@ -159,6 +159,13 @@ type BackendGenerateResponse = {
     accepted_after_review_rate?: number | null;
     notes?: string | null;
   } | null;
+  source_quality_adjustment?: {
+    applied?: boolean;
+    adjusted_count?: number;
+    reasons?: Record<string, number>;
+    affected_targets?: string[];
+    strongest_penalty?: number;
+  } | null;
   ts_syntax_valid?: boolean;
   ts_runtime_preview_valid?: boolean;
   output_schema_valid?: boolean;
@@ -254,6 +261,13 @@ type BackendHistoryResponse = {
           unresolved_rate?: number | null;
           accepted_after_review_rate?: number | null;
           notes?: string | null;
+        } | null;
+        source_quality_adjustment?: {
+          applied?: boolean;
+          adjusted_count?: number;
+          reasons?: Record<string, number>;
+          affected_targets?: string[];
+          strongest_penalty?: number;
         } | null;
         ts_syntax_valid?: boolean;
         ts_runtime_preview_valid?: boolean;
@@ -903,6 +917,30 @@ function normalizeTrueQualityMetrics(
   };
 }
 
+function normalizeSourceQualityAdjustment(
+  payload:
+    | {
+        applied?: boolean;
+        adjusted_count?: number;
+        reasons?: Record<string, number>;
+        affected_targets?: string[];
+        strongest_penalty?: number;
+      }
+    | null
+    | undefined
+) {
+  if (!payload || !payload.applied) {
+    return null;
+  }
+  return {
+    applied: Boolean(payload.applied),
+    adjustedCount: payload.adjusted_count ?? 0,
+    reasons: payload.reasons ?? {},
+    affectedTargets: payload.affected_targets ?? [],
+    strongestPenalty: payload.strongest_penalty ?? 0,
+  };
+}
+
 function normalizeFormExplainability(payload: BackendFormExplainability | null | undefined): FormExplainability | null {
   if (!payload) {
     return null;
@@ -1233,6 +1271,7 @@ export async function generateFromBackend({ file, targetJson, userId: _userId, s
     previewDiagnostics: payload.preview_diagnostics ?? [],
     mappingOperationalStatus: normalizeOperationalMappingStatus(payload.mapping_operational_status ?? payload.mapping_quality),
     mappingEvalMetrics: normalizeTrueQualityMetrics(payload.mapping_eval_metrics),
+    sourceQualityAdjustment: normalizeSourceQualityAdjustment(payload.source_quality_adjustment),
     tsSyntaxValid: payload.ts_syntax_valid ?? false,
     tsRuntimePreviewValid: payload.ts_runtime_preview_valid ?? false,
     outputSchemaValid: payload.output_schema_valid ?? false,
@@ -1370,6 +1409,7 @@ export async function fetchHistory(_userId: string): Promise<HistoryItem[]> {
                   item.validation.quality_summary.operational_mapping_status ?? item.validation.quality_summary.mapping_quality
                 ),
                 trueQualityMetrics: normalizeTrueQualityMetrics(item.validation.quality_summary.true_quality_metrics),
+                sourceQualityAdjustment: normalizeSourceQualityAdjustment(item.validation.quality_summary.source_quality_adjustment),
                 tsSyntaxValid: item.validation.quality_summary.ts_syntax_valid,
                 tsRuntimePreviewValid: item.validation.quality_summary.ts_runtime_preview_valid,
                 outputSchemaValid: item.validation.quality_summary.output_schema_valid,

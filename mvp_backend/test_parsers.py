@@ -164,7 +164,17 @@ except ModuleNotFoundError:
     sys.modules['fastapi.security'] = fastapi_security_stub
 
 from models import ParsedFile, ParsedSheet, RepairApplyPayload, RepairPreviewPayload, TargetField
-from parsers import ParseError, _build_form_model, parse_file, resolve_generation_source
+from parsers import ParseError, _build_form_model, _resolve_generic_form_layout_source, parse_file, resolve_generation_source
+from pdf_zoning import classify_pdf_document_zones
+from document_parser import _suppress_consumed_group_fragments
+from form_layout import (
+    _extract_scalar_from_table_row,
+    _extract_scalars_from_layout_lines,
+    _extract_table_rows_as_form,
+    _parse_kv_line,
+    _resolve_fatca_group,
+    understand_generic_form,
+)
 from routes import _build_form_explainability, repair_apply, repair_preview
 
 
@@ -425,6 +435,319 @@ class DocumentParserTests(unittest.TestCase):
         self.assertIsInstance(rows[0]['fatca_beneficiary'], list)
         self.assertIn('Generated mapping from form-aware extracted fields.', warnings)
 
+    def test_docx_question_option_row_is_not_treated_as_scalar(self) -> None:
+        scalar = _extract_scalar_from_table_row(
+            ['Российской Федерации?', 'X Не являюсь налоговым резидентом ни в одном государстве (территории)'],
+            table_index=0,
+            row_index=4,
+        )
+
+        self.assertIsNone(scalar)
+
+    def test_layout_lines_extract_docx_table_scalars_without_raw_form_rows(self) -> None:
+        scalars = _extract_scalars_from_layout_lines(
+            [
+                {
+                    'text': 'Наименование организации',
+                    'table_idx': 0,
+                    'row_idx': 1,
+                    'cell_idx': 0,
+                    'source_type': 'table_cell',
+                },
+                {
+                    'text': 'ООО «Рога и Копыта»',
+                    'table_idx': 0,
+                    'row_idx': 1,
+                    'cell_idx': 1,
+                    'source_type': 'table_cell',
+                },
+                {
+                    'text': 'ИНН/КИО',
+                    'table_idx': 0,
+                    'row_idx': 2,
+                    'cell_idx': 0,
+                    'source_type': 'table_cell',
+                },
+                {
+                    'text': '1234567890',
+                    'table_idx': 0,
+                    'row_idx': 2,
+                    'cell_idx': 1,
+                    'source_type': 'table_cell',
+                },
+                {
+                    'text': 'Российской Федерации?',
+                    'table_idx': 0,
+                    'row_idx': 4,
+                    'cell_idx': 0,
+                    'source_type': 'table_cell',
+                },
+                {
+                    'text': 'X Не являюсь налоговым резидентом ни в одном государстве (территории)',
+                    'table_idx': 0,
+                    'row_idx': 4,
+                    'cell_idx': 1,
+                    'source_type': 'table_cell',
+                },
+            ]
+        )
+
+        pairs = {(scalar['label'], scalar['value']) for scalar in scalars}
+        self.assertIn(('Наименование организации', 'ООО «Рога и Копыта»'), pairs)
+        self.assertIn(('ИНН/КИО', '1234567890'), pairs)
+        self.assertNotIn(
+            ('Российской Федерации?', 'X Не являюсь налоговым резидентом ни в одном государстве (территории)'),
+            pairs,
+        )
+
+    def test_parse_kv_line_rejects_verbose_consent_clause(self) -> None:
+        scalar = _parse_kv_line(
+            'настоящее согласие предоставляется на совершение следующих действий с персональными данными: '
+            'передача (в том числе трансграничная), сбор, запись, систематизация, накопление, хранение, '
+            'уточнение (обновление, изменение), извлечение, использование, обезличивание, блокирование, '
+            'удаление, уничтожение.',
+            source_ref={'source_type': 'paragraph', 'paragraph_idx': 1},
+        )
+
+        self.assertIsNone(scalar)
+
+    def test_extract_scalar_from_table_row_rejects_heading_fragment_pair(self) -> None:
+        scalar = _extract_scalar_from_table_row(
+            ['СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ', 'ЮРИДИЧЕСКОМ ЛИЦЕ или ИНОСТРАННОЙ СТРУКТУРЕ БЕЗ'],
+            table_index=0,
+            row_index=1,
+        )
+
+        self.assertIsNone(scalar)
+
+    def test_understand_generic_form_suppresses_scalars_consumed_by_groups(self) -> None:
+        form_model = understand_generic_form(
+            layout_layer={
+                'seed_scalars': [
+                    {
+                        'label': 'Наименование организации',
+                        'value': 'ООО «Рога и Копыта»',
+                        'source_ref': {'table_idx': 0, 'row_idx': 1, 'source_type': 'table_cell'},
+                        'confidence': 'high',
+                    },
+                    {
+                        'label': 'ДА, является налоговым резидентом только в РФ',
+                        'value': 'ДА, является налоговым резидентом только в РФ',
+                        'source_ref': {'table_idx': 0, 'row_idx': 3, 'source_type': 'table_cell'},
+                        'confidence': 'medium',
+                    },
+                    {
+                        'label': 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)',
+                        'value': 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)',
+                        'source_ref': {'table_idx': 0, 'row_idx': 5, 'source_type': 'table_cell'},
+                        'confidence': 'medium',
+                    },
+                ],
+                'layout_lines': [],
+                'raw_table_rows': [
+                    {
+                        'table_idx': 0,
+                        'row_idx': 2,
+                        'cells': ['Является ли выгодоприобретатель налоговым резидентом только в Российской Федерации?', ''],
+                        'cell_paragraphs': [['Является ли выгодоприобретатель налоговым резидентом только в Российской Федерации?'], []],
+                    },
+                    {
+                        'table_idx': 0,
+                        'row_idx': 3,
+                        'cells': ['', 'ДА, является налоговым резидентом только в РФ'],
+                        'cell_paragraphs': [[], ['ДА, является налоговым резидентом только в РФ']],
+                    },
+                    {
+                        'table_idx': 0,
+                        'row_idx': 4,
+                        'cells': ['X', 'Не являюсь налоговым резидентом ни в одном государстве (территории)'],
+                        'cell_paragraphs': [['X'], ['Не являюсь налоговым резидентом ни в одном государстве (территории)']],
+                    },
+                    {
+                        'table_idx': 0,
+                        'row_idx': 5,
+                        'cells': ['', 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)'],
+                        'cell_paragraphs': [[], ['НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)']],
+                    },
+                ],
+                'layout_meta': {'pipeline_layers': {'layout_extraction': {'status': 'completed'}}},
+                'sections': [],
+            },
+            tables=[],
+            kv_pairs=[],
+        )
+
+        self.assertIsNotNone(form_model)
+        scalar_pairs = {(scalar['label'], scalar['value']) for scalar in form_model['scalars']}
+        self.assertIn(('Наименование организации', 'ООО «Рога и Копыта»'), scalar_pairs)
+        self.assertNotIn(
+            ('ДА, является налоговым резидентом только в РФ', 'ДА, является налоговым резидентом только в РФ'),
+            scalar_pairs,
+        )
+        self.assertNotIn(
+            ('НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)', 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)'),
+            scalar_pairs,
+        )
+        self.assertTrue(any(group['group_id'] == 'tax_residency' for group in form_model['groups']))
+
+    def test_understand_generic_form_filters_heading_like_seed_scalar(self) -> None:
+        form_model = understand_generic_form(
+            layout_layer={
+                'seed_scalars': [
+                    {
+                        'label': 'СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ',
+                        'value': 'ЮРИДИЧЕСКОМ ЛИЦЕ или ИНОСТРАННОЙ СТРУКТУРЕ БЕЗ',
+                        'source_ref': {'source_type': 'line', 'line_id': 'line-1'},
+                        'confidence': 'medium',
+                    },
+                    {
+                        'label': 'Наименование организации',
+                        'value': 'ООО «Рога и Копыта»',
+                        'source_ref': {'source_type': 'line', 'line_id': 'line-2'},
+                        'confidence': 'medium',
+                    },
+                ],
+                'layout_lines': [],
+                'raw_table_rows': [],
+                'layout_meta': {'pipeline_layers': {'layout_extraction': {'status': 'completed'}}},
+                'sections': [],
+            },
+            tables=[],
+            kv_pairs=[],
+        )
+
+        self.assertIsNotNone(form_model)
+        scalar_pairs = {(scalar['label'], scalar['value']) for scalar in form_model['scalars']}
+        self.assertIn(('Наименование организации', 'ООО «Рога и Копыта»'), scalar_pairs)
+        self.assertNotIn(
+            ('СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ', 'ЮРИДИЧЕСКОМ ЛИЦЕ или ИНОСТРАННОЙ СТРУКТУРЕ БЕЗ'),
+            scalar_pairs,
+        )
+
+    def test_generic_form_source_prefers_form_model_over_dirty_raw_rows(self) -> None:
+        parsed = ParsedFile(
+            file_name='dirty_form_rows.docx',
+            file_type='docx',
+            columns=['column1', 'column2'],
+            rows=[
+                {'column1': 'ООО «Рога и Копыта»', 'column2': 'ООО «Рога и Копыта»'},
+                {'column1': '1234567890', 'column2': '1234567890'},
+                {'column1': 'ДА, является налоговым резидентом только в РФ', 'column2': 'ДА, является налоговым резидентом только в РФ'},
+                {'column1': 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)', 'column2': 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)'},
+            ],
+            content_type='form',
+            document_mode='form_layout_mode',
+            extraction_status='text_extracted',
+            raw_text='',
+            text_blocks=[],
+            sections=[],
+            kv_pairs=[],
+            source_candidates=[],
+            sheets=[],
+            form_model=_build_form_model(
+                {
+                    'scalars': [
+                        {
+                            'label': 'Наименование организации',
+                            'value': 'ООО «Рога и Копыта»',
+                            'source_ref': {'table_idx': 0, 'row_idx': 1},
+                            'confidence': 'high',
+                        },
+                        {
+                            'label': 'ИНН/КИО',
+                            'value': '1234567890',
+                            'source_ref': {'table_idx': 0, 'row_idx': 2},
+                            'confidence': 'high',
+                        },
+                    ],
+                    'groups': [
+                        {
+                            'group_id': 'tax_residency',
+                            'question': 'Является ли выгодоприобретатель налоговым резидентом только в Российской Федерации?',
+                            'group_type': 'single_choice',
+                            'options': [
+                                {
+                                    'label': 'ДА, является налоговым резидентом только в РФ',
+                                    'selected': False,
+                                    'marker_text': '',
+                                    'source_ref': {'table_idx': 0, 'row_idx': 3},
+                                },
+                                {
+                                    'label': 'Не являюсь налоговым резидентом ни в одном государстве (территории)',
+                                    'selected': True,
+                                    'marker_text': 'X',
+                                    'source_ref': {'table_idx': 0, 'row_idx': 4},
+                                },
+                                {
+                                    'label': 'НЕТ, является налоговым резидентом в следующем(их) иностранном(ых)',
+                                    'selected': False,
+                                    'marker_text': '',
+                                    'source_ref': {'table_idx': 0, 'row_idx': 5},
+                                },
+                            ],
+                            'source_ref': {'table_idx': 0, 'row_idx': 3},
+                        }
+                    ],
+                    'layout_lines': [],
+                    'layout_meta': {},
+                    'resolved_fields': [],
+                }
+            ),
+            warnings=[],
+        )
+
+        columns, rows, warnings = _resolve_generic_form_layout_source(parsed)
+
+        self.assertEqual(columns, ['Наименование организации', 'ИНН/КИО', 'tax_residency'])
+        self.assertEqual(
+            rows,
+            [
+                {
+                    'Наименование организации': 'ООО «Рога и Копыта»',
+                    'ИНН/КИО': '1234567890',
+                    'tax_residency': 'Не являюсь налоговым резидентом ни в одном государстве (территории)',
+                }
+            ],
+        )
+        self.assertNotIn('ООО «Рога и Копыта»', columns)
+        self.assertNotIn('1234567890', columns)
+        self.assertIn('Generated mapping from form-aware extracted fields.', warnings)
+
+    def test_docx_inline_cell_paragraphs_build_fatca_group(self) -> None:
+        _scalars, groups = _extract_table_rows_as_form(
+            [
+                {
+                    'table_idx': 0,
+                    'row_idx': 11,
+                    'cells': [
+                        'Является ли хотя бы одно из следующих утверждений для выгодоприобретателя верным:',
+                        'Являюсь лицом, неотделимым от собственника для целей налогообложения в США (disregarded entity);',
+                    ],
+                    'cell_paragraphs': [
+                        ['Является ли хотя бы одно из следующих утверждений для выгодоприобретателя верным:'],
+                        [
+                            'Являюсь лицом, неотделимым от собственника для целей налогообложения в США (disregarded entity);',
+                            'Собственник (owner) disregarded entity является',
+                            'X Являюсь Иностранным финансовым институтом для целей FATCA;',
+                            'Более 10% акций (долей) принадлежат налогоплательщикам США (юр. лицам/физ.лицам).',
+                            'НЕТ, данные утверждения не применимы для организации',
+                        ],
+                    ],
+                }
+            ],
+            table_index=0,
+        )
+
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(group['group_id'], 'fatca_beneficiary')
+        self.assertTrue(any(option['selected'] for option in group['options']))
+        selected = [option['label'] for option in group['options'] if option['selected']]
+        self.assertEqual(selected, ['Являюсь Иностранным финансовым институтом для целей FATCA'])
+        resolution = _resolve_fatca_group('fatcaBeneficiaryOptionList', groups, layout_lines=[])
+        self.assertEqual(resolution['status'], 'resolved')
+        self.assertEqual(resolution['value'], ['IS_FATCA_FOREIGN_INSTITUTE'])
+
     def test_form_critical_field_does_not_fall_back_to_legacy_candidates(self) -> None:
         path = self.test_root / 'critical_fallback_blocked.txt'
         path.write_text(
@@ -465,6 +788,193 @@ class DocumentParserTests(unittest.TestCase):
 
 
 class PdfAndRepairParserTests(unittest.TestCase):
+    def test_pdf_region_zoning_separates_text_and_noise(self) -> None:
+        zone_summary = classify_pdf_document_zones(
+            tables=[],
+            layout_lines=[
+                {
+                    'line_id': 'line-1',
+                    'text': 'СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ',
+                    'page': 1,
+                    'column_id': 1,
+                    'y': 10.0,
+                },
+                {
+                    'line_id': 'line-2',
+                    'text': 'Выгодоприобретатель ведет операционную деятельность на территории нескольких государств.',
+                    'page': 1,
+                    'column_id': 1,
+                    'y': 42.0,
+                },
+                {
+                    'line_id': 'line-3',
+                    'text': 'Организация использует международные расчеты и обслуживает внешнеторговые контракты.',
+                    'page': 1,
+                    'column_id': 1,
+                    'y': 56.0,
+                },
+            ],
+            raw_text='',
+        )
+
+        self.assertGreaterEqual(len(zone_summary['region_zones']), 2)
+        self.assertTrue(any(zone['zone_type'] == 'noise' for zone in zone_summary['region_zones']))
+        self.assertTrue(any(zone['zone_type'] == 'text' for zone in zone_summary['region_zones']))
+        self.assertIn('zone_graph', zone_summary)
+        self.assertIn('parser_outputs', zone_summary)
+        self.assertTrue(any(node['zone_confidence'] is not None for node in zone_summary['zone_graph']['nodes']))
+        self.assertGreaterEqual(len(zone_summary['parser_outputs']['text']['regions']), 1)
+        self.assertGreaterEqual(len(zone_summary['parser_outputs']['noise']['regions']), 1)
+
+    def test_pdf_form_like_table_routes_to_form_parser(self) -> None:
+        fake_pdf = FakePdfContext(
+            [
+                FakePdfPage(
+                    text='Form-like PDF with table layout and checkbox options',
+                    tables=[
+                        [
+                            ['Является ли выгодоприобретатель налоговым резидентом только в РФ', ''],
+                            ['', 'ДА'],
+                            ['X', 'Не являюсь налоговым резидентом ни в одном государстве'],
+                            ['', 'НЕТ, является налоговым резидентом в иностранном государстве'],
+                        ]
+                    ],
+                )
+            ]
+        )
+
+        with patch('pdf_parser.pdfplumber.open', return_value=fake_pdf):
+            parsed = parse_file(Path('pdf_form_table.pdf'), 'pdf_form_table.pdf')
+            columns, rows, _warnings = resolve_generation_source(
+                parsed,
+                target_fields=[TargetField(name='isResidentRF', type='string')],
+            )
+
+        self.assertEqual(parsed.content_type, 'form')
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertEqual(columns, ['isResidentRF'])
+        self.assertEqual(rows[0]['isResidentRF'], 'NOWHERE')
+        self.assertTrue(any('PDF zoning summary' in warning for warning in parsed.warnings))
+
+    def test_pdf_regular_table_routes_to_data_table_parser(self) -> None:
+        fake_pdf = FakePdfContext(
+            [
+                FakePdfPage(
+                    text='Simple tabular PDF',
+                    tables=[
+                        [
+                            ['name', 'amount'],
+                            ['Alice', '10'],
+                            ['Bob', '20'],
+                        ]
+                    ],
+                )
+            ]
+        )
+
+        with patch('pdf_parser.pdfplumber.open', return_value=fake_pdf):
+            parsed = parse_file(Path('pdf_data_table.pdf'), 'pdf_data_table.pdf')
+            columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(parsed.content_type, 'table')
+        self.assertEqual(parsed.document_mode, 'data_table_mode')
+        self.assertEqual(parsed.columns, ['name', 'amount'])
+        self.assertEqual(parsed.rows, [{'name': 'Alice', 'amount': '10'}, {'name': 'Bob', 'amount': '20'}])
+        self.assertEqual(columns, ['name', 'amount'])
+        self.assertEqual(rows, [{'name': 'Alice', 'amount': '10'}, {'name': 'Bob', 'amount': '20'}])
+        self.assertTrue(any('PDF zoning classified 1 table zone' in warning for warning in parsed.warnings))
+        self.assertEqual(warnings, [])
+        self.assertTrue(parsed.pdf_zone_summary)
+        self.assertTrue(parsed.pdf_zone_summary.get('parser_outputs'))
+
+    def test_pdf_noise_regions_do_not_override_text_content_type(self) -> None:
+        fake_pdf = FakePdfContext(
+            [
+                FakePdfPage(
+                    text='СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ\n\nНастоящее согласие предоставляется на совершение следующих действий.\nБанк вправе осуществлять обработку персональных данных.',
+                    words=[
+                        {'text': 'СВЕДЕНИЯ', 'x0': 20, 'x1': 86, 'top': 10, 'bottom': 18},
+                        {'text': 'О', 'x0': 90, 'x1': 98, 'top': 10, 'bottom': 18},
+                        {'text': 'ВЫГОДОПРИОБРЕТАТЕЛЕ', 'x0': 102, 'x1': 246, 'top': 10, 'bottom': 18},
+                        {'text': 'Настоящее', 'x0': 20, 'x1': 88, 'top': 50, 'bottom': 58},
+                        {'text': 'согласие', 'x0': 92, 'x1': 150, 'top': 50, 'bottom': 58},
+                        {'text': 'предоставляется', 'x0': 154, 'x1': 252, 'top': 50, 'bottom': 58},
+                        {'text': 'на', 'x0': 256, 'x1': 270, 'top': 50, 'bottom': 58},
+                        {'text': 'совершение', 'x0': 274, 'x1': 348, 'top': 50, 'bottom': 58},
+                        {'text': 'следующих', 'x0': 352, 'x1': 426, 'top': 50, 'bottom': 58},
+                        {'text': 'действий.', 'x0': 430, 'x1': 494, 'top': 50, 'bottom': 58},
+                        {'text': 'Банк', 'x0': 20, 'x1': 54, 'top': 64, 'bottom': 72},
+                        {'text': 'вправе', 'x0': 58, 'x1': 104, 'top': 64, 'bottom': 72},
+                        {'text': 'осуществлять', 'x0': 108, 'x1': 198, 'top': 64, 'bottom': 72},
+                        {'text': 'обработку', 'x0': 202, 'x1': 270, 'top': 64, 'bottom': 72},
+                        {'text': 'персональных', 'x0': 274, 'x1': 368, 'top': 64, 'bottom': 72},
+                        {'text': 'данных.', 'x0': 372, 'x1': 426, 'top': 64, 'bottom': 72},
+                    ],
+                )
+            ]
+        )
+
+        with patch('pdf_parser.pdfplumber.open', return_value=fake_pdf):
+            parsed = parse_file(Path('pdf_text_regions.pdf'), 'pdf_text_regions.pdf')
+
+        self.assertEqual(parsed.content_type, 'text')
+        self.assertEqual(parsed.document_mode, 'data_table_mode')
+        self.assertTrue(any('PDF zoning regions' in warning for warning in parsed.warnings))
+
+    def test_pdf_zone_routing_can_prefer_table_source_over_form_source(self) -> None:
+        parsed = ParsedFile(
+            file_name='routed.pdf',
+            file_type='pdf',
+            columns=['name', 'amount'],
+            rows=[{'name': 'Alice', 'amount': '10'}],
+            content_type='form',
+            document_mode='form_layout_mode',
+            extraction_status='structured_extracted',
+            raw_text='',
+            text_blocks=[],
+            sections=[],
+            kv_pairs=[],
+            source_candidates=[],
+            sheets=[],
+            form_model=_build_form_model(
+                {
+                    'scalars': [{'label': 'Наименование организации', 'value': 'ООО', 'source_ref': {'line_id': 'line-1'}}],
+                    'groups': [
+                        {
+                            'group_id': 'group_1',
+                            'question': 'Question',
+                            'group_type': 'single_choice',
+                            'options': [{'label': 'Option A', 'selected': True, 'source_ref': {'line_id': 'line-2'}}],
+                            'source_ref': {'line_id': 'line-1'},
+                        }
+                    ],
+                    'layout_lines': [
+                        {'text': 'Question', 'line_id': 'line-1'},
+                        {'text': 'Option A', 'line_id': 'line-2'},
+                    ],
+                    'layout_meta': {},
+                    'resolved_fields': [],
+                }
+            ),
+            pdf_zone_summary={
+                'dominant_zone': 'table',
+                'parser_outputs': {
+                    'table': {'zones': [{'zone_confidence': 0.92}]},
+                    'form': {'zones': [{'zone_confidence': 0.42}]},
+                    'text': {'zones': []},
+                    'noise': {'zones': []},
+                },
+            },
+            warnings=[],
+        )
+
+        columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(columns, ['name', 'amount'])
+        self.assertEqual(rows, [{'name': 'Alice', 'amount': '10'}])
+        self.assertTrue(any('preferred tabular extraction' in warning.lower() for warning in warnings))
+        self.assertEqual(parsed.form_model.layout_meta['pdf_zone_routing']['prefer_table_source'], True)
+
     def test_pdf_layout_words_are_grouped_and_ground_tax_option(self) -> None:
         fake_pdf = FakePdfContext(
             [
@@ -651,6 +1161,237 @@ class PdfAndRepairParserTests(unittest.TestCase):
         self.assertEqual(tax_group.source_ref.get('column_id'), 1)
         self.assertTrue(all(option.source_ref.get('column_id') == 1 for option in tax_group.options))
 
+    def test_pdf_two_column_form_rows_resolve_scalars_like_docx(self) -> None:
+        fake_pdf = FakePdfContext(
+            [
+                FakePdfPage(
+                    text='Beneficiary form with enough extracted text for parsing flow and scalar reconstruction',
+                    words=[
+                        {'text': 'Наименование', 'x0': 20, 'x1': 100, 'top': 10, 'bottom': 18},
+                        {'text': 'организации', 'x0': 104, 'x1': 184, 'top': 10, 'bottom': 18},
+                        {'text': 'ООО', 'x0': 330, 'x1': 356, 'top': 10, 'bottom': 18},
+                        {'text': '«Рога', 'x0': 360, 'x1': 404, 'top': 10, 'bottom': 18},
+                        {'text': 'и', 'x0': 408, 'x1': 416, 'top': 10, 'bottom': 18},
+                        {'text': 'Копыта»', 'x0': 420, 'x1': 476, 'top': 10, 'bottom': 18},
+                        {'text': 'ИНН/КИО', 'x0': 20, 'x1': 84, 'top': 24, 'bottom': 32},
+                        {'text': '1234567890', 'x0': 330, 'x1': 402, 'top': 24, 'bottom': 32},
+                        {'text': 'СВЕДЕНИЯ', 'x0': 20, 'x1': 86, 'top': 38, 'bottom': 46},
+                        {'text': 'О', 'x0': 90, 'x1': 98, 'top': 38, 'bottom': 46},
+                        {'text': 'ВЫГОДОПРИОБРЕТАТЕЛЕ', 'x0': 102, 'x1': 246, 'top': 38, 'bottom': 46},
+                        {'text': 'ЮРИДИЧЕСКОМ', 'x0': 330, 'x1': 426, 'top': 38, 'bottom': 46},
+                        {'text': 'ЛИЦЕ', 'x0': 430, 'x1': 466, 'top': 38, 'bottom': 46},
+                        {'text': 'или', 'x0': 470, 'x1': 490, 'top': 38, 'bottom': 46},
+                        {'text': 'ИНОСТРАННОЙ', 'x0': 494, 'x1': 586, 'top': 38, 'bottom': 46},
+                        {'text': 'СТРУКТУРЕ', 'x0': 590, 'x1': 670, 'top': 38, 'bottom': 46},
+                        {'text': 'Является', 'x0': 20, 'x1': 70, 'top': 54, 'bottom': 62},
+                        {'text': 'ли', 'x0': 74, 'x1': 84, 'top': 54, 'bottom': 62},
+                        {'text': 'выгодоприобретатель', 'x0': 88, 'x1': 180, 'top': 54, 'bottom': 62},
+                        {'text': 'налоговым', 'x0': 184, 'x1': 250, 'top': 54, 'bottom': 62},
+                        {'text': 'резидентом', 'x0': 254, 'x1': 320, 'top': 54, 'bottom': 62},
+                        {'text': 'только', 'x0': 324, 'x1': 365, 'top': 54, 'bottom': 62},
+                        {'text': 'в', 'x0': 369, 'x1': 376, 'top': 54, 'bottom': 62},
+                        {'text': 'РФ', 'x0': 380, 'x1': 395, 'top': 54, 'bottom': 62},
+                        {'text': 'X', 'x0': 20, 'x1': 26, 'top': 70, 'bottom': 78},
+                        {'text': 'Не', 'x0': 44, 'x1': 56, 'top': 70, 'bottom': 78},
+                        {'text': 'являюсь', 'x0': 60, 'x1': 112, 'top': 70, 'bottom': 78},
+                        {'text': 'налоговым', 'x0': 116, 'x1': 182, 'top': 70, 'bottom': 78},
+                        {'text': 'резидентом', 'x0': 186, 'x1': 252, 'top': 70, 'bottom': 78},
+                        {'text': 'ни', 'x0': 256, 'x1': 268, 'top': 70, 'bottom': 78},
+                        {'text': 'в', 'x0': 272, 'x1': 279, 'top': 70, 'bottom': 78},
+                        {'text': 'одном', 'x0': 283, 'x1': 320, 'top': 70, 'bottom': 78},
+                        {'text': 'государстве', 'x0': 324, 'x1': 392, 'top': 70, 'bottom': 78},
+                    ],
+                )
+            ]
+        )
+
+        with patch('pdf_parser.pdfplumber.open', return_value=fake_pdf):
+            parsed = parse_file(Path('pdf_form_rows.pdf'), 'pdf_form_rows.pdf')
+            columns, rows, _warnings = resolve_generation_source(
+                parsed,
+                target_fields=[
+                    TargetField(name='organizationName', type='string'),
+                    TargetField(name='innOrKio', type='string'),
+                    TargetField(name='isResidentRF', type='string'),
+                ],
+            )
+
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertIsNotNone(parsed.form_model)
+        self.assertEqual(rows[0]['organizationName'], 'ООО «Рога и Копыта»')
+        self.assertEqual(rows[0]['innOrKio'], '1234567890')
+        self.assertEqual(rows[0]['isResidentRF'], 'NOWHERE')
+        scalar_pairs = {(scalar.label, scalar.value) for scalar in parsed.form_model.scalars}
+        self.assertIn(('Наименование организации', 'ООО «Рога и Копыта»'), scalar_pairs)
+        self.assertIn(('ИНН/КИО', '1234567890'), scalar_pairs)
+        self.assertNotIn(
+            ('СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ', 'ЮРИДИЧЕСКОМ ЛИЦЕ или ИНОСТРАННОЙ СТРУКТУРЕ'),
+            scalar_pairs,
+        )
+
+    def test_pdf_cross_column_fatca_block_uses_left_question_and_right_options(self) -> None:
+        fake_pdf = FakePdfContext(
+            [
+                FakePdfPage(
+                    text='FATCA form text with enough extracted content for realistic grouping',
+                    words=[
+                        {'text': 'Является', 'x0': 20, 'x1': 70, 'top': 10, 'bottom': 18},
+                        {'text': 'ли', 'x0': 74, 'x1': 84, 'top': 10, 'bottom': 18},
+                        {'text': 'хотя', 'x0': 88, 'x1': 118, 'top': 10, 'bottom': 18},
+                        {'text': 'бы', 'x0': 122, 'x1': 136, 'top': 10, 'bottom': 18},
+                        {'text': 'одно', 'x0': 140, 'x1': 172, 'top': 10, 'bottom': 18},
+                        {'text': 'из', 'x0': 176, 'x1': 188, 'top': 10, 'bottom': 18},
+                        {'text': 'следующих', 'x0': 192, 'x1': 264, 'top': 10, 'bottom': 18},
+                        {'text': 'утверждений', 'x0': 20, 'x1': 104, 'top': 24, 'bottom': 32},
+                        {'text': 'для', 'x0': 108, 'x1': 128, 'top': 24, 'bottom': 32},
+                        {'text': 'выгодоприобретателя', 'x0': 132, 'x1': 246, 'top': 24, 'bottom': 32},
+                        {'text': 'верным:', 'x0': 20, 'x1': 78, 'top': 38, 'bottom': 46},
+                        {'text': 'Являюсь', 'x0': 330, 'x1': 386, 'top': 10, 'bottom': 18},
+                        {'text': 'лицом,', 'x0': 390, 'x1': 436, 'top': 10, 'bottom': 18},
+                        {'text': 'неотделимым', 'x0': 440, 'x1': 528, 'top': 10, 'bottom': 18},
+                        {'text': 'от', 'x0': 532, 'x1': 546, 'top': 10, 'bottom': 18},
+                        {'text': 'собственника', 'x0': 550, 'x1': 642, 'top': 10, 'bottom': 18},
+                        {'text': 'Собственник', 'x0': 330, 'x1': 420, 'top': 24, 'bottom': 32},
+                        {'text': '(owner)', 'x0': 424, 'x1': 480, 'top': 24, 'bottom': 32},
+                        {'text': 'disregarded', 'x0': 484, 'x1': 568, 'top': 24, 'bottom': 32},
+                        {'text': 'entity', 'x0': 572, 'x1': 614, 'top': 24, 'bottom': 32},
+                        {'text': 'является', 'x0': 618, 'x1': 684, 'top': 24, 'bottom': 32},
+                        {'text': 'X', 'x0': 330, 'x1': 336, 'top': 38, 'bottom': 46},
+                        {'text': 'Являюсь', 'x0': 352, 'x1': 408, 'top': 38, 'bottom': 46},
+                        {'text': 'Иностранным', 'x0': 412, 'x1': 508, 'top': 38, 'bottom': 46},
+                        {'text': 'финансовым', 'x0': 512, 'x1': 596, 'top': 38, 'bottom': 46},
+                        {'text': 'институтом', 'x0': 600, 'x1': 680, 'top': 38, 'bottom': 46},
+                        {'text': 'для', 'x0': 684, 'x1': 704, 'top': 38, 'bottom': 46},
+                        {'text': 'FATCA', 'x0': 708, 'x1': 752, 'top': 38, 'bottom': 46},
+                        {'text': 'Более', 'x0': 330, 'x1': 372, 'top': 52, 'bottom': 60},
+                        {'text': '10%', 'x0': 376, 'x1': 404, 'top': 52, 'bottom': 60},
+                        {'text': 'акций', 'x0': 408, 'x1': 448, 'top': 52, 'bottom': 60},
+                        {'text': 'НЕТ,', 'x0': 330, 'x1': 362, 'top': 66, 'bottom': 74},
+                        {'text': 'данные', 'x0': 366, 'x1': 418, 'top': 66, 'bottom': 74},
+                        {'text': 'утверждения', 'x0': 422, 'x1': 506, 'top': 66, 'bottom': 74},
+                        {'text': 'не', 'x0': 510, 'x1': 524, 'top': 66, 'bottom': 74},
+                        {'text': 'применимы', 'x0': 528, 'x1': 606, 'top': 66, 'bottom': 74},
+                    ],
+                )
+            ]
+        )
+
+        with patch('pdf_parser.pdfplumber.open', return_value=fake_pdf):
+            parsed = parse_file(Path('pdf_fatca_cross_column.pdf'), 'pdf_fatca_cross_column.pdf')
+            columns, rows, _warnings = resolve_generation_source(
+                parsed,
+                target_fields=[TargetField(name='fatcaBeneficiaryOptionList', type='array')],
+            )
+
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertIsNotNone(parsed.form_model)
+        self.assertEqual(columns, ['fatcaBeneficiaryOptionList'])
+        self.assertEqual(rows[0]['fatcaBeneficiaryOptionList'], ['IS_FATCA_FOREIGN_INSTITUTE'])
+        fatca_group = next(group for group in parsed.form_model.groups if 'fatca' in group.group_id or any('fatca' in option.label.lower() for option in group.options))
+        self.assertIn('Является ли хотя бы одно из следующих утверждений для выгодоприобретателя верным', fatca_group.question)
+        self.assertTrue(any(option.selected for option in fatca_group.options))
+        self.assertFalse(str(fatca_group.question).startswith('Собственник (owner) disregarded entity является'))
+
+    def test_form_mode_filters_consumed_option_fragments_from_candidates(self) -> None:
+        form_model = {
+            'groups': [
+                {
+                    'group_id': 'tax_residency',
+                    'question': 'Является ли выгодоприобретатель налоговым резидентом только в РФ',
+                    'group_type': 'single_choice',
+                    'options': [
+                        {'label': 'ДА, является налоговым резидентом только в РФ', 'selected': False},
+                        {'label': 'Не являюсь налоговым резидентом ни в одном государстве', 'selected': True},
+                        {'label': 'НЕТ, является налоговым резидентом в иностранном государстве', 'selected': False},
+                    ],
+                }
+            ]
+        }
+
+        kv_pairs, text_facts = _suppress_consumed_group_fragments(
+            kv_pairs=[
+                {'label': 'Наименование организации', 'value': 'ООО "Рога и Копыта"'},
+                {'label': 'X', 'value': 'Не являюсь налоговым резидентом ни в одном государстве'},
+            ],
+            text_facts=[
+                {'label': 'ДА, является налоговым резидентом только в РФ', 'value': 'вариант'},
+                {'label': 'ИНН/КИО', 'value': '1234567890'},
+            ],
+            form_model=form_model,
+        )
+
+        self.assertEqual(kv_pairs, [{'label': 'Наименование организации', 'value': 'ООО "Рога и Копыта"'}])
+        self.assertEqual(text_facts, [{'label': 'ИНН/КИО', 'value': '1234567890'}])
+
+    def test_generic_form_source_suppresses_option_rows_consumed_by_group(self) -> None:
+        parsed = ParsedFile(
+            file_name='form_pairs.txt',
+            file_type='txt',
+            columns=['label', 'value'],
+            rows=[
+                {'label': 'Наименование организации', 'value': 'ООО "Рога и Копыта"'},
+                {'label': 'ДА, является налоговым резидентом только в РФ', 'value': ''},
+                {'label': 'Не являюсь налоговым резидентом ни в одном государстве', 'value': 'X'},
+                {'label': 'НЕТ, является налоговым резидентом в иностранном государстве', 'value': ''},
+            ],
+            content_type='form',
+            document_mode='form_layout_mode',
+            extraction_status='text_extracted',
+            raw_text='',
+            text_blocks=[],
+            sections=[],
+            kv_pairs=[],
+            source_candidates=[],
+            sheets=[],
+            form_model=_build_form_model(
+                {
+                    'scalars': [],
+                    'groups': [
+                        {
+                            'group_id': 'tax_residency',
+                            'question': 'Является ли выгодоприобретатель налоговым резидентом только в РФ',
+                            'group_type': 'single_choice',
+                            'options': [
+                                {
+                                    'label': 'ДА, является налоговым резидентом только в РФ',
+                                    'selected': False,
+                                    'marker_text': '',
+                                    'source_ref': {'table_idx': 0, 'row_idx': 2},
+                                },
+                                {
+                                    'label': 'Не являюсь налоговым резидентом ни в одном государстве',
+                                    'selected': True,
+                                    'marker_text': 'X',
+                                    'source_ref': {'table_idx': 0, 'row_idx': 3},
+                                },
+                                {
+                                    'label': 'НЕТ, является налоговым резидентом в иностранном государстве',
+                                    'selected': False,
+                                    'marker_text': '',
+                                    'source_ref': {'table_idx': 0, 'row_idx': 4},
+                                },
+                            ],
+                            'source_ref': {'table_idx': 0, 'row_idx': 2},
+                        }
+                    ],
+                    'layout_lines': [],
+                    'layout_meta': {},
+                    'resolved_fields': [],
+                }
+            ),
+            warnings=[],
+        )
+
+        columns, rows, warnings = _resolve_generic_form_layout_source(parsed)
+
+        self.assertEqual(columns, ['tax_residency'])
+        self.assertEqual(rows[0]['tax_residency'], 'Не являюсь налоговым резидентом ни в одном государстве')
+        self.assertNotIn('Наименование организации', rows[0])
+        self.assertNotIn('ДА, является налоговым резидентом только в РФ', rows[0])
+        self.assertNotIn('Не являюсь налоговым резидентом ни в одном государстве', rows[0])
+        self.assertNotIn('НЕТ, является налоговым резидентом в иностранном государстве', rows[0])
+        self.assertIn('Generated mapping from form-aware extracted fields.', warnings)
+
     def test_form_explainability_contains_quality_summary(self) -> None:
         parsed = ParsedFile(
             file_name='explainability.txt',
@@ -790,6 +1531,131 @@ class PdfAndRepairParserTests(unittest.TestCase):
         self.assertTrue(explainability['repair_plan']['recommended'])
         self.assertEqual(explainability['repair_plan']['trigger_stage'], 'generic_form_understanding')
         self.assertTrue(any(action['kind'] == 'review_group_selection' for action in explainability['repair_plan']['actions']))
+
+    def test_form_explainability_flags_low_confidence_group(self) -> None:
+        parsed = ParsedFile(
+            file_name='generic_low_confidence.txt',
+            file_type='txt',
+            columns=[],
+            rows=[],
+            content_type='form',
+            document_mode='form_layout_mode',
+            extraction_status='text_extracted',
+            raw_text='Question\nOption A\n',
+            text_blocks=[],
+            sections=[],
+            kv_pairs=[],
+            source_candidates=[],
+            sheets=[],
+            form_model=_build_form_model(
+                {
+                    'scalars': [],
+                    'groups': [
+                        {
+                            'group_id': 'group_1',
+                            'question': 'Question',
+                            'group_type': 'single_choice',
+                            'group_confidence': 0.54,
+                            'selection_confidence': 0.41,
+                            'is_ambiguous': False,
+                            'options': [
+                                {
+                                    'label': 'Option A',
+                                    'selected': True,
+                                    'marker_text': '',
+                                    'selection_confidence': 0.41,
+                                    'source_ref': {'line_id': 'line-2'},
+                                }
+                            ],
+                            'source_ref': {'line_id': 'line-1'},
+                        }
+                    ],
+                    'layout_lines': [
+                        {'text': 'Question', 'line_id': 'line-1'},
+                        {'text': 'Option A', 'line_id': 'line-2'},
+                    ],
+                    'layout_meta': {},
+                    'resolved_fields': [],
+                }
+            ),
+            warnings=[],
+        )
+
+        explainability = _build_form_explainability(parsed)
+
+        self.assertIsNotNone(explainability)
+        self.assertIn('low_confidence_form_groups', explainability['repair_plan']['red_flag_codes'])
+        self.assertIn('group_1', explainability['quality_summary']['low_confidence_groups'])
+        action = next(action for action in explainability['repair_plan']['actions'] if action.get('group_id') == 'group_1')
+        self.assertEqual(action['kind'], 'review_group_selection')
+        self.assertEqual(action['priority'], 'medium')
+        self.assertAlmostEqual(action['group_confidence'], 0.54)
+        self.assertAlmostEqual(action['selection_confidence'], 0.41)
+
+    def test_form_explainability_exposes_pdf_zone_routing(self) -> None:
+        parsed = ParsedFile(
+            file_name='pdf_explainability.pdf',
+            file_type='pdf',
+            columns=[],
+            rows=[],
+            content_type='form',
+            document_mode='form_layout_mode',
+            extraction_status='text_extracted',
+            raw_text='Question\nOption A\n',
+            text_blocks=[],
+            sections=[],
+            kv_pairs=[],
+            source_candidates=[],
+            sheets=[],
+            form_model=_build_form_model(
+                {
+                    'scalars': [],
+                    'groups': [
+                        {
+                            'group_id': 'group_1',
+                            'question': 'Question',
+                            'group_type': 'single_choice',
+                            'group_confidence': 0.58,
+                            'selection_confidence': 0.53,
+                            'options': [{'label': 'Option A', 'selected': True, 'source_ref': {'line_id': 'line-2'}}],
+                            'source_ref': {'line_id': 'line-1'},
+                        }
+                    ],
+                    'layout_lines': [
+                        {'text': 'Question', 'line_id': 'line-1'},
+                        {'text': 'Option A', 'line_id': 'line-2'},
+                    ],
+                    'layout_meta': {},
+                    'resolved_fields': [],
+                }
+            ),
+            pdf_zone_summary={
+                'dominant_zone': 'form',
+                'counts': {'form': 1, 'text': 0, 'noise': 1, 'table': 0},
+                'available': True,
+                'has_form_zones': True,
+                'has_noise_zones': True,
+                'best_form_confidence': 0.58,
+                'best_noise_confidence': 0.88,
+                'has_confident_form_zone': False,
+                'low_confidence_form_zones': True,
+                'prefer_table_source': False,
+                'parser_outputs': {
+                    'table': {'zones': []},
+                    'form': {'zones': [{'zone_confidence': 0.58}]},
+                    'text': {'zones': []},
+                    'noise': {'zones': [{'zone_confidence': 0.88}]},
+                },
+            },
+            warnings=[],
+        )
+
+        explainability = _build_form_explainability(parsed)
+
+        self.assertIsNotNone(explainability)
+        self.assertEqual(explainability['pdf_zone_summary']['routing']['low_confidence_form_zones'], True)
+        self.assertIn('low_confidence_form_zones', explainability['repair_plan']['red_flag_codes'])
+        self.assertTrue(any(action['kind'] == 'review_pdf_zone_routing' for action in explainability['repair_plan']['actions']))
 
     def test_repair_preview_returns_targeted_patch_for_tax_group(self) -> None:
         parsed = ParsedFile(

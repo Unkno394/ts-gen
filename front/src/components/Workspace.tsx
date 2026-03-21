@@ -150,6 +150,43 @@ function isGenericFormGroupId(groupId: string): boolean {
   return !normalized || normalized === 'group' || normalized === 'unknown' || normalized.startsWith('group_');
 }
 
+function uppercaseRatio(text: string): number {
+  const letters = Array.from(text).filter((char) => /[A-Za-zА-Яа-яЁё]/u.test(char));
+  if (letters.length === 0) {
+    return 0;
+  }
+  const uppercase = letters.filter((char) => char === char.toUpperCase()).length;
+  return uppercase / letters.length;
+}
+
+function looksLikeSectionHeadingText(text: string): boolean {
+  const normalized = text.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return false;
+  }
+  const tokens = normalized.toLowerCase().split(' ');
+  const headingKeywords = new Set(['сведения', 'информация', 'данные', 'анкета', 'раздел', 'часть', 'приложение']);
+  if (tokens.length >= 2 && headingKeywords.has(tokens[0] ?? '')) {
+    return true;
+  }
+  return uppercaseRatio(normalized) >= 0.9 && tokens.length >= 4;
+}
+
+function looksLikeHeadingPair(label: string, value: unknown): boolean {
+  const normalizedLabel = label.trim().replace(/\s+/g, ' ');
+  const normalizedValue = formatPreviewCellValue(value).trim().replace(/\s+/g, ' ');
+  if (!normalizedLabel || !normalizedValue) {
+    return false;
+  }
+  if (!looksLikeSectionHeadingText(normalizedLabel)) {
+    return false;
+  }
+  if (/\d/u.test(`${normalizedLabel} ${normalizedValue}`)) {
+    return false;
+  }
+  return looksLikeSectionHeadingText(normalizedValue) || uppercaseRatio(normalizedValue) >= 0.55;
+}
+
 function isUsefulFormPreviewPair(label: string, value: unknown): boolean {
   const normalizedLabel = label.trim().replace(/\s+/g, ' ');
   if (!normalizedLabel || value === null || value === undefined) {
@@ -164,6 +201,9 @@ function isUsefulFormPreviewPair(label: string, value: unknown): boolean {
 
   const valueText = formatPreviewCellValue(value).trim().replace(/\s+/g, ' ');
   if (!valueText) {
+    return false;
+  }
+  if (looksLikeHeadingPair(normalizedLabel, valueText)) {
     return false;
   }
 
@@ -181,23 +221,93 @@ function isUsefulFormPreviewPair(label: string, value: unknown): boolean {
   return true;
 }
 
-function buildFormPreviewRowsFromParsedRows(parsedFile: ParsedFileInfo): Record<string, unknown>[] {
-  if (parsedFile.columns.length < 2 || parsedFile.rows.length === 0) {
-    return [];
+function normalizeFormConsumptionText(value: unknown): string {
+  const text = formatPreviewCellValue(value).trim().replace(/\s+/g, ' ');
+  if (!text) {
+    return '';
   }
 
-  const [labelColumn, valueColumn] = parsedFile.columns;
-  return parsedFile.rows.flatMap((row) => {
-    const label = String(row[labelColumn] ?? '').trim();
-    const value = row[valueColumn];
-    if (!isUsefulFormPreviewPair(label, value)) {
+  return text
+    .replace(/^[\[(<{«"']*\s*(?:x|х|v|✓|✔|☒|☑)\s*[\])}>»"']*\s*/iu, '')
+    .replace(/^[•*·\-–—]+\s*/u, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+function isStandaloneOptionMarker(value: unknown): boolean {
+  return /^(?:x|х|v|✓|✔|☒|☑|\[\s*(?:x|х|v|✓|✔)\s*\])$/iu.test(String(value ?? '').trim());
+}
+
+function collectConsumedFormOptionTexts(parsedFile: ParsedFileInfo): Set<string> {
+  const consumedTexts = new Set<string>();
+  const groups = parsedFile.formModel?.groups ?? [];
+
+  groups.forEach((group) => {
+    if (!isObjectRecord(group)) {
+      return;
+    }
+
+    const options = Array.isArray(group.options) ? group.options : [];
+    options.forEach((option) => {
+      if (!isObjectRecord(option)) {
+        return;
+      }
+
+      const label = normalizeFormConsumptionText(option.label);
+      if (label) {
+        consumedTexts.add(label);
+      }
+
+      const markerText = normalizeFormConsumptionText(option.marker_text);
+      if (label && markerText) {
+        consumedTexts.add(normalizeFormConsumptionText(`${markerText} ${label}`));
+      }
+    });
+  });
+
+  return consumedTexts;
+}
+
+function isConsumedFormOptionEntry(label: string, value: unknown, consumedTexts: Set<string>): boolean {
+  if (consumedTexts.size === 0) {
+    return false;
+  }
+
+  const normalizedLabel = normalizeFormConsumptionText(label);
+  const normalizedValue = normalizeFormConsumptionText(value);
+  const normalizedCombined = normalizeFormConsumptionText(`${label} ${formatPreviewCellValue(value)}`);
+
+  if (normalizedLabel && consumedTexts.has(normalizedLabel)) {
+    return true;
+  }
+  if (normalizedCombined && consumedTexts.has(normalizedCombined)) {
+    return true;
+  }
+  if (isStandaloneOptionMarker(label) && normalizedValue && consumedTexts.has(normalizedValue)) {
+    return true;
+  }
+
+  return false;
+}
+
+function buildResolvedFormPreviewRows(parsedFile: ParsedFileInfo): Record<string, unknown>[] {
+  const resolvedFields = parsedFile.formModel?.resolvedFields ?? [];
+  return resolvedFields.flatMap((field) => {
+    if (!isObjectRecord(field)) {
+      return [];
+    }
+    const label = typeof field.field === 'string' ? field.field.trim() : '';
+    const status = typeof field.status === 'string' ? field.status.trim() : '';
+    const value = field.value;
+    const resolvedBy = typeof field.resolved_by === 'string' ? field.resolved_by.trim() : 'resolved';
+    if (!label || !['resolved', 'weak_match'].includes(status) || value === null || value === undefined) {
       return [];
     }
     return [
       {
         field: label,
         value: formatPreviewCellValue(value),
-        source: 'pair',
+        source: resolvedBy,
       },
     ];
   });
@@ -209,16 +319,19 @@ function buildFormPreviewSheet(parsedFile: ParsedFileInfo): ParsedSheetInfo | nu
     return null;
   }
 
-  const rows: Record<string, unknown>[] = buildFormPreviewRowsFromParsedRows(parsedFile);
+  const consumedOptionTexts = collectConsumedFormOptionTexts(parsedFile);
+  const rows: Record<string, unknown>[] = buildResolvedFormPreviewRows(parsedFile);
   const seenEntries = new Set<string>();
 
   rows.forEach((row) => {
     if (typeof row.field === 'string') {
+      seenEntries.add(`resolved:${row.field}`);
       seenEntries.add(`pair:${row.field}`);
     }
   });
 
   if (rows.length === 0) {
+    const scalarRows: Record<string, unknown>[] = [];
     formModel.scalars.forEach((scalar) => {
       if (!isObjectRecord(scalar)) {
         return;
@@ -226,7 +339,7 @@ function buildFormPreviewSheet(parsedFile: ParsedFileInfo): ParsedSheetInfo | nu
 
       const label = typeof scalar.label === 'string' ? scalar.label.trim() : '';
       const value = scalar.value;
-      if (!isUsefulFormPreviewPair(label, value)) {
+      if (!isUsefulFormPreviewPair(label, value) || isConsumedFormOptionEntry(label, value, consumedOptionTexts)) {
         return;
       }
 
@@ -235,12 +348,13 @@ function buildFormPreviewSheet(parsedFile: ParsedFileInfo): ParsedSheetInfo | nu
         return;
       }
       seenEntries.add(key);
-      rows.push({
+      scalarRows.push({
         field: label,
         value: formatPreviewCellValue(value),
         source: 'scalar',
       });
     });
+    rows.push(...scalarRows);
   }
 
   formModel.groups.forEach((group) => {
@@ -439,12 +553,15 @@ function getExtractedFieldEntries(parsedFile: ParsedFileInfo | null): Array<{ ki
     return [];
   }
 
-  const kvEntries = parsedFile.kvPairs.map((pair) => ({
-    kind: 'kv_pair' as const,
-    label: pair.label,
-    value: pair.value,
-    hint: pair.sourceText ?? null,
-  }));
+  const consumedOptionTexts = collectConsumedFormOptionTexts(parsedFile);
+  const kvEntries = parsedFile.kvPairs
+    .filter((pair) => !isConsumedFormOptionEntry(pair.label, pair.value, consumedOptionTexts))
+    .map((pair) => ({
+      kind: 'kv_pair' as const,
+      label: pair.label,
+      value: pair.value,
+      hint: pair.sourceText ?? null,
+    }));
   const factEntries = parsedFile.sourceCandidates
     .filter((candidate) => candidate.candidateType === 'text_fact')
     .map((candidate) => ({
@@ -453,7 +570,8 @@ function getExtractedFieldEntries(parsedFile: ParsedFileInfo | null): Array<{ ki
       value: String(candidate.value ?? ''),
       hint: candidate.sourceText ?? null,
     }))
-    .filter((entry) => entry.value.trim().length > 0);
+    .filter((entry) => entry.value.trim().length > 0)
+    .filter((entry) => !isConsumedFormOptionEntry(entry.label, entry.value, consumedOptionTexts));
 
   return [...kvEntries, ...factEntries];
 }
@@ -1706,6 +1824,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       previewDiagnostics: item.validation?.previewValidation?.diagnostics ?? [],
       mappingOperationalStatus: item.validation?.qualitySummary?.operationalMappingStatus ?? null,
       mappingEvalMetrics: item.validation?.qualitySummary?.trueQualityMetrics ?? null,
+      sourceQualityAdjustment: item.validation?.qualitySummary?.sourceQualityAdjustment ?? null,
       tsSyntaxValid: item.validation?.qualitySummary?.tsSyntaxValid ?? item.validation?.tsValidation?.valid ?? false,
       tsRuntimePreviewValid: item.validation?.qualitySummary?.tsRuntimePreviewValid ?? item.validation?.previewValidation?.runtimeValid ?? false,
       outputSchemaValid: item.validation?.qualitySummary?.outputSchemaValid ?? item.validation?.previewValidation?.schemaValid ?? false,
@@ -3363,10 +3482,37 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                         {result.outputSchemaValid ? 'match' : 'mismatch'}
                       </em>
                     </div>
+                    <div className="generation-quality-item">
+                      <span>Source quality</span>
+                      <strong>{result.sourceQualityAdjustment?.applied ? 'Confidence lowered' : 'No adjustment'}</strong>
+                      <small>
+                        {result.sourceQualityAdjustment?.applied
+                          ? `${result.sourceQualityAdjustment.adjustedCount} mapping(s) · ${result.sourceQualityAdjustment.affectedTargets.slice(0, 3).join(', ') || 'targets hidden'}`
+                          : 'source routing penalties not applied'}
+                      </small>
+                      <em
+                        className={`generation-quality-chip generation-quality-chip-${
+                          result.sourceQualityAdjustment?.applied ? 'medium' : 'high'
+                        }`}
+                      >
+                        {result.sourceQualityAdjustment?.applied
+                          ? `-${Math.round((result.sourceQualityAdjustment.strongestPenalty ?? 0) * 100)}%`
+                          : 'stable'}
+                      </em>
+                    </div>
                   </div>
                   <p className="subtle-text mapping-editor-note">
                     Readiness показывает полноту и объём ручной проверки в runtime. Accuracy-метрики считаются отдельно оффлайн на benchmark-наборах.
                   </p>
+                  {result.sourceQualityAdjustment?.applied && (
+                    <p className="subtle-text mapping-editor-note">
+                      Source quality adjustment: confidence был понижен из-за качества source extraction. Причины:{' '}
+                      {Object.entries(result.sourceQualityAdjustment.reasons)
+                        .map(([reason, count]) => `${reason} (${count})`)
+                        .join(', ')}
+                      .
+                    </p>
+                  )}
                   {currentFormExplainability && (
                     <div className="generation-diagnostics-stack">
                       <div className="generation-diagnostics-group">

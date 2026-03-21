@@ -107,6 +107,8 @@ from validation import assess_mapping_operational_status, compile_typescript_cod
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+LOW_GROUP_CONFIDENCE_THRESHOLD = 0.65
+LOW_SELECTION_CONFIDENCE_THRESHOLD = 0.6
 
 
 def _model_to_dict(value: object) -> dict:
@@ -143,6 +145,17 @@ def _build_form_explainability(parsed_file: object) -> dict | None:
         _model_to_dict(field)
         for field in list(getattr(form_model, 'resolved_fields', []) or [])
     ]
+    groups = [_to_jsonish(group) for group in list(getattr(form_model, 'groups', []) or [])]
+    scalars = [_to_jsonish(item) for item in list(getattr(form_model, 'scalars', []) or [])]
+    layout_lines = [_to_jsonish(item) for item in list(getattr(form_model, 'layout_lines', []) or [])]
+    generic_quality = _build_generic_form_quality(
+        parsed_file=parsed_file,
+        groups=groups,
+        scalars=scalars,
+        layout_lines=layout_lines,
+    )
+    quality_summary = _merge_form_quality_summaries(quality_summary, generic_quality)
+
     repair_plan = _build_form_repair_plan(
         parsed_file=parsed_file,
         form_model=form_model,
@@ -154,13 +167,15 @@ def _build_form_explainability(parsed_file: object) -> dict | None:
         'document_mode': getattr(parsed_file, 'document_mode', 'data_table_mode'),
         'final_source_mode': layout_meta.get('final_source_mode'),
         'layout_meta': layout_meta,
+        'pdf_zone_summary': _build_pdf_zone_explainability(parsed_file),
+        'structure': _to_jsonish(getattr(form_model, 'structure', {}) or {}),
         'quality_summary': quality_summary,
         'repair_plan': repair_plan,
         'resolved_fields': resolved_fields,
-        'scalar_count': len(list(getattr(form_model, 'scalars', []) or [])),
-        'group_count': len(list(getattr(form_model, 'groups', []) or [])),
+        'scalar_count': len(scalars),
+        'group_count': len(groups),
         'section_count': len(list(getattr(form_model, 'section_hierarchy', []) or [])),
-        'layout_line_count': len(list(getattr(form_model, 'layout_lines', []) or [])),
+        'layout_line_count': len(layout_lines),
         'repair_fields': [
             field.get('field')
             for field in resolved_fields
@@ -225,6 +240,32 @@ def _build_form_repair_plan(
             seen_keys.add(key)
             actions.append(action)
 
+    for group_id in list(quality_summary.get('ambiguous_groups') or []):
+        action = _build_group_repair_action(
+            group_id=str(group_id),
+            groups=groups,
+            layout_lines=layout_lines,
+            priority='high',
+            reason='Generic form group remains ambiguous and should be re-evaluated from local layout chunks.',
+        )
+        key = (action['kind'], action['group_id'])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            actions.append(action)
+
+    for group_id in list(quality_summary.get('low_confidence_groups') or []):
+        action = _build_group_repair_action(
+            group_id=str(group_id),
+            groups=groups,
+            layout_lines=layout_lines,
+            priority='medium',
+            reason='Generic form group was extracted with low confidence and should be reviewed before mapping.',
+        )
+        key = (action['kind'], action['group_id'])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            actions.append(action)
+
     for group_id in list(quality_summary.get('multiple_selected_single_choice_groups') or []):
         action = _build_group_repair_action(
             group_id=str(group_id),
@@ -275,6 +316,23 @@ def _build_form_repair_plan(
             if key not in seen_keys:
                 seen_keys.add(key)
                 actions.append(action)
+        elif code in {'low_confidence_form_zones', 'pdf_zone_prefers_table'}:
+            action = {
+                'kind': 'review_pdf_zone_routing',
+                'priority': 'high' if code == 'pdf_zone_prefers_table' else 'medium',
+                'reason': str(flag.get('message') or 'PDF zone routing should be reviewed.'),
+                'llm_scope': 'disabled_until_zone_selection_reviewed',
+                'chunk_refs': {
+                    'group_ids': [str(item.get('group_id') or '') for item in groups[:6]],
+                    'scalar_labels': [str(item.get('label') or '') for item in scalars[:8]],
+                    'line_ids': [str(item.get('line_id') or item.get('block_id') or '') for item in layout_lines[:16] if str(item.get('line_id') or item.get('block_id') or '')],
+                },
+                'pdf_zone_routing': quality_summary.get('pdf_zone_routing') or {},
+            }
+            key = (action['kind'], code)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                actions.append(action)
 
     needs_attention = bool(quality_summary.get('needs_attention'))
     return {
@@ -297,7 +355,9 @@ def _build_generic_form_quality(
     layout_lines: list[object],
 ) -> dict:
     document_mode = getattr(parsed_file, 'document_mode', 'data_table_mode')
+    pdf_zone_summary = _extract_pdf_zone_summary(parsed_file)
     red_flags: list[dict] = []
+    group_quality = _derive_group_quality_signals(groups)
     multiple_selected_single_choice_groups = [
         str(group.get('group_id') or '')
         for group in groups
@@ -305,6 +365,8 @@ def _build_generic_form_quality(
         and str(group.get('group_type') or 'unknown') == 'single_choice'
         and sum(1 for option in list(group.get('options') or []) if isinstance(option, dict) and option.get('selected')) > 1
     ]
+    ambiguous_groups = group_quality['ambiguous_groups']
+    low_confidence_groups = group_quality['low_confidence_groups']
     if document_mode == 'form_layout_mode' and not groups and not scalars and layout_lines:
         red_flags.append(
             {
@@ -320,6 +382,39 @@ def _build_generic_form_quality(
                 'groups': multiple_selected_single_choice_groups,
             }
         )
+    if ambiguous_groups:
+        red_flags.append(
+            {
+                'code': 'ambiguous_form_groups',
+                'message': 'Some extracted form groups remain ambiguous.',
+                'groups': ambiguous_groups,
+            }
+        )
+    if low_confidence_groups:
+        red_flags.append(
+            {
+                'code': 'low_confidence_form_groups',
+                'message': 'Some extracted form groups have low confidence and should be reviewed.',
+                'groups': low_confidence_groups,
+            }
+        )
+    if pdf_zone_summary.get('prefer_table_source'):
+        red_flags.append(
+            {
+                'code': 'pdf_zone_prefers_table',
+                'message': 'PDF routing indicates stronger table zones than form zones.',
+                'best_form_confidence': pdf_zone_summary.get('best_form_confidence'),
+                'best_table_confidence': pdf_zone_summary.get('best_table_confidence'),
+            }
+        )
+    elif pdf_zone_summary.get('low_confidence_form_zones'):
+        red_flags.append(
+            {
+                'code': 'low_confidence_form_zones',
+                'message': 'PDF form zones were detected with low confidence.',
+                'best_form_confidence': pdf_zone_summary.get('best_form_confidence'),
+            }
+        )
     return {
         'needs_attention': bool(red_flags),
         'repair_recommended': bool(red_flags),
@@ -327,6 +422,49 @@ def _build_generic_form_quality(
         'ambiguous_fields': [],
         'red_flags': red_flags,
         'multiple_selected_single_choice_groups': multiple_selected_single_choice_groups,
+        'ambiguous_groups': ambiguous_groups,
+        'low_confidence_groups': low_confidence_groups,
+        'pdf_zone_routing': pdf_zone_summary,
+    }
+
+
+def _extract_pdf_zone_summary(parsed_file: object) -> dict:
+    return _to_jsonish(dict(getattr(parsed_file, 'pdf_zone_summary', {}) or {}))
+
+
+def _build_pdf_zone_explainability(parsed_file: object) -> dict | None:
+    pdf_zone_summary = _extract_pdf_zone_summary(parsed_file)
+    if not pdf_zone_summary:
+        return None
+    parser_outputs = dict(pdf_zone_summary.get('parser_outputs') or {})
+    return {
+        'dominant_zone': pdf_zone_summary.get('dominant_zone'),
+        'counts': dict(pdf_zone_summary.get('counts') or {}),
+        'routing': {
+            key: pdf_zone_summary.get(key)
+            for key in (
+                'available',
+                'has_table_zones',
+                'has_form_zones',
+                'has_text_zones',
+                'has_noise_zones',
+                'best_table_confidence',
+                'best_form_confidence',
+                'best_text_confidence',
+                'best_noise_confidence',
+                'has_confident_table_zone',
+                'has_confident_form_zone',
+                'low_confidence_form_zones',
+                'prefer_table_source',
+            )
+            if key in pdf_zone_summary
+        },
+        'parser_outputs': {
+            'table_zone_count': len(list(dict(parser_outputs.get('table') or {}).get('zones') or [])),
+            'form_zone_count': len(list(dict(parser_outputs.get('form') or {}).get('zones') or [])),
+            'text_zone_count': len(list(dict(parser_outputs.get('text') or {}).get('zones') or [])),
+            'noise_zone_count': len(list(dict(parser_outputs.get('noise') or {}).get('zones') or [])),
+        },
     }
 
 
@@ -371,7 +509,7 @@ def _build_group_repair_action(
         if isinstance(group, dict) and str(group.get('group_id') or '') == group_id
     ]
     line_ids = _collect_related_line_ids(related_groups=related_groups, scalars=[], layout_lines=layout_lines, field_name=group_id)
-    return {
+    action = {
         'kind': 'review_group_selection',
         'priority': priority,
         'group_id': group_id,
@@ -383,6 +521,96 @@ def _build_group_repair_action(
             'line_ids': line_ids,
         },
     }
+    if related_groups:
+        group = related_groups[0]
+        action['group_confidence'] = _coerce_float(group.get('group_confidence'))
+        action['selection_confidence'] = _coerce_float(group.get('selection_confidence'))
+        action['ambiguity_reason'] = str(group.get('ambiguity_reason') or '') or None
+    return action
+
+
+def _derive_group_quality_signals(groups: list[object]) -> dict[str, list[str]]:
+    ambiguous_groups: list[str] = []
+    low_confidence_groups: list[str] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get('group_id') or '').strip()
+        if not group_id:
+            continue
+        group_confidence = _coerce_float(group.get('group_confidence'))
+        selection_confidence = _coerce_float(group.get('selection_confidence'))
+        if bool(group.get('is_ambiguous')):
+            ambiguous_groups.append(group_id)
+            continue
+        if group_confidence is not None and group_confidence < LOW_GROUP_CONFIDENCE_THRESHOLD:
+            low_confidence_groups.append(group_id)
+            continue
+        if selection_confidence is not None and selection_confidence < LOW_SELECTION_CONFIDENCE_THRESHOLD:
+            low_confidence_groups.append(group_id)
+    return {
+        'ambiguous_groups': _merge_unique_str_lists([], ambiguous_groups),
+        'low_confidence_groups': _merge_unique_str_lists([], low_confidence_groups),
+    }
+
+
+def _merge_form_quality_summaries(primary: dict, generic: dict) -> dict:
+    if not primary:
+        return dict(generic)
+    if not generic:
+        return dict(primary)
+
+    merged = dict(primary)
+    for key in (
+        'unresolved_critical_fields',
+        'ambiguous_fields',
+        'multiple_selected_single_choice_groups',
+        'ambiguous_groups',
+        'low_confidence_groups',
+    ):
+        merged[key] = _merge_unique_str_lists(primary.get(key), generic.get(key))
+    merged['red_flags'] = _merge_red_flags(
+        list(primary.get('red_flags') or []),
+        list(generic.get('red_flags') or []),
+    )
+    merged['needs_attention'] = bool(merged['red_flags']) or bool(primary.get('needs_attention')) or bool(generic.get('needs_attention'))
+    merged['repair_recommended'] = bool(merged['red_flags']) or bool(primary.get('repair_recommended')) or bool(generic.get('repair_recommended'))
+    return merged
+
+
+def _merge_unique_str_lists(left: object, right: object) -> list[str]:
+    result: list[str] = []
+    for values in (left, right):
+        for item in list(values or []):
+            normalized = str(item).strip()
+            if normalized and normalized not in result:
+                result.append(normalized)
+    return result
+
+
+def _merge_red_flags(left: list[dict], right: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for flag in list(left) + list(right):
+        if not isinstance(flag, dict):
+            continue
+        code = str(flag.get('code') or '')
+        message = str(flag.get('message') or '')
+        key = (code, message)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(flag)
+    return merged
+
+
+def _coerce_float(value: object) -> float | None:
+    try:
+        if value in (None, ''):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _find_related_groups_for_field(field_name: str, groups: list[object]) -> list[dict]:
@@ -613,6 +841,43 @@ def _preview_text(value: str, limit: int = 200) -> str:
     if len(compact) <= limit:
         return compact
     return f'{compact[:limit]}...'
+
+
+def _build_source_quality_adjustment(mapping_explainability: dict | None) -> dict | None:
+    if not isinstance(mapping_explainability, dict):
+        return None
+    mapping_sources = list(mapping_explainability.get('mapping_sources') or [])
+    adjusted_rows = [
+        row for row in mapping_sources
+        if isinstance(row, dict)
+        and isinstance(row.get('candidate_metadata'), dict)
+        and row['candidate_metadata'].get('source_routing_penalty_reason')
+    ]
+    if not adjusted_rows:
+        return None
+
+    reasons: dict[str, int] = {}
+    affected_targets: list[str] = []
+    strongest_penalty = 0.0
+    for row in adjusted_rows:
+        metadata = dict(row.get('candidate_metadata') or {})
+        reason = str(metadata.get('source_routing_penalty_reason') or 'unknown')
+        reasons[reason] = reasons.get(reason, 0) + 1
+        target = str(row.get('target') or '').strip()
+        if target and target not in affected_targets:
+            affected_targets.append(target)
+        try:
+            strongest_penalty = max(strongest_penalty, float(metadata.get('source_routing_penalty') or 0.0))
+        except (TypeError, ValueError):
+            continue
+
+    return {
+        'applied': True,
+        'adjusted_count': len(adjusted_rows),
+        'reasons': reasons,
+        'affected_targets': affected_targets,
+        'strongest_penalty': strongest_penalty,
+    }
 
 
 @router.post('/source-preview')
@@ -1022,10 +1287,25 @@ async def generate(
             source_rows=source_rows,
             user_id=resolved_user_id,
             schema_fingerprint_id=resolved_schema_fingerprint_id,
+            source_routing_context={
+                'file_type': parsed.file_type,
+                'document_mode': parsed.document_mode,
+                'final_source_mode': (
+                    dict(getattr(parsed.form_model, 'layout_meta', {}) or {}).get('final_source_mode')
+                    if parsed.form_model is not None
+                    else None
+                ),
+                'pdf_zone_routing': (
+                    dict(getattr(parsed.form_model, 'layout_meta', {}) or {}).get('pdf_zone_routing', {})
+                    if parsed.form_model is not None
+                    else {}
+                ),
+            },
         )
         mappings = mapping_result['mappings']
         mapping_warnings = mapping_result['warnings']
         mapping_explainability = mapping_result['explainability']
+        source_quality_adjustment = _build_source_quality_adjustment(mapping_explainability)
         ts_code = generate_typescript(target_fields, mappings)
         preview = build_preview(source_rows, target_fields, mappings)
         ts_validation = compile_typescript_code(ts_code)
@@ -1039,6 +1319,7 @@ async def generate(
             'ts_syntax_valid': bool(ts_validation['valid']),
             'ts_runtime_preview_valid': bool(preview_validation['runtime_valid']),
             'output_schema_valid': bool(preview_validation['schema_valid']),
+            'source_quality_adjustment': source_quality_adjustment,
         }
         validation_payload = {
             'target_schema': target_schema,
@@ -1111,6 +1392,7 @@ async def generate(
             'mapping_operational_status': quality_summary['operational_mapping_status'],
             'mapping_quality': quality_summary['operational_mapping_status'],
             'mapping_eval_metrics': quality_summary['true_quality_metrics'],
+            'source_quality_adjustment': quality_summary['source_quality_adjustment'],
             'ts_syntax_valid': quality_summary['ts_syntax_valid'],
             'ts_runtime_preview_valid': quality_summary['ts_runtime_preview_valid'],
             'output_schema_valid': quality_summary['output_schema_valid'],
