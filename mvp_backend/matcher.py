@@ -86,6 +86,38 @@ SYNONYM_GROUPS = {
     'unit': {'unit', 'measure', 'uom', 'единица', 'измерения', 'edinitsa', 'izmereniya'},
 }
 
+SYNONYM_GROUPS['plan'] = {'plan', 'planned', 'planovaya', 'planovyy', 'planovoe', 'planovuyu'}
+SYNONYM_GROUPS['act'] = {'act', 'acts', 'akt', 'akta', 'aktu'}
+SYNONYM_GROUPS['reason'] = {'reason', 'cause', 'prichina', 'prichine'}
+SYNONYM_GROUPS['close'] = {'close', 'closed', 'closing', 'zakryt', 'zakryta', 'zakrytiya'}
+SYNONYM_GROUPS['updated'].update({'last', 'poslednego', 'posledniy', 'poslednyaya'})
+SYNONYM_GROUPS['id'].update({'identifikator'})
+SYNONYM_GROUPS['revenue'].update({'vyruchki', 'vyruchke'})
+SYNONYM_GROUPS['creator'].update({'sozdal'})
+SYNONYM_GROUPS['organization'].update({'organizatsiya'})
+SYNONYM_GROUPS['responsible'].update({'person'})
+SYNONYM_GROUPS['product'].update({'produktov'})
+SYNONYM_GROUPS['license'].update({'litsenziy'})
+SYNONYM_GROUPS['boolean'].update({'lid'})
+SYNONYM_GROUPS['stage'] = {'stage', 'stadiya', 'stadiyu'}
+SYNONYM_GROUPS['transition'] = {'transition', 'perehod', 'perehoda'}
+SYNONYM_GROUPS['time'] = {'time', 'vremya'}
+SYNONYM_GROUPS['delivery'] = {'delivery', 'postavka', 'postavki'}
+SYNONYM_GROUPS['direct'] = {'direct', 'pryamaya', 'pryamoy'}
+SYNONYM_GROUPS['distributor'] = {'distributor', 'distribyutor'}
+SYNONYM_GROUPS['service'] = {'service', 'uslug', 'uslugi'}
+SYNONYM_GROUPS['final'] = {'final', 'itogovaya', 'itogovyy', 'itogovoe'}
+SYNONYM_GROUPS['forecast'] = {'forecast', 'prognoz'}
+SYNONYM_GROUPS['marketing'] = {'marketing', 'marketingovoe'}
+SYNONYM_GROUPS['event'] = {'event', 'meropriyatie'}
+SYNONYM_GROUPS['site'] = {'site', 'sayta', 'sayt'}
+SYNONYM_GROUPS['lead'] = {'lead', 'lid'}
+SYNONYM_GROUPS['supply'] = {'supply', 'postavka'}
+SYNONYM_GROUPS['type'] = {'type', 'tip'}
+SYNONYM_GROUPS['vat'] = {'vat', 'nds'}
+
+STOPWORD_TOKENS = {'of', 'by', 'with', 'na', 'po', 's'}
+
 CANONICAL_LOOKUP = {
     alias: canonical
     for canonical, aliases in SYNONYM_GROUPS.items()
@@ -114,6 +146,16 @@ IMPORTANT_DOMAIN_TOKENS = {
     'net',
     'customer',
     'unit',
+}
+
+IMPORTANT_DOMAIN_TOKENS.update({'plan', 'act', 'reason', 'close', 'stage', 'transition', 'time', 'delivery', 'direct', 'distributor', 'service', 'final', 'forecast', 'marketing', 'event', 'site', 'lead', 'supply', 'type', 'vat'})
+
+ALIAS_SENSITIVE_TOKEN_GROUPS = {
+    'identifier': {'identifier', 'identifikator', 'identyfikator'},
+    'id': {'id'},
+    'comment': {'comment', 'kommentariy'},
+    'reason': {'reason', 'prichina', 'prichine'},
+    'close': {'close', 'closed', 'closing', 'zakryt', 'zakryta', 'zakrytiya'},
 }
 
 ROLE_LABEL_BY_TOKEN = {
@@ -306,6 +348,14 @@ def _find_deterministic_match(
     if exact is not None:
         return {'source': exact['original_name'], 'confidence': 'high', 'reason': 'normalized_exact'}
 
+    alias_sensitive = _find_alias_sensitive_match(
+        prepared_target=prepared_target,
+        prepared_sources=prepared_sources,
+        used_sources=used_sources,
+    )
+    if alias_sensitive is not None:
+        return alias_sensitive
+
     canonical_exact = next(
         (
             source
@@ -364,6 +414,118 @@ def _find_deterministic_match(
     return None
 
 
+def _find_alias_sensitive_match(
+    *,
+    prepared_target: dict[str, Any],
+    prepared_sources: list[dict[str, Any]],
+    used_sources: set[str],
+) -> dict[str, str] | None:
+    target_tokens = set(prepared_target['normalized_tokens'])
+    target_canonical = set(prepared_target['canonical_tokens'])
+
+    def find_source(predicate: Any) -> dict[str, Any] | None:
+        return next(
+            (
+                source
+                for source in prepared_sources
+                if source['original_name'] not in used_sources and predicate(set(source['normalized_tokens']), set(source['canonical_tokens']))
+            ),
+            None,
+        )
+
+    if 'identifier' in target_tokens:
+        match = find_source(
+            lambda source_tokens, source_canonical: bool(source_tokens & ALIAS_SENSITIVE_TOKEN_GROUPS['identifier'])
+            and ('deal' not in target_canonical or 'deal' in source_canonical)
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_identifier'}
+
+    if 'id' in target_tokens and 'identifier' not in target_tokens:
+        match = find_source(
+            lambda source_tokens, source_canonical: 'id' in source_tokens
+            and not source_tokens.intersection(ALIAS_SENSITIVE_TOKEN_GROUPS['identifier'])
+            and ('deal' not in target_canonical or 'deal' in source_canonical)
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_id'}
+
+    if 'invoice' in target_tokens and 'amount' in target_tokens:
+        if 'vat' in target_tokens:
+            match = find_source(
+                lambda _source_tokens, source_canonical: 'amount' in source_canonical and 'act' in source_canonical and 'vat' in source_canonical
+            )
+            if match is not None:
+                return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_invoice_vat'}
+        else:
+            match = find_source(
+                lambda _source_tokens, source_canonical: 'amount' in source_canonical and 'act' in source_canonical and 'vat' not in source_canonical
+            )
+            if match is not None:
+                return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_invoice'}
+
+    if {'final', 'service', 'amount'} <= target_canonical:
+        if {'revenue', 'vat'} <= target_canonical:
+            match = find_source(
+                lambda _source_tokens, source_canonical: {'deal', 'final', 'service', 'amount', 'revenue', 'vat'} <= source_canonical
+            )
+            if match is not None:
+                return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_final_service_revenue_vat'}
+        if 'vat' in target_canonical and 'revenue' not in target_canonical:
+            match = find_source(
+                lambda _source_tokens, source_canonical: {'deal', 'final', 'service', 'amount', 'vat'} <= source_canonical and 'revenue' not in source_canonical
+            )
+            if match is not None:
+                return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_final_service_vat'}
+        if 'vat' not in target_canonical and 'revenue' not in target_canonical:
+            match = find_source(
+                lambda _source_tokens, source_canonical: {'deal', 'final', 'service', 'amount'} <= source_canonical
+                and 'vat' not in source_canonical
+                and 'revenue' not in source_canonical
+            )
+            if match is not None:
+                return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_final_service'}
+
+    if {'site', 'lead'} <= target_canonical:
+        match = find_source(
+            lambda _source_tokens, source_canonical: {'deal', 'site', 'lead'} <= source_canonical
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_site_lead'}
+
+    if {'direct', 'supply'} <= target_canonical:
+        match = find_source(
+            lambda _source_tokens, source_canonical: {'deal', 'direct', 'supply'} <= source_canonical
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_direct_supply'}
+
+    if {'deal', 'stage', 'final'} <= target_canonical:
+        match = find_source(
+            lambda _source_tokens, source_canonical: {'deal', 'stage'} <= source_canonical
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'medium', 'reason': 'alias_sensitive_stage_final'}
+
+    if 'comment' in target_tokens and 'reason' in target_tokens:
+        match = find_source(
+            lambda source_tokens, _source_canonical: bool(source_tokens & ALIAS_SENSITIVE_TOKEN_GROUPS['comment'])
+            and bool(source_tokens & ALIAS_SENSITIVE_TOKEN_GROUPS['reason'])
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_reason_comment'}
+
+    if 'reason' in target_tokens and 'comment' not in target_tokens:
+        match = find_source(
+            lambda source_tokens, _source_canonical: bool(source_tokens & ALIAS_SENSITIVE_TOKEN_GROUPS['reason'])
+            and not bool(source_tokens & ALIAS_SENSITIVE_TOKEN_GROUPS['comment'])
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_reason'}
+
+    return None
+
+
 def _matches_standard_pattern(prepared_target: dict[str, Any], prepared_source: dict[str, Any]) -> bool:
     target_tokens = prepared_target['canonical_tokens']
     source_tokens = prepared_source['canonical_tokens']
@@ -387,7 +549,7 @@ def _raw_tokens(value: str) -> list[str]:
     with_boundaries = CAMEL_BOUNDARY_RE.sub(' ', value)
     with_boundaries = DIGIT_BOUNDARY_RE.sub(' ', with_boundaries)
     parts = TOKEN_SPLIT_RE.split(with_boundaries.strip().lower())
-    return [part for part in parts if part]
+    return [part for part in parts if part and part not in STOPWORD_TOKENS]
 
 
 def _transliterate_token(token: str) -> str:

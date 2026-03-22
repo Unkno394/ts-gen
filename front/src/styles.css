@@ -893,6 +893,16 @@ input::-ms-reveal {
   font-size: 13px;
 }
 
+.upload-zone-target-json {
+  margin-bottom: 18px;
+}
+
+.target-json-clear-btn {
+  width: 100%;
+  min-height: 46px;
+  margin-bottom: 18px;
+}
+
 .generator-action-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -122,6 +122,11 @@ type InsightFeedEntry = {
   timestamp: string | null;
 };
 
+type UploadedTargetJson = {
+  fileName: string;
+  content: string;
+};
+
 function buildPreviewSheet(name: string, columns: string[], rows: Record<string, unknown>[]): ParsedSheetInfo {
   return {
     name,
@@ -1497,6 +1502,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [draftJsonNotice, setDraftJsonNotice] = useState('');
   const [draftJsonError, setDraftJsonError] = useState('');
   const [draftJsonSaved, setDraftJsonSaved] = useState(false);
+  const [uploadedTargetJson, setUploadedTargetJson] = useState<UploadedTargetJson | null>(null);
+  const [targetJsonPrepared, setTargetJsonPrepared] = useState(false);
+  const [targetJsonUploadNotice, setTargetJsonUploadNotice] = useState('');
+  const [targetJsonUploadError, setTargetJsonUploadError] = useState('');
   const [learningReviewBusy, setLearningReviewBusy] = useState(false);
   const [learningReviewNotice, setLearningReviewNotice] = useState('');
   const [learningReviewError, setLearningReviewError] = useState('');
@@ -1674,6 +1683,13 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${parsedExtractionStatusLabel(parsedFile.extractionStatus)}`;
   }, [extractedFieldEntries.length, parsedFile, previewSheets.length]);
 
+  const targetJsonFileSummary = useMemo(() => {
+    if (!uploadedTargetJson) {
+      return 'JSON-файл еще не загружен';
+    }
+    return `${uploadedTargetJson.fileName} · загружен в Target JSON`;
+  }, [uploadedTargetJson]);
+
   const schemaTargetFields = useMemo(() => parseSchemaFields(schema), [schema]);
 
   const mappingTargetOptions = useMemo(() => {
@@ -1706,6 +1722,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const hasRejectedDraftWithoutReason = useMemo(() => {
     return draftSuggestions.some((suggestion, index) => draftSuggestionNeedsExplicitReview(suggestion) && suggestion.status === 'rejected' && !draftReviewNotes[`draft-${index}`]?.trim());
   }, [draftReviewNotes, draftSuggestions]);
+
+  const currentGenerationTokenUsage = result.tokenUsage ?? null;
 
   const sortedMappingRows = useMemo(() => {
     return result.mappings
@@ -1943,6 +1961,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
           draftJsonError,
           learningReviewError,
           draftJsonNotice,
+          targetJsonUploadError,
+          targetJsonUploadNotice,
           learningReviewNotice,
           sourcePreviewRefreshNotice,
           sourcePreviewRefreshError,
@@ -1951,7 +1971,46 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         ].filter(Boolean)
       )
     );
-  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, repairError, repairNotice, result.warnings, saveMessage, sourcePreviewRefreshError, sourcePreviewRefreshNotice]);
+  }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, repairError, repairNotice, result.warnings, saveMessage, sourcePreviewRefreshError, sourcePreviewRefreshNotice, targetJsonUploadError, targetJsonUploadNotice]);
+
+  const clearUploadedTargetJson = () => {
+    setUploadedTargetJson(null);
+    setTargetJsonUploadNotice('');
+    setTargetJsonUploadError('');
+  };
+
+  const invalidateGeneratedResult = () => {
+    setResult({ code: defaultCode, mappings: [], preview: [], warnings: [] });
+    setActiveHistoryId(null);
+    setCorrectionBaseline(null);
+    setCorrectionSaveNotice('');
+    setCorrectionSaveError('');
+    setMappingReviewNotes({});
+    setGenerationConfirmed(false);
+    setLearningReviewNotice('');
+    setLearningReviewError('');
+    setRepairNotice('');
+    setRepairError('');
+    setActiveRepairActionKey(null);
+    setRepairPreview(null);
+    setAutoGenerateSectionKey(null);
+  };
+
+  const onClearTargetJsonFile = () => {
+    if (!uploadedTargetJson) {
+      return;
+    }
+    invalidateGeneratedResult();
+    clearUploadedTargetJson();
+    setTargetJsonPrepared(false);
+    setDraftSuggestions([]);
+    setDraftReviewNotes({});
+    setDraftJsonNotice('');
+    setDraftJsonError('');
+    setDraftJsonSaved(false);
+    setSchema(defaultSchema);
+    setSaveMessage('Загруженный JSON удален из Target JSON.');
+  };
 
   const profileStats = useMemo(() => {
     const totalGenerations = history.length;
@@ -2043,6 +2102,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setActiveHistoryId(item.id);
     setSelectedFile(null);
     setParsedFile(item.parsedFile ?? null);
+    clearUploadedTargetJson();
+    setTargetJsonPrepared(true);
     setSchema(item.schema);
     setAutoGenerateSectionKey(null);
     const restoredResult: GenerationResult = {
@@ -2258,6 +2319,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     if (!isObjectRecord(payload)) {
       return false;
     }
+    invalidateGeneratedResult();
+    clearUploadedTargetJson();
+    setTargetJsonPrepared(true);
     setSchema(JSON.stringify(payload, null, 2));
     setActiveView('generator');
     setSaveMessage(message);
@@ -2432,6 +2496,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
     setSourceStructureTab(preferredSourceStructureTab(parsed));
+    setTargetJsonPrepared(Boolean(uploadedTargetJson));
     setSectionStateCache({});
     setAutoGenerateSectionKey(null);
     setSaveMessage('');
@@ -2442,6 +2507,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setDraftReviewNotes({});
     setDraftJsonNotice('');
     setDraftJsonError('');
+    setTargetJsonUploadNotice('');
+    setTargetJsonUploadError('');
     setDraftJsonSaved(false);
     setRepairNotice('');
     setRepairError('');
@@ -2457,6 +2524,49 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     const file = event.target.files?.[0];
     if (!file) return;
     await handleSelectedFile(file);
+  };
+
+  const onTargetJsonFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) {
+      return;
+    }
+
+    setTargetJsonUploadNotice('');
+    setTargetJsonUploadError('');
+
+    try {
+      const content = await file.text();
+      JSON.parse(content);
+      invalidateGeneratedResult();
+      setUploadedTargetJson({
+        fileName: file.name,
+        content,
+      });
+      setTargetJsonPrepared(true);
+      setSchema(content);
+      setDraftSuggestions([]);
+      setDraftReviewNotes({});
+      setDraftJsonNotice('');
+      setDraftJsonError('');
+      setDraftJsonSaved(false);
+      setTargetJsonUploadNotice('JSON загружен в Target JSON. Draft JSON по источнику временно отключен.');
+    } catch (error) {
+      setTargetJsonUploadNotice('');
+      setTargetJsonUploadError(error instanceof Error ? error.message : 'Не удалось загрузить JSON-файл.');
+    }
+  };
+
+  const onSchemaChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+    const nextSchema = event.target.value;
+    if (nextSchema !== schema) {
+      invalidateGeneratedResult();
+    }
+    if (uploadedTargetJson && nextSchema !== uploadedTargetJson.content) {
+      clearUploadedTargetJson();
+    }
+    setSchema(nextSchema);
   };
 
   const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
@@ -2522,6 +2632,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const applySectionState = (nextState: SectionWorkspaceState | null | undefined) => {
     if (!nextState) {
+      clearUploadedTargetJson();
+      setTargetJsonPrepared(false);
       setSchema(defaultSchema);
       setResult({ code: defaultCode, mappings: [], preview: [], warnings: [] });
       setDraftSuggestions([]);
@@ -2541,6 +2653,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       return;
     }
 
+    clearUploadedTargetJson();
+    setTargetJsonPrepared(true);
     setSchema(nextState.schema);
     setResult({
       ...nextState.result,
@@ -2614,6 +2728,16 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         mappings: [],
         preview: [],
         warnings: ['Сначала загрузите CSV, XLSX, XLS, PDF или DOCX.'],
+      });
+      return;
+    }
+    if (!targetJsonPrepared) {
+      setAutoGenerateSectionKey(null);
+      setResult({
+        code: defaultCode,
+        mappings: [],
+        preview: [],
+        warnings: ['Сначала загрузите JSON или постройте Draft JSON по источнику.'],
       });
       return;
     }
@@ -2908,6 +3032,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setDraftJsonError('Сначала загрузите файл.');
       return;
     }
+    if (uploadedTargetJson) {
+      setDraftJsonError('Сначала измените или уберите загруженный JSON, чтобы снова строить Draft JSON.');
+      return;
+    }
 
     setDraftJsonBusy(true);
     setDraftJsonError('');
@@ -2923,6 +3051,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setParsedFile(generated.parsedFile ?? parsedFile);
       setDraftSuggestions(cloneDraftSuggestions(generated.fieldSuggestions));
       setDraftReviewNotes({});
+      invalidateGeneratedResult();
+      clearUploadedTargetJson();
+      setTargetJsonPrepared(true);
       setSchema(JSON.stringify(generated.draftJson, null, 2));
       setDraftJsonNotice('Draft JSON построен. Проверьте названия полей и при необходимости сохраните их в память.');
       setDraftJsonError('');
@@ -2945,6 +3076,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
             }
           : item
       );
+      invalidateGeneratedResult();
+      clearUploadedTargetJson();
       setSchema(buildSchemaFromDraftSuggestions(updated));
       return updated;
     });
@@ -2960,6 +3093,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
             }
           : item
       );
+      invalidateGeneratedResult();
+      clearUploadedTargetJson();
       setSchema(buildSchemaFromDraftSuggestions(updated.filter((item) => item.status !== 'rejected' && item.targetField.trim())));
       return updated;
     });
@@ -3030,6 +3165,8 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
           };
         }),
       });
+      clearUploadedTargetJson();
+      setTargetJsonPrepared(true);
       setSchema(JSON.stringify(result.draftJson, null, 2));
       setDraftSuggestions((current) =>
         current.map((item) => ({
@@ -3467,13 +3604,23 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                 <span>{fileSummary}</span>
               </label>
 
+              <label className="upload-zone upload-zone-target-json">
+                <input accept=".json,application/json" hidden onChange={onTargetJsonFileChange} type="file" />
+                <Upload size={18} />
+                <strong>Загрузить JSON</strong>
+                <span>{targetJsonFileSummary}</span>
+              </label>
+              <button className="secondary-btn target-json-clear-btn" disabled={!uploadedTargetJson} onClick={onClearTargetJsonFile} type="button">
+                <X size={16} /> Очистить JSON
+              </button>
+
               <div className="field-block">
                 <div className="field-caption">Target JSON</div>
-                <textarea className="editor-area schema-editor-area" onChange={(event) => setSchema(event.target.value)} value={schema} />
+                <textarea className="editor-area schema-editor-area" onChange={onSchemaChange} value={schema} />
               </div>
 
               <div className="generator-action-row">
-                <button className="secondary-btn" disabled={draftJsonBusy || busy || !selectedFile} onClick={onGenerateDraftJson} type="button">
+                <button className="secondary-btn" disabled={draftJsonBusy || busy || !selectedFile || Boolean(uploadedTargetJson)} onClick={onGenerateDraftJson} type="button">
                   <Sparkles size={16} /> {draftJsonBusy ? 'Строим draft JSON...' : 'Draft JSON по источнику'}
                 </button>
                 {!profile.skipped && draftSuggestions.length > 0 && (
@@ -3483,7 +3630,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                 )}
               </div>
 
-              <button className="primary-btn" disabled={busy} onClick={onGenerate} type="button">
+              <button className="primary-btn" disabled={busy || !selectedFile || !targetJsonPrepared} onClick={onGenerate} type="button">
                 <WandSparkles size={16} /> {busy ? 'Генерируем...' : 'Сгенерировать'}
               </button>
 
@@ -3816,21 +3963,17 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </em>
                     </div>
                     <div className="generation-quality-item">
-                      <span>Source quality</span>
-                      <strong>{result.sourceQualityAdjustment?.applied ? 'Confidence lowered' : 'No adjustment'}</strong>
+                      <span>Token usage</span>
+                      <strong>
+                        {currentGenerationTokenUsage ? `${currentGenerationTokenUsage.totalTokens.toLocaleString('ru-RU')} токенов` : 'Нет данных'}
+                      </strong>
                       <small>
-                        {result.sourceQualityAdjustment?.applied
-                          ? `${result.sourceQualityAdjustment.adjustedCount} mapping(s) · ${result.sourceQualityAdjustment.affectedTargets.slice(0, 3).join(', ') || 'targets hidden'}`
-                          : 'source routing penalties not applied'}
+                        {currentGenerationTokenUsage
+                          ? `input ${currentGenerationTokenUsage.inputTokens.toLocaleString('ru-RU')} · output ${currentGenerationTokenUsage.outputTokens.toLocaleString('ru-RU')}`
+                          : 'Токены для этой генерации не были сохранены.'}
                       </small>
-                      <em
-                        className={`generation-quality-chip generation-quality-chip-${
-                          result.sourceQualityAdjustment?.applied ? 'medium' : 'high'
-                        }`}
-                      >
-                        {result.sourceQualityAdjustment?.applied
-                          ? `-${Math.round((result.sourceQualityAdjustment.strongestPenalty ?? 0) * 100)}%`
-                          : 'stable'}
+                      <em className="generation-quality-chip generation-quality-chip-neutral">
+                        {currentGenerationTokenUsage?.modelName ?? currentGenerationTokenUsage?.provider ?? 'usage'}
                       </em>
                     </div>
                   </div>

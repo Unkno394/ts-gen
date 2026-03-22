@@ -117,6 +117,118 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(plain_id['attribute_token'], 'id')
         self.assertEqual(plain_id['role_label'], 'identifier')
 
+    def test_maps_crm_semantic_columns_with_ambiguous_id_and_reason_tokens(self) -> None:
+        target_fields = [
+            TargetField(name='actPlanDate', type='string'),
+            TargetField(name='closeReason', type='string'),
+            TargetField(name='closeReasonComment', type='string'),
+            TargetField(name='creator', type='string'),
+            TargetField(name='dealId', type='string'),
+            TargetField(name='dealIdentifier', type='string'),
+            TargetField(name='dealLastUpdateDate', type='string'),
+            TargetField(name='dealRevenueAmount', type='number'),
+        ]
+
+        mappings, warnings = map_fields(
+            [
+                'Плановая дата акта',
+                'Сделка - Причина закрытия',
+                'Сделка - Комментарий к причине закрытия',
+                'Сделка - Создал',
+                'Сделка - ID сделки',
+                'Сделка - Идентификатор',
+                'Сделка - Дата последнего обновления',
+                'Сделка - Сумма выручки',
+            ],
+            target_fields,
+            allow_position_fallback=False,
+        )
+
+        mapping_by_target = {mapping.target: mapping for mapping in mappings}
+        self.assertEqual(mapping_by_target['actPlanDate'].source, 'Плановая дата акта')
+        self.assertEqual(mapping_by_target['closeReason'].source, 'Сделка - Причина закрытия')
+        self.assertEqual(mapping_by_target['closeReasonComment'].source, 'Сделка - Комментарий к причине закрытия')
+        self.assertEqual(mapping_by_target['creator'].source, 'Сделка - Создал')
+        self.assertEqual(mapping_by_target['dealId'].source, 'Сделка - ID сделки')
+        self.assertEqual(mapping_by_target['dealIdentifier'].source, 'Сделка - Идентификатор')
+        self.assertEqual(mapping_by_target['dealLastUpdateDate'].source, 'Сделка - Дата последнего обновления')
+        self.assertEqual(mapping_by_target['dealRevenueAmount'].source, 'Сделка - Сумма выручки')
+        self.assertEqual(warnings, [])
+
+    def test_maps_extended_crm_fields_without_null_source_fallbacks(self) -> None:
+        target_fields = [
+            TargetField(name='dealStage', type='string'),
+            TargetField(name='dealStageFinal', type='boolean'),
+            TargetField(name='dealStageTransitionDate', type='string'),
+            TargetField(name='deliveryType', type='string'),
+            TargetField(name='directSupply', type='boolean'),
+            TargetField(name='distributor', type='string'),
+            TargetField(name='finalLicenseAmount', type='number'),
+            TargetField(name='finalServiceAmount', type='number'),
+            TargetField(name='finalServiceAmountByRevenueWithVAT', type='number'),
+            TargetField(name='finalServiceAmountWithVAT', type='number'),
+            TargetField(name='forecast', type='string'),
+            TargetField(name='invoiceAmount', type='number'),
+            TargetField(name='invoiceAmountWithVAT', type='number'),
+            TargetField(name='marketingEvent', type='string'),
+            TargetField(name='organization', type='string'),
+            TargetField(name='responsiblePerson', type='string'),
+            TargetField(name='siteLead', type='boolean'),
+            TargetField(name='stageTransitionTime', type='string'),
+            TargetField(name='totalProductAmount', type='number'),
+            TargetField(name='unitOfMeasure', type='string'),
+        ]
+
+        mappings, warnings = map_fields(
+            [
+                'Сделка - Стадия',
+                'Стадия (Сделка)',
+                'Сделка - Дата перехода объекта на новую стадию',
+                'Тип поставки',
+                'Сделка - Прямая поставка',
+                'Сделка - Дистрибьютор',
+                'Сделка - Итоговая сумма лицензий',
+                'Сделка - Итоговая сумма услуг',
+                'Сделка - Итоговая сумма услуг по выручке (с НДС)',
+                'Сделка - Итоговая сумма услуг (с НДС)',
+                'Сделка - Прогноз',
+                'Сумма акта',
+                'Сумма акта (с НДС)',
+                'Сделка - Маркетинговое мероприятие',
+                'Сделка - Организация',
+                'Сделка - Ответственный',
+                'Сделка - Лид с сайта',
+                'Время перехода на текущую стадию',
+                'Сделка - Итоговая сумма продуктов',
+                'Единица измерения',
+            ],
+            target_fields,
+            allow_position_fallback=False,
+        )
+
+        mapping_by_target = {mapping.target: mapping for mapping in mappings}
+        self.assertEqual(mapping_by_target['dealStage'].source, 'Сделка - Стадия')
+        self.assertEqual(mapping_by_target['dealStageFinal'].source, 'Стадия (Сделка)')
+        self.assertEqual(mapping_by_target['dealStageTransitionDate'].source, 'Сделка - Дата перехода объекта на новую стадию')
+        self.assertEqual(mapping_by_target['deliveryType'].source, 'Тип поставки')
+        self.assertEqual(mapping_by_target['directSupply'].source, 'Сделка - Прямая поставка')
+        self.assertEqual(mapping_by_target['distributor'].source, 'Сделка - Дистрибьютор')
+        self.assertEqual(mapping_by_target['finalLicenseAmount'].source, 'Сделка - Итоговая сумма лицензий')
+        self.assertEqual(mapping_by_target['finalServiceAmount'].source, 'Сделка - Итоговая сумма услуг')
+        self.assertEqual(mapping_by_target['finalServiceAmountByRevenueWithVAT'].source, 'Сделка - Итоговая сумма услуг по выручке (с НДС)')
+        self.assertEqual(mapping_by_target['finalServiceAmountWithVAT'].source, 'Сделка - Итоговая сумма услуг (с НДС)')
+        self.assertEqual(mapping_by_target['forecast'].source, 'Сделка - Прогноз')
+        self.assertEqual(mapping_by_target['invoiceAmount'].source, 'Сумма акта')
+        self.assertEqual(mapping_by_target['invoiceAmountWithVAT'].source, 'Сумма акта (с НДС)')
+        self.assertEqual(mapping_by_target['marketingEvent'].source, 'Сделка - Маркетинговое мероприятие')
+        self.assertEqual(mapping_by_target['organization'].source, 'Сделка - Организация')
+        self.assertEqual(mapping_by_target['responsiblePerson'].source, 'Сделка - Ответственный')
+        self.assertEqual(mapping_by_target['siteLead'].source, 'Сделка - Лид с сайта')
+        self.assertEqual(mapping_by_target['stageTransitionTime'].source, 'Время перехода на текущую стадию')
+        self.assertEqual(mapping_by_target['totalProductAmount'].source, 'Сделка - Итоговая сумма продуктов')
+        self.assertEqual(mapping_by_target['unitOfMeasure'].source, 'Единица измерения')
+        self.assertEqual(warnings, [])
+
 
 if __name__ == '__main__':
     unittest.main()
