@@ -819,6 +819,12 @@ input::-ms-reveal {
   filter: brightness(1.05);
 }
 
+.download-btn.preview-json-download.ready {
+  border-color: rgba(241, 183, 82, 0.34);
+  background: linear-gradient(135deg, rgba(173, 112, 19, 0.24), rgba(196, 88, 46, 0.24));
+  box-shadow: 0 16px 34px rgba(150, 88, 21, 0.18);
+}
+
 .sidebar h2,
 .viewer-toolbar h2 {
   margin: 0;
@@ -2030,6 +2036,16 @@ input::-ms-reveal {
   min-height: var(--mapping-editor-row-height);
 }
 
+.mapping-editor-list-scroll .mapping-editor-empty-card {
+  min-height: auto;
+  margin-top: 12px;
+  padding: 18px 20px;
+  place-items: stretch;
+  align-content: start;
+  text-align: left;
+  line-height: 1.55;
+}
+
 .mapping-editor-row {
   display: grid;
   gap: 12px;
@@ -2398,6 +2414,14 @@ input::-ms-reveal {
   gap: 16px;
 }
 
+.insight-grid-primary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.insight-grid-secondary {
+  margin-top: 16px;
+}
+
 .warning-list {
   display: flex;
   flex-direction: column;
@@ -2591,6 +2615,10 @@ input::-ms-reveal {
   }
 
   .insight-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .insight-grid-primary {
     grid-template-columns: 1fr;
   }
 }

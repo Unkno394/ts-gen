@@ -7,6 +7,14 @@ export type UserProfile = {
   skipped?: boolean;
 };
 
+export type ModelTokenUsage = {
+  provider?: string | null;
+  modelName?: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
 export type HistoryItem = {
   id: string;
   createdAt: string;
@@ -19,13 +27,7 @@ export type HistoryItem = {
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
   warnings: string[];
-  tokenUsage?: {
-    provider?: string | null;
-    modelName?: string | null;
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-  } | null;
+  tokenUsage?: ModelTokenUsage | null;
   validation?: GenerationValidation | null;
 };
 
@@ -228,13 +230,7 @@ export type GenerationResult = {
   schemaFingerprintId?: number | null;
   parsedFile?: ParsedFileInfo | null;
   formExplainability?: FormExplainability | null;
-  tokenUsage?: {
-    provider?: string | null;
-    modelName?: string | null;
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-  } | null;
+  tokenUsage?: ModelTokenUsage | null;
   code: string;
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
@@ -242,6 +238,7 @@ export type GenerationResult = {
   targetSchema?: Record<string, unknown> | unknown[] | null;
   requiredFields?: string[];
   tsValid?: boolean;
+  tsCompilerAvailable?: boolean;
   tsDiagnostics?: ValidationDiagnostic[];
   previewDiagnostics?: ValidationDiagnostic[];
   mappingOperationalStatus?: OperationalMappingStatus | null;

@@ -21,7 +21,7 @@ from email_service import (
 )
 from generator import build_preview, generate_typescript
 from learning_pipeline import resolve_generation_mappings_detailed
-from model_client import begin_model_usage_capture, end_model_usage_capture, get_captured_model_usage
+from model_client import begin_model_usage_capture, end_model_usage_capture, get_captured_model_usage, suggest_tabular_source_structure, suggest_target_field_value_rows
 from models import (
     AuthPayload,
     ChangeEmailPayload,
@@ -37,6 +37,7 @@ from models import (
     RepairApplyPayload,
     RepairPreviewPayload,
     ParsedFile,
+    ParsedSheet,
     RegisterPayload,
     SourcePreviewRefreshLogPayload,
     ResetPasswordPayload,
@@ -111,6 +112,8 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 LOW_GROUP_CONFIDENCE_THRESHOLD = 0.65
 LOW_SELECTION_CONFIDENCE_THRESHOLD = 0.6
+PARSED_OVERRIDE_ALLOWED_FILE_TYPES = {'pdf', 'docx', 'txt', 'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'}
+PARSED_OVERRIDE_ALLOWED_EXTRACTION_STATUSES = {'model_structured_refresh', 'model_field_value_refresh'}
 
 
 def _model_to_dict(value: object) -> dict:
@@ -998,17 +1001,308 @@ def _build_source_quality_adjustment(mapping_explainability: dict | None) -> dic
     }
 
 
+def _looks_table_like_line(line: str) -> bool:
+    normalized = ' '.join(str(line or '').split()).strip()
+    if not normalized:
+        return False
+    if '|' in normalized or '\t' in normalized or ';' in normalized:
+        return True
+    digit_count = sum(char.isdigit() for char in normalized)
+    upper_count = sum(1 for char in normalized if char.isalpha() and char == char.upper())
+    token_count = len(normalized.split())
+    if digit_count >= 2 and token_count >= 2:
+        return True
+    if upper_count >= 2 and token_count >= 2:
+        return True
+    return False
+
+
+def _collect_model_source_refresh_chunks(parsed_file: ParsedFile) -> list[list[str]]:
+    candidate_lines: list[str] = []
+
+    if parsed_file.columns and parsed_file.rows:
+        header_line = ' | '.join(str(item).strip() for item in list(parsed_file.columns or []) if str(item).strip())
+        if header_line:
+            candidate_lines.append(header_line)
+        for row in list(parsed_file.rows or [])[:8]:
+            if not isinstance(row, dict):
+                continue
+            row_line = ' | '.join(str(row.get(column) or '').strip() for column in parsed_file.columns)
+            if row_line.strip():
+                candidate_lines.append(row_line)
+
+    for block in list(parsed_file.text_blocks or [])[:24]:
+        text = str(getattr(block, 'text', '') or '').strip()
+        if text:
+            candidate_lines.append(text)
+
+    if not candidate_lines:
+        for section in list(parsed_file.sections or [])[:8]:
+            section_text = str(getattr(section, 'text', '') or '')
+            for line in section_text.splitlines():
+                normalized = line.strip()
+                if normalized:
+                    candidate_lines.append(normalized)
+                if len(candidate_lines) >= 24:
+                    break
+            if len(candidate_lines) >= 24:
+                break
+
+    if not candidate_lines and parsed_file.raw_text:
+        for line in str(parsed_file.raw_text).splitlines():
+            normalized = line.strip()
+            if normalized:
+                candidate_lines.append(normalized)
+            if len(candidate_lines) >= 24:
+                break
+
+    filtered = [line for line in candidate_lines if _looks_table_like_line(line)]
+    if len(filtered) < 2:
+        filtered = candidate_lines[:12]
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for line in filtered:
+        current.append(line)
+        if len(current) >= 6:
+            chunks.append(current)
+            current = []
+        if len(chunks) >= 3:
+            break
+    if current and len(chunks) < 3:
+        chunks.append(current)
+    return [chunk for chunk in chunks if len(chunk) >= 2]
+
+
+def _normalize_model_source_rows(columns: list[str], rows: list[dict[str, object]]) -> list[dict[str, str]]:
+    normalized_rows: list[dict[str, str]] = []
+    for row in rows:
+        normalized_row = {column: '' if row.get(column) is None else str(row.get(column)) for column in columns}
+        if any(value.strip() for value in normalized_row.values()):
+            normalized_rows.append(normalized_row)
+    return normalized_rows[:5]
+
+
+def _build_wide_field_value_row(
+    rows: list[dict[str, object]],
+    target_fields: list[TargetField],
+) -> tuple[list[str], list[dict[str, object]]]:
+    ordered_columns = [field.name for field in target_fields if str(field.name).strip()]
+    row_payload: dict[str, object] = {}
+    for row in rows:
+        field_name = str(row.get('Field') or '').strip()
+        value = row.get('Value')
+        if not field_name or value in (None, ''):
+            continue
+        row_payload[field_name] = value
+
+    if not row_payload:
+        return [], []
+
+    columns = [column for column in ordered_columns if column in row_payload]
+    for key in row_payload:
+        if key not in columns:
+            columns.append(key)
+    return columns, [row_payload]
+
+
+def _has_usable_tabular_preview(parsed_file: ParsedFile) -> bool:
+    columns = [str(item).strip() for item in list(parsed_file.columns or []) if str(item).strip()]
+    rows = list(parsed_file.rows or [])
+    if len(columns) < 2 or not rows:
+        return False
+
+    meaningful_rows = 0
+    for row in rows[:5]:
+        if not isinstance(row, dict):
+            continue
+        non_empty_cells = sum(1 for column in columns if str(row.get(column) or '').strip())
+        if non_empty_cells >= min(2, len(columns)):
+            meaningful_rows += 1
+    return meaningful_rows > 0
+
+
+def _maybe_apply_model_field_value_refresh(
+    *,
+    parsed_file: ParsedFile,
+    target_fields: list[TargetField] | None,
+    force: bool = False,
+    selected_sheet: str | None = None,
+) -> list[str]:
+    if not target_fields:
+        return []
+    if _has_usable_tabular_preview(parsed_file) and not force:
+        return []
+    if parsed_file.file_type in {'csv', 'xlsx', 'xls', 'json'}:
+        return []
+    if not (parsed_file.raw_text or parsed_file.text_blocks or parsed_file.sections or parsed_file.columns or parsed_file.rows):
+        return []
+
+    compact_target_fields = [
+        {'name': field.name, 'type': field.type}
+        for field in list(target_fields or [])
+        if str(field.name).strip()
+    ][:20]
+    if not compact_target_fields:
+        return []
+
+    warnings: list[str] = []
+    extracted_rows: list[dict[str, Any]] = []
+    seen_fields: set[str] = set()
+    chunks = _collect_model_source_refresh_chunks(parsed_file)
+    logger.info(
+        'source-preview field-value refresh started: file=%s type=%s force=%s chunks=%d target_fields=%d',
+        parsed_file.file_name,
+        parsed_file.file_type,
+        force,
+        len(chunks),
+        len(compact_target_fields),
+    )
+    for chunk in chunks[:3]:
+        candidate_rows, candidate_warnings = suggest_target_field_value_rows(
+            lines=chunk,
+            target_fields=compact_target_fields,
+        )
+        warnings.extend(candidate_warnings)
+        for row in candidate_rows:
+            field_name = str(row.get('Field') or '').strip()
+            if not field_name or field_name in seen_fields:
+                continue
+            extracted_rows.append(row)
+            seen_fields.add(field_name)
+        if len(extracted_rows) >= min(6, len(compact_target_fields)):
+            break
+
+    columns, normalized_rows = _build_wide_field_value_row(extracted_rows, list(target_fields or []))
+    if not columns or not normalized_rows:
+        logger.info(
+            'source-preview field-value refresh produced no rows: file=%s force=%s warnings=%d',
+            parsed_file.file_name,
+            force,
+            len(warnings),
+        )
+        return warnings
+
+    parsed_file.columns = columns
+    parsed_file.rows = normalized_rows
+    parsed_file.content_type = 'table'
+    parsed_file.document_mode = 'data_table_mode'
+    parsed_file.form_model = None
+    parsed_file.extraction_status = 'model_field_value_refresh'
+    refreshed_sheet_name = str(selected_sheet or '').strip() or (parsed_file.sheets[0].name if parsed_file.sheets else 'Refreshed fields')
+    parsed_file.sheets = [
+        ParsedSheet(
+            name=refreshed_sheet_name,
+            columns=columns,
+            rows=normalized_rows,
+        )
+    ]
+    logger.info(
+        'source-preview field-value refresh applied: file=%s rows=%d force=%s',
+        parsed_file.file_name,
+        len(normalized_rows),
+        force,
+    )
+    warnings.append('Model-assisted source refresh extracted target field values from compact questionnaire fragments.')
+    return warnings
+
+
+def _maybe_apply_model_source_refresh(
+    *,
+    parsed_file: ParsedFile,
+    target_fields: list[TargetField] | None,
+    force: bool = False,
+    selected_sheet: str | None = None,
+) -> list[str]:
+    if _has_usable_tabular_preview(parsed_file) and not force:
+        return []
+    if parsed_file.file_type in {'csv', 'xlsx', 'xls', 'json'}:
+        return []
+    if not (parsed_file.raw_text or parsed_file.text_blocks or parsed_file.sections):
+        if not (parsed_file.columns and parsed_file.rows):
+            return []
+
+    target_names = [field.name for field in list(target_fields or [])]
+    warnings: list[str] = []
+    best_result: dict | None = None
+    best_score = -1.0
+    chunks = _collect_model_source_refresh_chunks(parsed_file)
+    logger.info(
+        'source-preview model refresh started: file=%s type=%s force=%s chunks=%d current_columns=%d current_rows=%d',
+        parsed_file.file_name,
+        parsed_file.file_type,
+        force,
+        len(chunks),
+        len(parsed_file.columns or []),
+        len(parsed_file.rows or []),
+    )
+    for chunk in chunks:
+        candidate, candidate_warnings = suggest_tabular_source_structure(
+            lines=chunk,
+            target_fields=target_names,
+        )
+        warnings.extend(candidate_warnings)
+        if not candidate:
+            continue
+        columns = list(candidate.get('columns') or [])
+        rows = list(candidate.get('rows') or [])
+        score = float(len(rows) * 10 + len(columns))
+        if score > best_score:
+            best_result = candidate
+            best_score = score
+
+    if not best_result:
+        logger.info(
+            'source-preview model refresh produced no table: file=%s force=%s warnings=%d',
+            parsed_file.file_name,
+            force,
+            len(warnings),
+        )
+        return warnings
+
+    columns = [str(item).strip() for item in list(best_result.get('columns') or []) if str(item).strip()]
+    rows = _normalize_model_source_rows(columns, list(best_result.get('rows') or []))
+    if not columns or not rows:
+        return warnings
+
+    parsed_file.columns = columns
+    parsed_file.rows = rows
+    parsed_file.content_type = 'table'
+    parsed_file.document_mode = 'data_table_mode'
+    parsed_file.form_model = None
+    parsed_file.extraction_status = 'model_structured_refresh'
+    refreshed_sheet_name = str(selected_sheet or '').strip() or (parsed_file.sheets[0].name if parsed_file.sheets else 'Refreshed table')
+    parsed_file.sheets = [
+        ParsedSheet(
+            name=refreshed_sheet_name,
+            columns=columns,
+            rows=rows,
+        )
+    ]
+    logger.info(
+        'source-preview model refresh applied: file=%s columns=%d rows=%d force=%s',
+        parsed_file.file_name,
+        len(columns),
+        len(rows),
+        force,
+    )
+    warnings.append('Model-assisted source refresh reconstructed a tabular preview using compact candidate fragments.')
+    return warnings
+
+
 @router.post('/source-preview')
 async def source_preview(
     file: UploadFile = File(...),
     target_json: str | None = Form(default=None),
     selected_sheet: str | None = Form(default=None),
+    force_model_refresh: bool = Form(default=False),
 ) -> dict:
     cleanup_expired_guest_files()
 
     filename = file.filename or 'uploaded_file'
     file_bytes = await file.read()
     saved_path = save_upload(file_bytes, filename, mode='guest')
+    usage_token = begin_model_usage_capture()
 
     try:
         parsed = parse_file(saved_path, filename)
@@ -1033,10 +1327,38 @@ async def source_preview(
         except ParseError as exc:
             parsed.warnings.append(f'Structure refresh fallback: {exc}')
 
+        model_refresh_warnings: list[str] = []
+        if resolved_target_fields:
+            model_refresh_warnings = _maybe_apply_model_field_value_refresh(
+                parsed_file=parsed,
+                target_fields=resolved_target_fields,
+                force=force_model_refresh,
+                selected_sheet=selected_sheet,
+            )
+        if not model_refresh_warnings:
+            model_refresh_warnings = _maybe_apply_model_source_refresh(
+                parsed_file=parsed,
+                target_fields=resolved_target_fields,
+                force=force_model_refresh,
+                selected_sheet=selected_sheet,
+            )
+        if model_refresh_warnings:
+            source_warnings = [*source_warnings, *model_refresh_warnings]
+
         if source_warnings:
             deduped_warnings = list(dict.fromkeys([*parsed.warnings, *source_warnings]))
             parsed.warnings = deduped_warnings
 
+        token_usage = end_model_usage_capture(usage_token)
+        logger.info(
+            'source-preview completed: file=%s total_tokens=%s input_tokens=%s output_tokens=%s model=%s provider=%s',
+            filename,
+            token_usage.get('total_tokens'),
+            token_usage.get('input_tokens'),
+            token_usage.get('output_tokens'),
+            token_usage.get('model_name'),
+            token_usage.get('provider'),
+        )
         try:
             saved_path.unlink(missing_ok=True)
         except PermissionError:
@@ -1044,11 +1366,14 @@ async def source_preview(
         return {
             'parsed_file': _model_to_dict(parsed),
             'form_explainability': _build_form_explainability(parsed),
+            'token_usage': token_usage,
         }
     except ParseError as exc:
+        end_model_usage_capture(usage_token)
         logger.warning('source preview parse failed: file=%s error=%s', filename, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
+        end_model_usage_capture(usage_token)
         logger.exception('source preview failed: file=%s error=%s', filename, exc)
         raise HTTPException(status_code=500, detail='Произошла внутренняя ошибка сервера. Попробуйте ещё раз.') from exc
 
@@ -1365,6 +1690,7 @@ async def generate(
     file: UploadFile = File(...),
     target_json: str = Form(...),
     selected_sheet: str | None = Form(default=None),
+    parsed_file: str | None = Form(default=None),
     keep_guest_file: bool = Form(default=False),
     current_user: dict[str, str] | None = Depends(get_optional_current_user),
 ) -> dict:
@@ -1385,7 +1711,34 @@ async def generate(
             mode=mode,
             user_id=resolved_user_id,
         )
-        parsed = parse_file(saved_path, filename)
+        if parsed_file and parsed_file.strip():
+            parsed_payload = json.loads(parsed_file)
+            parsed_candidate = coerce_parsed_file(parsed_payload)
+            if (
+                parsed_candidate.file_type in PARSED_OVERRIDE_ALLOWED_FILE_TYPES
+                and parsed_candidate.extraction_status in PARSED_OVERRIDE_ALLOWED_EXTRACTION_STATUSES
+            ):
+                parsed = parsed_candidate
+                logger.info(
+                    'generate using provided parsed_file override: file=%s content_type=%s document_mode=%s columns=%d rows=%d sheets=%d extraction_status=%s',
+                    filename,
+                    parsed.content_type,
+                    parsed.document_mode,
+                    len(parsed.columns or []),
+                    len(parsed.rows or []),
+                    len(parsed.sheets or []),
+                    parsed.extraction_status,
+                )
+            else:
+                logger.info(
+                    'generate ignored parsed_file override: file=%s file_type=%s extraction_status=%s',
+                    filename,
+                    parsed_candidate.file_type,
+                    parsed_candidate.extraction_status,
+                )
+                parsed = parse_file(saved_path, filename)
+        else:
+            parsed = parse_file(saved_path, filename)
         target_fields, target_payload, target_schema, target_schema_summary = parse_target_schema(target_json)
         source_columns, source_rows, source_warnings = resolve_generation_source(
             parsed,
@@ -1525,6 +1878,7 @@ async def generate(
             'target_schema': target_schema,
             'required_fields': target_schema_summary['required_fields'],
             'ts_valid': bool(ts_validation['valid']),
+            'ts_compiler_available': bool(ts_validation.get('compiler_available', False)),
             'ts_diagnostics': ts_validation['diagnostics'],
             'preview_diagnostics': preview_validation['diagnostics'],
             'mapping_operational_status': quality_summary['operational_mapping_status'],

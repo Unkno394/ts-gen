@@ -15,6 +15,7 @@ import type {
   RepairApplyResult,
   RepairPreviewResult,
   BackendHealth,
+  ModelTokenUsage,
   UserProfile,
 } from '../types';
 
@@ -23,6 +24,7 @@ type GenerateParams = {
   targetJson: string;
   userId?: string;
   selectedSheet?: string;
+  parsedFile?: GenerationResult['parsedFile'] | null;
 };
 
 type SourcePreviewRefreshLogParams = {
@@ -47,6 +49,7 @@ type SourceStructureRefreshParams = {
   file: File;
   targetJson?: string;
   selectedSheet?: string | null;
+  forceModelRefresh?: boolean;
 };
 
 type BackendParsedFile = {
@@ -137,6 +140,7 @@ type BackendGenerateResponse = {
   target_schema?: Record<string, unknown> | unknown[] | null;
   required_fields?: string[];
   ts_valid?: boolean;
+  ts_compiler_available?: boolean;
   ts_diagnostics?: Array<{
     path?: string;
     code?: string;
@@ -184,6 +188,11 @@ type BackendGenerateResponse = {
     affected_targets?: string[];
     strongest_penalty?: number;
   } | null;
+  validation?: {
+    ts_validation?: {
+      compiler_available?: boolean;
+    } | null;
+  } | null;
   ts_syntax_valid?: boolean;
   ts_runtime_preview_valid?: boolean;
   output_schema_valid?: boolean;
@@ -192,6 +201,13 @@ type BackendGenerateResponse = {
 type BackendSourcePreviewResponse = {
   parsed_file: BackendParsedFile;
   form_explainability?: BackendFormExplainability | null;
+  token_usage?: {
+    provider?: string | null;
+    model_name?: string | null;
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  } | null;
 };
 
 type BackendSourcePreviewLogResponse = {
@@ -1351,12 +1367,15 @@ export async function changePasswordWithBackend(params: { userId: string; curren
   return response.message;
 }
 
-export async function generateFromBackend({ file, targetJson, userId: _userId, selectedSheet }: GenerateParams): Promise<GenerationResult> {
+export async function generateFromBackend({ file, targetJson, userId: _userId, selectedSheet, parsedFile }: GenerateParams): Promise<GenerationResult> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('target_json', targetJson);
   if (selectedSheet) {
     formData.append('selected_sheet', selectedSheet);
+  }
+  if (parsedFile) {
+    formData.append('parsed_file', JSON.stringify(serializeParsedFile(parsedFile)));
   }
 
   const response = await fetchWithTimeout(
@@ -1399,6 +1418,7 @@ export async function generateFromBackend({ file, targetJson, userId: _userId, s
     targetSchema: payload.target_schema ?? null,
     requiredFields: payload.required_fields ?? [],
     tsValid: payload.ts_valid ?? false,
+    tsCompilerAvailable: payload.ts_compiler_available ?? payload.validation?.ts_validation?.compiler_available ?? undefined,
     tsDiagnostics: payload.ts_diagnostics ?? [],
     previewDiagnostics: payload.preview_diagnostics ?? [],
     mappingOperationalStatus: normalizeOperationalMappingStatus(payload.mapping_operational_status ?? payload.mapping_quality),
@@ -1444,6 +1464,7 @@ export async function fetchBackendHealth(): Promise<BackendHealth> {
 export async function refreshSourceStructureFromBackend(params: SourceStructureRefreshParams): Promise<{
   parsedFile: ReturnType<typeof normalizeParsedFile>;
   formExplainability: FormExplainability | null;
+  tokenUsage: ModelTokenUsage | null;
 }> {
   const formData = new FormData();
   formData.append('file', params.file);
@@ -1452,6 +1473,9 @@ export async function refreshSourceStructureFromBackend(params: SourceStructureR
   }
   if (params.selectedSheet?.trim()) {
     formData.append('selected_sheet', params.selectedSheet);
+  }
+  if (params.forceModelRefresh) {
+    formData.append('force_model_refresh', 'true');
   }
 
   const response = await fetchWithTimeout(
@@ -1467,6 +1491,15 @@ export async function refreshSourceStructureFromBackend(params: SourceStructureR
   return {
     parsedFile: normalizeParsedFile(payload.parsed_file),
     formExplainability: normalizeFormExplainability(payload.form_explainability),
+    tokenUsage: payload.token_usage
+      ? {
+          provider: payload.token_usage.provider ?? null,
+          modelName: payload.token_usage.model_name ?? null,
+          inputTokens: payload.token_usage.input_tokens ?? 0,
+          outputTokens: payload.token_usage.output_tokens ?? 0,
+          totalTokens: payload.token_usage.total_tokens ?? 0,
+        }
+      : null,
   };
 }
 

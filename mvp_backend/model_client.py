@@ -409,6 +409,175 @@ def suggest_draft_json_fields(
     return normalized, warnings
 
 
+def suggest_tabular_source_structure(
+    *,
+    lines: list[str],
+    target_fields: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not _model_enabled():
+        logger.info(
+            'llm source-structure skipped: model runtime disabled provider=%s base_url=%s model=%s',
+            _get_model_runtime_config()['provider'],
+            _get_model_runtime_config()['base_url'],
+            _get_model_runtime_config()['model_name'],
+        )
+        return None, []
+
+    compact_lines = [str(line).strip() for line in lines if str(line).strip()][:12]
+    if len(compact_lines) < 2:
+        return None, []
+
+    runtime = _get_model_runtime_config()
+    payload = {
+        'task': 'source_structure_normalization',
+        'lines': compact_lines,
+        'target_fields': [str(field).strip() for field in (target_fields or []) if str(field).strip()][:12],
+        'output_schema': {
+            'table_like': 'boolean',
+            'columns': ['string'],
+            'rows': [{'column': 'value'}],
+            'confidence': 'high|medium|low',
+            'reason': 'short_reason',
+        },
+    }
+    instructions = (
+        'You normalize a small document fragment into a table preview. '
+        'Return only strict JSON. '
+        'Use only the provided lines. '
+        'If the fragment is not clearly tabular, return table_like false with empty columns and rows. '
+        'Do not invent rows that are not supported by the text. '
+        'Keep column names short and stable.'
+    )
+    raw_response, warnings = _call_model_as_json(
+        instructions=instructions,
+        payload=payload,
+        max_tokens=min(runtime['draft_max_tokens'], 220),
+    )
+    if not isinstance(raw_response, dict):
+        return None, warnings
+
+    if not bool(raw_response.get('table_like')):
+        return None, warnings
+
+    raw_columns = raw_response.get('columns')
+    raw_rows = raw_response.get('rows')
+    if not isinstance(raw_columns, list) or not isinstance(raw_rows, list):
+        return None, warnings + ['Модель вернула некорректный формат source structure.']
+
+    columns: list[str] = []
+    for item in raw_columns:
+        name = str(item or '').strip()
+        if name and name not in columns:
+            columns.append(name)
+    if not columns:
+        return None, warnings
+
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows[:8]:
+        if not isinstance(row, dict):
+            continue
+        normalized_row: dict[str, Any] = {}
+        for column in columns:
+            normalized_row[column] = row.get(column)
+        if any(value not in (None, '') for value in normalized_row.values()):
+            rows.append(normalized_row)
+
+    if not rows:
+        return None, warnings
+
+    return {
+        'columns': columns,
+        'rows': rows,
+        'confidence': _normalize_confidence(raw_response.get('confidence')),
+        'reason': str(raw_response.get('reason') or 'source_structure_model'),
+        'input_lines': compact_lines,
+    }, warnings
+
+
+def suggest_target_field_value_rows(
+    *,
+    lines: list[str],
+    target_fields: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not _model_enabled():
+        logger.info(
+            'llm field-value refresh skipped: model runtime disabled provider=%s base_url=%s model=%s',
+            _get_model_runtime_config()['provider'],
+            _get_model_runtime_config()['base_url'],
+            _get_model_runtime_config()['model_name'],
+        )
+        return [], []
+
+    compact_lines = [str(line).strip() for line in lines if str(line).strip()][:8]
+    compact_fields = [
+        {
+            'name': str(item.get('name') or '').strip(),
+            'type': str(item.get('type') or 'string').strip() or 'string',
+        }
+        for item in target_fields
+        if str(item.get('name') or '').strip()
+    ][:20]
+    if len(compact_lines) < 2 or not compact_fields:
+        return [], []
+
+    runtime = _get_model_runtime_config()
+    payload = {
+        'task': 'field_value_extraction',
+        'lines': compact_lines,
+        'target_fields': compact_fields,
+        'output_schema': {
+            'rows': [
+                {
+                    'Field': 'target field name from target_fields only',
+                    'Value': 'string|number|boolean|null',
+                    'confidence': 'high|medium|low',
+                }
+            ],
+        },
+    }
+    instructions = (
+        'You extract only explicit field values from a small questionnaire fragment. '
+        'Return only strict JSON. '
+        'Use only target field names from target_fields. '
+        'Do not invent fields. '
+        'If a value is not explicit in the text, do not return that field. '
+        'Keep the answer compact.'
+    )
+    raw_response, warnings = _call_model_as_json(
+        instructions=instructions,
+        payload=payload,
+        max_tokens=min(runtime['mapping_max_tokens'], 180),
+    )
+    if not isinstance(raw_response, dict):
+        return [], warnings
+
+    raw_rows = raw_response.get('rows')
+    if not isinstance(raw_rows, list):
+        return [], warnings
+
+    valid_fields = {item['name'] for item in compact_fields}
+    normalized_rows: list[dict[str, Any]] = []
+    seen_fields: set[str] = set()
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        field_name = str(item.get('Field') or item.get('field') or '').strip()
+        if field_name not in valid_fields or field_name in seen_fields:
+            continue
+        value = item.get('Value') if 'Value' in item else item.get('value')
+        if value in (None, ''):
+            continue
+        normalized_rows.append(
+            {
+                'Field': field_name,
+                'Value': value,
+                'confidence': _normalize_confidence(item.get('confidence')),
+            }
+        )
+        seen_fields.add(field_name)
+    return normalized_rows, warnings
+
+
 def suggest_form_field_repair(
     *,
     target_field: str,

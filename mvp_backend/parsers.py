@@ -1672,6 +1672,7 @@ def parse_target_schema(
     target_json_raw: str,
 ) -> tuple[list[TargetField], dict[str, Any] | list[Any], dict[str, Any], dict[str, Any]]:
     payload, duplicate_keys = _load_target_json_with_duplicate_tracking(target_json_raw)
+    payload = _unwrap_target_payload(payload)
 
     if duplicate_keys:
         duplicates = ', '.join(sorted(set(duplicate_keys)))
@@ -1692,6 +1693,31 @@ def parse_target_schema(
     return target_fields, payload, target_schema, schema_summary
 
 
+def _unwrap_target_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict) or len(payload) != 1:
+        return payload
+
+    key, value = next(iter(payload.items()))
+    normalized_key = str(key).strip().casefold()
+    if normalized_key not in {'input', 'items', 'rows', 'data'}:
+        return payload
+    if not isinstance(value, list):
+        return payload
+    if not value:
+        return value
+    if all(isinstance(item, dict) for item in value):
+        return value
+    return payload
+
+
+def _normalize_relaxed_target_json(target_json_raw: str) -> str:
+    normalized = str(target_json_raw or '').strip()
+    if normalized.startswith('\ufeff'):
+        normalized = normalized.lstrip('\ufeff').strip()
+    normalized = re.sub(r',(\s*[}\]])', r'\1', normalized)
+    return normalized
+
+
 def _load_target_json_with_duplicate_tracking(target_json_raw: str) -> tuple[Any, list[str]]:
     duplicate_keys: list[str] = []
 
@@ -1707,7 +1733,14 @@ def _load_target_json_with_duplicate_tracking(target_json_raw: str) -> tuple[Any
     try:
         payload = json.loads(target_json_raw, object_pairs_hook=_object_pairs_hook)
     except json.JSONDecodeError as exc:
-        raise ParseError(f'Invalid target JSON: {exc}') from exc
+        normalized = _normalize_relaxed_target_json(target_json_raw)
+        if normalized != str(target_json_raw):
+            try:
+                payload = json.loads(normalized, object_pairs_hook=_object_pairs_hook)
+            except json.JSONDecodeError:
+                raise ParseError(f'Invalid target JSON: {exc}') from exc
+        else:
+            raise ParseError(f'Invalid target JSON: {exc}') from exc
 
     return payload, duplicate_keys
 
@@ -1768,6 +1801,13 @@ def _merge_array_item_schemas(item_schemas: list[dict[str, Any]], *, path: str) 
     merged['nullable'] = bool(merged.get('nullable')) or nullable
 
     for schema in non_null_schemas[1:]:
+        if merged.get('type') == 'any':
+            merged = deepcopy(schema)
+            merged['nullable'] = bool(merged.get('nullable')) or nullable
+            continue
+        if schema.get('type') == 'any':
+            merged['nullable'] = bool(merged.get('nullable')) or nullable
+            continue
         if merged.get('type') != schema.get('type'):
             raise ParseError(f'Target JSON contains conflicting array item types at {path}.')
         if merged.get('type') == 'object':
@@ -1803,6 +1843,14 @@ def _merge_object_schemas(left: dict[str, Any], right: dict[str, Any], *, path: 
             merged_properties[key] = deepcopy(left_schema)
             continue
         if left_schema.get('type') != right_schema.get('type'):
+            if left_schema.get('type') == 'any':
+                merged_properties[key] = deepcopy(right_schema)
+                merged_properties[key]['nullable'] = bool(left_schema.get('nullable')) or bool(right_schema.get('nullable'))
+                continue
+            if right_schema.get('type') == 'any':
+                merged_properties[key] = deepcopy(left_schema)
+                merged_properties[key]['nullable'] = bool(left_schema.get('nullable')) or bool(right_schema.get('nullable'))
+                continue
             raise ParseError(f'Target JSON contains conflicting types for "{key}" at {child_path}.')
         if left_schema.get('type') == 'object':
             merged_properties[key] = _merge_object_schemas(left_schema, right_schema, path=child_path)

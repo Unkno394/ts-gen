@@ -36,7 +36,6 @@ import {
   fetchRepairPreviewFromBackend,
   fetchLearningEvents,
   fetchLearningMemory,
-  fetchBackendHealth,
   fetchSourcePreviewFromBackend,
   generateDraftJsonFromBackend,
   generateFromBackend,
@@ -50,12 +49,12 @@ import {
 } from '../lib/api';
 import type {
   DraftFieldSuggestion,
-  BackendHealth,
   FormRepairAction,
   GenerationResult,
   HistoryItem,
   LearningEvent,
   LearningMemory,
+  ModelTokenUsage,
   OperationalMappingStatus,
   ManualCorrectionInput,
   MappingInfo,
@@ -595,8 +594,77 @@ function getExtractedFieldEntries(parsedFile: ParsedFileInfo | null): Array<{ ki
 
 function collectParsedSourceColumns(parsedFile: ParsedFileInfo | null, currentPreviewSheet: ParsedSheetInfo | null): string[] {
   const columns = currentPreviewSheet?.columns ?? parsedFile?.columns ?? [];
-  const extractedFields = getExtractedFieldEntries(parsedFile).map((entry) => entry.label);
-  return Array.from(new Set([...columns, ...extractedFields]));
+  return Array.from(new Set(columns.filter((column) => String(column).trim().length > 0)));
+}
+
+function detectCsvDelimiter(lines: string[]): string {
+  const candidates = [';', ',', '\t'];
+  let bestDelimiter = ',';
+  let bestScore = -1;
+
+  for (const delimiter of candidates) {
+    const counts = lines
+      .slice(0, 5)
+      .map((line) => line.split(delimiter).length)
+      .filter((count) => count > 1);
+    if (counts.length === 0) {
+      continue;
+    }
+    const minCount = Math.min(...counts);
+    const maxCount = Math.max(...counts);
+    const score = minCount * 10 - (maxCount - minCount);
+    if (score > bestScore) {
+      bestScore = score;
+      bestDelimiter = delimiter;
+    }
+  }
+
+  return bestDelimiter;
+}
+
+function parseCsvLine(line: string, delimiter: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        current += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === delimiter && !inQuotes) {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  cells.push(current.trim());
+  return cells;
+}
+
+function shouldUseParsedFileOverride(parsedFile: ParsedFileInfo | null): boolean {
+  if (!parsedFile) {
+    return false;
+  }
+  if (['csv', 'xlsx', 'xls'].includes(parsedFile.extension)) {
+    return false;
+  }
+  if (!['pdf', 'docx', 'txt', 'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'].includes(parsedFile.extension)) {
+    return false;
+  }
+  return ['model_structured_refresh', 'model_field_value_refresh'].includes(parsedFile.extractionStatus);
 }
 
 function preferredSourceStructureTab(parsedFile: ParsedFileInfo | null): SourceStructureTab {
@@ -857,10 +925,11 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
   if (extension === 'csv') {
     const text = await file.text();
     const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
+    const delimiter = detectCsvDelimiter(lines);
     const [headerLine = '', ...dataLines] = lines;
-    const columns = headerLine ? headerLine.split(',').map((item) => item.trim()) : [];
+    const columns = headerLine ? parseCsvLine(headerLine, delimiter) : [];
     const rows = dataLines.slice(0, 8).map((line) => {
-      const cells = line.split(',');
+      const cells = parseCsvLine(line, delimiter);
       return Object.fromEntries(columns.map((column, index) => [column, cells[index] ?? '']));
     });
 
@@ -1008,17 +1077,56 @@ function detachGenerationLinkFromSectionState(state: SectionWorkspaceState, gene
   };
 }
 
+function normalizeLooseJsonInput(value: string): string {
+  const withoutBom = value.replace(/^\uFEFF/, '').trim();
+  return withoutBom.replace(/,(\s*[}\]])/g, '$1');
+}
+
+function tryNormalizeJsonText(value: string): string | null {
+  const normalized = normalizeLooseJsonInput(value);
+  try {
+    const parsed = JSON.parse(normalized);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function unwrapTargetSchemaRoot(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length !== 1) {
+    return value;
+  }
+  const [key, nested] = entries[0];
+  const normalizedKey = key.trim().toLowerCase();
+  if (!['input', 'items', 'rows', 'data'].includes(normalizedKey)) {
+    return value;
+  }
+  if (Array.isArray(nested)) {
+    const firstObject = nested.find((item) => isObjectRecord(item));
+    return firstObject ?? value;
+  }
+  return value;
+}
+
+function isWrapperTargetField(name: string): boolean {
+  return ['input', 'items', 'rows', 'data'].includes(name.trim().toLowerCase());
+}
+
 function parseSchemaFields(schemaText: string): string[] {
   try {
-    const parsed = JSON.parse(schemaText) as Record<string, unknown> | Array<Record<string, unknown>>;
+    const parsed = unwrapTargetSchemaRoot(JSON.parse(normalizeLooseJsonInput(schemaText))) as Record<string, unknown> | Array<Record<string, unknown>>;
     if (Array.isArray(parsed)) {
       const firstObject = parsed.find((item) => isObjectRecord(item));
-      return firstObject ? Object.keys(firstObject) : [];
+      return firstObject ? Object.keys(firstObject).filter((key) => !isWrapperTargetField(key)) : [];
     }
     if (!parsed || typeof parsed !== 'object') {
       return [];
     }
-    return Object.keys(parsed);
+    return Object.keys(parsed).filter((key) => !isWrapperTargetField(key));
   } catch {
     return [];
   }
@@ -1026,7 +1134,7 @@ function parseSchemaFields(schemaText: string): string[] {
 
 function parseMaybeJson(value: string): unknown {
   try {
-    return JSON.parse(value);
+    return JSON.parse(normalizeLooseJsonInput(value));
   } catch {
     return value;
   }
@@ -1156,6 +1264,59 @@ function validationStateLabel(valid: boolean | undefined, okText = 'OK', failTex
 
 function validationStateTone(valid: boolean | undefined): string {
   return valid ? 'success' : 'danger';
+}
+
+function tsSyntaxState(result: GenerationResult): 'valid' | 'invalid' | 'unavailable' {
+  if (result.tsCompilerAvailable === false) {
+    return 'unavailable';
+  }
+  if (result.tsCompilerAvailable === undefined) {
+    const hasCompilerUnavailableDiagnostic = (result.tsDiagnostics ?? []).some((item) => item.code === 'compiler_unavailable');
+    if (hasCompilerUnavailableDiagnostic) {
+      return 'unavailable';
+    }
+  }
+  return result.tsSyntaxValid ? 'valid' : 'invalid';
+}
+
+function tsSyntaxStateLabel(state: 'valid' | 'invalid' | 'unavailable'): string {
+  if (state === 'valid') {
+    return 'Компилируется';
+  }
+  if (state === 'unavailable') {
+    return 'Компилятор недоступен';
+  }
+  return 'Есть ошибки';
+}
+
+function tsSyntaxStateTone(state: 'valid' | 'invalid' | 'unavailable'): string {
+  if (state === 'valid') {
+    return 'success';
+  }
+  if (state === 'unavailable') {
+    return 'neutral';
+  }
+  return 'danger';
+}
+
+function tsSyntaxStateBadge(state: 'valid' | 'invalid' | 'unavailable'): string {
+  if (state === 'valid') {
+    return 'valid';
+  }
+  if (state === 'unavailable') {
+    return 'not checked';
+  }
+  return 'invalid';
+}
+
+function tsSyntaxStateHint(state: 'valid' | 'invalid' | 'unavailable'): string {
+  if (state === 'valid') {
+    return 'compiler check пройден';
+  }
+  if (state === 'unavailable') {
+    return 'TypeScript compiler недоступен в текущем runtime';
+  }
+  return 'compiler diagnostics доступны ниже';
 }
 
 function formatRatio(value: number | undefined | null): string {
@@ -1465,8 +1626,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [historyClearDialogOpen, setHistoryClearDialogOpen] = useState(false);
   const [historyDeleteError, setHistoryDeleteError] = useState('');
   const [saveMessage, setSaveMessage] = useState('');
-  const [dragActive, setDragActive] = useState(false);
+  const [sourceDragActive, setSourceDragActive] = useState(false);
+  const [targetJsonDragActive, setTargetJsonDragActive] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [previewCopied, setPreviewCopied] = useState(false);
   const [activePreviewSheet, setActivePreviewSheet] = useState<string | null>(null);
   const [sourceStructureTab, setSourceStructureTab] = useState<SourceStructureTab>('tables');
   const [activeView, setActiveView] = useState<'generator' | 'profile'>('generator');
@@ -1521,18 +1684,19 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [sourcePreviewRefreshNotice, setSourcePreviewRefreshNotice] = useState('');
   const [sourcePreviewRefreshError, setSourcePreviewRefreshError] = useState('');
   const [sourcePreviewRefreshDone, setSourcePreviewRefreshDone] = useState(false);
+  const [sourcePreviewTokenUsage, setSourcePreviewTokenUsage] = useState<ModelTokenUsage | null>(null);
   const [activeRepairActionKey, setActiveRepairActionKey] = useState<string | null>(null);
   const [repairPreview, setRepairPreview] = useState<RepairPreviewResult | null>(null);
   const [sectionStateCache, setSectionStateCache] = useState<Record<string, SectionWorkspaceState>>({});
   const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
   const [profileAccountCardHeight, setProfileAccountCardHeight] = useState<number | null>(null);
-  const [backendHealth, setBackendHealth] = useState<BackendHealth | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
   const sourcePreviewRefreshTimerRef = useRef<number | null>(null);
   const previewGridWrapRef = useRef<HTMLDivElement | null>(null);
   const profileAccountCardRef = useRef<HTMLElement | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
+  const hasPreviewResult = result.preview.length > 0;
   const currentFormExplainability = result.formExplainability ?? null;
   const currentRepairPlan = currentFormExplainability?.repairPlan ?? null;
   const currentRepairActions = currentRepairPlan?.actions ?? [];
@@ -1540,8 +1704,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const currentFormRedFlags = currentFormQuality?.redFlags ?? [];
   const currentPdfZoneSummary = currentFormExplainability?.pdfZoneSummary ?? null;
   const currentOcrZoneSummary = currentFormExplainability?.ocrZoneSummary ?? null;
-  const visibleTsDiagnostics = (result.tsDiagnostics ?? []).filter((diagnostic) => Boolean(diagnostic?.message));
-  const visiblePreviewDiagnostics = (result.previewDiagnostics ?? []).filter((diagnostic) => Boolean(diagnostic?.message));
 
   const refreshLearningData = async () => {
     if (profile.skipped) {
@@ -1581,12 +1743,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [historyClearDialogOpen, historyDeleteBusyId, historyDeleteTarget]);
-
-  useEffect(() => {
-    void fetchBackendHealth()
-      .then((health) => setBackendHealth(health))
-      .catch(() => setBackendHealth(null));
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -1714,13 +1870,11 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const mappingTargetOptions = useMemo(() => {
     const options = schemaTargetFields.length > 0 ? schemaTargetFields : result.mappings.map((mapping) => mapping.target);
-    return Array.from(new Set(options.filter(Boolean)));
+    return Array.from(new Set(options.filter((option) => Boolean(option) && !isWrapperTargetField(String(option)))));
   }, [result.mappings, schemaTargetFields]);
 
   const mappingSourceOptions = useMemo(() => {
-    const sourceColumns = collectParsedSourceColumns(parsedFile, currentPreviewSheet);
-    const currentSources = result.mappings.map((mapping) => mapping.source).filter((value) => value && value !== 'not found');
-    return Array.from(new Set([...sourceColumns, ...currentSources])) as string[];
+    return collectParsedSourceColumns(parsedFile, currentPreviewSheet);
   }, [currentPreviewSheet, parsedFile, result.mappings]);
 
   const hasReviewableMappings = useMemo(() => {
@@ -1744,6 +1898,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   }, [draftReviewNotes, draftSuggestions]);
 
   const currentGenerationTokenUsage = result.tokenUsage ?? null;
+  const currentSourceRefreshTokenUsage = sourcePreviewTokenUsage;
 
   const sortedMappingRows = useMemo(() => {
     return result.mappings
@@ -2137,6 +2292,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       targetSchema: item.validation?.targetSchema ?? null,
       requiredFields: item.validation?.targetSchemaSummary?.requiredFields ?? [],
       tsValid: item.validation?.tsValidation?.valid ?? false,
+      tsCompilerAvailable: item.validation?.tsValidation?.compilerAvailable,
       tsDiagnostics: item.validation?.tsValidation?.diagnostics ?? [],
       previewDiagnostics: item.validation?.previewValidation?.diagnostics ?? [],
       mappingOperationalStatus: item.validation?.qualitySummary?.operationalMappingStatus ?? null,
@@ -2558,20 +2714,27 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
     try {
       const content = await file.text();
-      JSON.parse(content);
+      const normalizedContent = tryNormalizeJsonText(content);
+      if (!normalizedContent) {
+        throw new Error('Не удалось прочитать JSON-файл. Проверьте синтаксис.');
+      }
       invalidateGeneratedResult();
       setUploadedTargetJson({
         fileName: file.name,
-        content,
+        content: normalizedContent,
       });
       setTargetJsonPrepared(true);
-      setSchema(content);
+      setSchema(normalizedContent);
       setDraftSuggestions([]);
       setDraftReviewNotes({});
       setDraftJsonNotice('');
       setDraftJsonError('');
       setDraftJsonSaved(false);
-      setTargetJsonUploadNotice('JSON загружен в Target JSON. Draft JSON по источнику временно отключен.');
+      setTargetJsonUploadNotice(
+        normalizedContent !== content.trim()
+          ? 'JSON загружен и автоматически исправлен в Target JSON. Draft JSON по источнику временно отключен.'
+          : 'JSON загружен в Target JSON. Draft JSON по источнику временно отключен.'
+      );
     } catch (error) {
       setTargetJsonUploadNotice('');
       setTargetJsonUploadError(error instanceof Error ? error.message : 'Не удалось загрузить JSON-файл.');
@@ -2586,33 +2749,118 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     if (uploadedTargetJson && nextSchema !== uploadedTargetJson.content) {
       clearUploadedTargetJson();
     }
+    const normalizedSchema = tryNormalizeJsonText(nextSchema);
     setSchema(nextSchema);
-  };
-
-  const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragActive(true);
-  };
-
-  const onDragOver = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    if (!dragActive) {
-      setDragActive(true);
+    setTargetJsonPrepared(normalizedSchema !== null);
+    if (targetJsonUploadError) {
+      setTargetJsonUploadError('');
     }
   };
 
-  const onDragLeave = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-    setDragActive(false);
+  const onSchemaBlur = () => {
+    const normalizedSchema = tryNormalizeJsonText(schema);
+    if (normalizedSchema && normalizedSchema !== schema) {
+      setSchema(normalizedSchema);
+      setTargetJsonPrepared(true);
+      setTargetJsonUploadNotice('Target JSON автоматически приведён к корректному формату.');
+      setTargetJsonUploadError('');
+    }
   };
 
-  const onDrop = async (event: DragEvent<HTMLDivElement>) => {
+  const isJsonFile = (file: File | null | undefined) => {
+    if (!file) {
+      return false;
+    }
+    const lowerName = file.name.toLowerCase();
+    return lowerName.endsWith('.json') || file.type === 'application/json';
+  };
+
+  const onSourceDragEnter = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
-    setDragActive(false);
+    setSourceDragActive(true);
+  };
+
+  const onSourceDragOver = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    if (!sourceDragActive) {
+      setSourceDragActive(true);
+    }
+  };
+
+  const onSourceDragLeave = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setSourceDragActive(false);
+  };
+
+  const onSourceDrop = async (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    setSourceDragActive(false);
     const file = event.dataTransfer.files?.[0];
-    if (!file) return;
+    if (!file || isJsonFile(file)) {
+      return;
+    }
     await handleSelectedFile(file);
+  };
+
+  const onTargetJsonDragEnter = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    setTargetJsonDragActive(true);
+  };
+
+  const onTargetJsonDragOver = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    if (!targetJsonDragActive) {
+      setTargetJsonDragActive(true);
+    }
+  };
+
+  const onTargetJsonDragLeave = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setTargetJsonDragActive(false);
+  };
+
+  const onTargetJsonDrop = async (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    setTargetJsonDragActive(false);
+    const file = event.dataTransfer.files?.[0];
+    if (!file || !isJsonFile(file)) {
+      setTargetJsonUploadNotice('');
+      setTargetJsonUploadError('Зона Target JSON принимает только .json файл.');
+      return;
+    }
+    await (async () => {
+      setTargetJsonUploadNotice('');
+      setTargetJsonUploadError('');
+      try {
+        const content = await file.text();
+        const normalizedContent = tryNormalizeJsonText(content);
+        if (!normalizedContent) {
+          throw new Error('Не удалось прочитать JSON-файл. Проверьте синтаксис.');
+        }
+        invalidateGeneratedResult();
+        setUploadedTargetJson({
+          fileName: file.name,
+          content: normalizedContent,
+        });
+        setTargetJsonPrepared(true);
+        setSchema(normalizedContent);
+        setDraftSuggestions([]);
+        setDraftReviewNotes({});
+        setDraftJsonNotice('');
+        setDraftJsonError('');
+        setDraftJsonSaved(false);
+        setTargetJsonUploadNotice(
+          normalizedContent !== content.trim()
+            ? 'JSON загружен и автоматически исправлен в Target JSON. Draft JSON по источнику временно отключен.'
+            : 'JSON загружен в Target JSON. Draft JSON по источнику временно отключен.'
+        );
+      } catch (error) {
+        setTargetJsonUploadNotice('');
+        setTargetJsonUploadError(error instanceof Error ? error.message : 'Не удалось загрузить JSON-файл.');
+      }
+    })();
   };
 
   const captureCurrentSectionState = (): SectionWorkspaceState =>
@@ -2762,6 +3010,23 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       return;
     }
 
+    const normalizedSchema = tryNormalizeJsonText(schema);
+    if (!normalizedSchema) {
+      setAutoGenerateSectionKey(null);
+      setResult({
+        code: defaultCode,
+        mappings: [],
+        preview: [],
+        warnings: ['Target JSON не удалось привести к корректному формату.'],
+      });
+      return;
+    }
+    if (normalizedSchema !== schema) {
+      setSchema(normalizedSchema);
+      setTargetJsonUploadNotice('Target JSON автоматически приведён к корректному формату перед генерацией.');
+      setTargetJsonUploadError('');
+    }
+
     setBusy(true);
     setDraftSuggestions([]);
     setMappingReviewNotes({});
@@ -2779,9 +3044,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     try {
       const generated = await generateFromBackend({
         file: selectedFile,
-        targetJson: schema,
+        targetJson: normalizedSchema,
         userId: profile.skipped ? undefined : profile.id,
         selectedSheet: parsedFile?.sheets.length ? currentPreviewSheet?.name : undefined,
+        parsedFile: shouldUseParsedFileOverride(parsedFile) ? parsedFile : null,
       });
 
       setParsedFile(generated.parsedFile ?? parsedFile);
@@ -2862,9 +3128,13 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         file: selectedFile,
         targetJson: schema,
         selectedSheet: previousPreferredSheetName,
+        forceModelRefresh: true,
       });
       const refreshed = refreshedResponse.parsedFile;
       const refreshSummary = describeSourceStructureRefresh(previousParsedFile, refreshed, previousPreferredSheetName);
+      const refreshMessage = refreshedResponse.tokenUsage
+        ? `${refreshSummary.message} · токены ${refreshedResponse.tokenUsage.totalTokens.toLocaleString('ru-RU')}`
+        : refreshSummary.message;
 
       setParsedFile(refreshed);
       setResult((current) => ({
@@ -2874,6 +3144,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       }));
       setActivePreviewSheet(refreshSummary.nextActiveSheetName);
       setSourceStructureTab(preferredSourceStructureTab(refreshed));
+      setSourcePreviewTokenUsage(refreshedResponse.tokenUsage ?? null);
       setSectionStateCache({});
       setAutoGenerateSectionKey(null);
       setActiveRepairActionKey(null);
@@ -2900,7 +3171,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         setSourcePreviewRefreshDone(false);
         sourcePreviewRefreshTimerRef.current = null;
       }, 1800);
-      setSourcePreviewRefreshNotice(refreshSummary.message);
+      setSourcePreviewRefreshNotice(refreshMessage);
     } catch (error) {
       setSourcePreviewRefreshDone(false);
       setSourcePreviewRefreshError(error instanceof Error ? error.message : 'Не удалось перегенерировать структуру источника.');
@@ -3427,6 +3698,44 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
   };
 
+  const onCopyPreviewJson = async () => {
+    if (!hasPreviewResult) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(result.preview, null, 2));
+      setPreviewCopied(true);
+      window.setTimeout(() => setPreviewCopied(false), 1400);
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  const onDownloadPreviewJson = async () => {
+    if (!hasPreviewResult) return;
+
+    const previewJson = JSON.stringify(result.preview, null, 2);
+    const suggestedName = `${parsedFile?.fileName?.split('.')?.[0] ?? 'preview'}.preview.json`;
+
+    if (window.electronAPI) {
+      const saved = await window.electronAPI.saveGeneratedFile({
+        code: previewJson,
+        suggestedName,
+      });
+      if (!saved.canceled && saved.filePath) {
+        setSaveMessage(`Файл сохранен: ${saved.filePath}`);
+      }
+      return;
+    }
+
+    const blob = new Blob([previewJson], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = suggestedName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setSaveMessage('Preview JSON скачан через браузер.');
+  };
+
   const resetEmailChangeState = () => {
     setNewEmail('');
     setEmailPassword('');
@@ -3579,13 +3888,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   void activeRepairActionKey;
 
   return (
-    <div
-      className="workspace-stage"
-      onDragEnter={onDragEnter}
-      onDragLeave={onDragLeave}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
-    >
+    <div className="workspace-stage">
       <VibeBackground className="workspace-scene" baseScale={1.08} energy={0.26} lite staticFrame />
       <div className="workspace-overlay" />
 
@@ -3617,23 +3920,26 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                 <Sparkles size={16} /> Генерация
               </div>
 
-              <label className={dragActive ? 'upload-zone drag-active' : 'upload-zone'}>
+              <label
+                className={sourceDragActive ? 'upload-zone drag-active' : 'upload-zone'}
+                onDragEnter={onSourceDragEnter}
+                onDragLeave={onSourceDragLeave}
+                onDragOver={onSourceDragOver}
+                onDrop={onSourceDrop}
+              >
                 <input accept=".csv,.xlsx,.xls,.pdf,.docx,.txt,.png,.jpg,.jpeg,.bmp,.gif,.tif,.tiff,.webp" hidden onChange={onFileChange} type="file" />
                 <Upload size={18} />
                 <strong>Загрузить CSV/XLSX/PDF/DOCX/TXT/IMG</strong>
                 <span>{fileSummary}</span>
               </label>
-              <div className="subtle-text" style={{ marginTop: 8 }}>
-                OCR service:{' '}
-                <strong>
-                  {backendHealth?.ocrService?.status === 'ok' && backendHealth?.ocrService?.paddleocrAvailable
-                    ? 'available'
-                    : 'unavailable'}
-                </strong>
-                {parsedFile?.ocrUsed ? ' · OCR used for current source' : ''}
-              </div>
 
-              <label className="upload-zone upload-zone-target-json">
+              <label
+                className={targetJsonDragActive ? 'upload-zone upload-zone-target-json drag-active' : 'upload-zone upload-zone-target-json'}
+                onDragEnter={onTargetJsonDragEnter}
+                onDragLeave={onTargetJsonDragLeave}
+                onDragOver={onTargetJsonDragOver}
+                onDrop={onTargetJsonDrop}
+              >
                 <input accept=".json,application/json" hidden onChange={onTargetJsonFileChange} type="file" />
                 <Upload size={18} />
                 <strong>Загрузить JSON</strong>
@@ -3645,7 +3951,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
               <div className="field-block">
                 <div className="field-caption">Target JSON</div>
-                <textarea className="editor-area schema-editor-area" onChange={onSchemaChange} value={schema} />
+                <textarea className="editor-area schema-editor-area" onBlur={onSchemaBlur} onChange={onSchemaChange} value={schema} />
               </div>
 
               <div className="generator-action-row">
@@ -3670,6 +3976,14 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                 type="button"
               >
                 <Download size={16} /> Скачать .ts
+              </button>
+              <button
+                className={hasPreviewResult ? 'download-btn preview-json-download ready' : 'download-btn preview-json-download'}
+                disabled={!hasPreviewResult}
+                onClick={onDownloadPreviewJson}
+                type="button"
+              >
+                <Download size={16} /> Скачать Preview JSON
               </button>
               {false && !profile.skipped && (
                 <div className="learning-status-stack">
@@ -3942,10 +4256,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
               </div>
 
-              <div className="insight-grid">
+              <div className="insight-grid insight-grid-primary">
                 <section className="insight-card">
-                  <div className="pane-header">
-                    <Sparkles size={16} /> Preview JSON
+                  <div className="pane-header pane-header-with-action">
+                    <span className="pane-header-label">
+                      <Sparkles size={16} /> Preview JSON
+                    </span>
+                    <button className="icon-btn copy-code-btn" disabled={!hasPreviewResult} onClick={onCopyPreviewJson} title="Скопировать Preview JSON" type="button">
+                      {previewCopied ? <Check size={16} /> : <Copy size={16} />}
+                    </button>
                   </div>
                   <pre className="preview-pane">{JSON.stringify(result.preview, null, 2)}</pre>
                 </section>
@@ -3969,10 +4288,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     </div>
                     <div className="generation-quality-item">
                       <span>TS syntax</span>
-                      <strong>{validationStateLabel(result.tsSyntaxValid, 'Компилируется', 'Есть ошибки')}</strong>
-                      <small>{result.tsValid ? 'compiler check пройден' : 'compiler diagnostics доступны ниже'}</small>
-                      <em className={`generation-quality-chip generation-quality-chip-${validationStateTone(result.tsSyntaxValid)}`}>
-                        {result.tsSyntaxValid ? 'valid' : 'invalid'}
+                      <strong>{tsSyntaxStateLabel(tsSyntaxState(result))}</strong>
+                      <small>{tsSyntaxStateHint(tsSyntaxState(result))}</small>
+                      <em className={`generation-quality-chip generation-quality-chip-${tsSyntaxStateTone(tsSyntaxState(result))}`}>
+                        {tsSyntaxStateBadge(tsSyntaxState(result))}
                       </em>
                     </div>
                     <div className="generation-quality-item">
@@ -3994,30 +4313,33 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                     <div className="generation-quality-item">
                       <span>Token usage</span>
                       <strong>
-                        {currentGenerationTokenUsage ? `${currentGenerationTokenUsage.totalTokens.toLocaleString('ru-RU')} токенов` : 'Нет данных'}
+                        {currentGenerationTokenUsage || currentSourceRefreshTokenUsage
+                          ? `${((currentGenerationTokenUsage?.totalTokens ?? 0) + (currentSourceRefreshTokenUsage?.totalTokens ?? 0)).toLocaleString('ru-RU')} токенов`
+                          : 'Нет данных'}
                       </strong>
                       <small>
-                        {currentGenerationTokenUsage
-                          ? `input ${currentGenerationTokenUsage.inputTokens.toLocaleString('ru-RU')} · output ${currentGenerationTokenUsage.outputTokens.toLocaleString('ru-RU')}`
-                          : 'Токены для этой генерации не были сохранены.'}
+                        {currentGenerationTokenUsage || currentSourceRefreshTokenUsage
+                          ? [
+                              currentGenerationTokenUsage
+                                ? `generate ${currentGenerationTokenUsage.totalTokens.toLocaleString('ru-RU')} (${currentGenerationTokenUsage.inputTokens.toLocaleString('ru-RU')}/${currentGenerationTokenUsage.outputTokens.toLocaleString('ru-RU')})`
+                                : null,
+                              currentSourceRefreshTokenUsage
+                                ? `refresh ${currentSourceRefreshTokenUsage.totalTokens.toLocaleString('ru-RU')} (${currentSourceRefreshTokenUsage.inputTokens.toLocaleString('ru-RU')}/${currentSourceRefreshTokenUsage.outputTokens.toLocaleString('ru-RU')})`
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')
+                          : 'Токены для генерации и refresh структуры пока не сохранены.'}
                       </small>
                       <em className="generation-quality-chip generation-quality-chip-neutral">
-                        {currentGenerationTokenUsage?.modelName ?? currentGenerationTokenUsage?.provider ?? 'usage'}
+                        {currentGenerationTokenUsage?.modelName
+                          ?? currentSourceRefreshTokenUsage?.modelName
+                          ?? currentGenerationTokenUsage?.provider
+                          ?? currentSourceRefreshTokenUsage?.provider
+                          ?? 'usage'}
                       </em>
                     </div>
                   </div>
-                  <p className="subtle-text mapping-editor-note">
-                    Readiness показывает полноту и объём ручной проверки в runtime. Accuracy-метрики считаются отдельно оффлайн на benchmark-наборах.
-                  </p>
-                  {result.sourceQualityAdjustment?.applied && (
-                    <p className="subtle-text mapping-editor-note">
-                      Source quality adjustment: confidence был понижен из-за качества source extraction. Причины:{' '}
-                      {Object.entries(result.sourceQualityAdjustment.reasons)
-                        .map(([reason, count]) => `${reason} (${count})`)
-                        .join(', ')}
-                      .
-                    </p>
-                  )}
                   {currentFormExplainability && (
                     <div className="generation-diagnostics-stack">
                       <div className="generation-diagnostics-group">
@@ -4189,41 +4511,11 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       )}
                     </div>
                   )}
-                  {(visibleTsDiagnostics.length > 0 || visiblePreviewDiagnostics.length > 0) && (
-                    <div className="generation-diagnostics-stack">
-                      {visibleTsDiagnostics.length > 0 && (
-                        <div className="generation-diagnostics-group">
-                          <strong>TypeScript diagnostics</strong>
-                          <div className="generation-diagnostics-list">
-                            {visibleTsDiagnostics.slice(0, 6).map((diagnostic, index) => (
-                              <div className="generation-diagnostic-item" key={`ts-${index}`}>
-                                <span>{formatDiagnosticLabel(diagnostic)}</span>
-                                <small>{diagnostic.message}</small>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      {visiblePreviewDiagnostics.length > 0 && (
-                        <div className="generation-diagnostics-group">
-                          <strong>Preview vs schema</strong>
-                          <div className="generation-diagnostics-list">
-                            {visiblePreviewDiagnostics.slice(0, 6).map((diagnostic, index) => (
-                              <div className="generation-diagnostic-item" key={`preview-${index}`}>
-                                <span>{formatDiagnosticLabel(diagnostic)}</span>
-                                <small>{diagnostic.message}</small>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </section>
 
                 <section className="insight-card">
                   <div className="pane-header">
-                    <Eye size={16} /> Ожидают проверки
+                    <SquarePen size={16} /> Mapping overrides
                   </div>
                   <div className="review-queue-grid">
                     <div className="review-queue-stat">
@@ -4255,19 +4547,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       ))}
                     </div>
                   ) : (
-                    <div className="empty-card compact review-queue-empty-card">Сейчас всё разобрано. Можно сохранять draft JSON и подтверждать генерацию.</div>
+                    <div className="empty-card compact review-queue-empty-card">Сейчас всё разобрано.</div>
                   )}
-                  <p className="subtle-text mapping-editor-note">
-                    Пока здесь есть элементы, сохранение draft JSON и подтверждение генерации будут ждать вашего решения.
-                  </p>
-                </section>
-
-                <section className="insight-card">
-                  <div className="pane-header">
-                    <SquarePen size={16} /> Mapping overrides
-                  </div>
                   <div className="mapping-editor-list mapping-editor-list-scroll">
-                    {result.mappings.length === 0 && <div className="empty-card compact">После генерации здесь появятся найденные соответствия.</div>}
+                    {result.mappings.length === 0 && <div className="empty-card compact mapping-editor-empty-card">После генерации здесь появятся найденные соответствия.</div>}
                     {sortedMappingRows.map(({ mapping, index }) => (
                       <div
                         className={reviewFocusTarget === `mapping-review-${index}` ? 'mapping-editor-row review-target-focus' : 'mapping-editor-row'}
@@ -4291,6 +4574,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                               value={mapping.source === 'not found' ? '' : mapping.source}
                             >
                               <option value="">Не найдено</option>
+                              {mapping.source && mapping.source !== 'not found' && !mappingSourceOptions.includes(mapping.source) && (
+                                <option value={mapping.source}>{mapping.source}</option>
+                              )}
                               {mappingSourceOptions.map((sourceField) => (
                                 <option key={sourceField} value={sourceField}>
                                   {sourceField}
@@ -4306,7 +4592,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                               onChange={(event) => onMappingTargetChange(index, event.target.value)}
                               value={mapping.target}
                             >
-                              {mappingTargetOptions.length === 0 && <option value={mapping.target}>{mapping.target}</option>}
+                              {(mappingTargetOptions.length === 0 || !mappingTargetOptions.includes(mapping.target)) && (
+                                <option value={mapping.target}>{mapping.target}</option>
+                              )}
                               {mappingTargetOptions.map((targetField) => (
                                 <option key={targetField} value={targetField}>
                                   {targetField}
@@ -4370,7 +4658,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       : 'Изменения сохраняются как рабочие правки. Подтверждение закрепит результат в обучающей памяти.'}
                   </p>
                 </section>
+              </div>
 
+              <div className="insight-grid insight-grid-secondary">
                 <section className="insight-card">
                   <div className="pane-header">
                     <WandSparkles size={16} /> Draft JSON naming
@@ -4557,10 +4847,12 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       <strong>{profileStats.totalWarnings}</strong>
                       <span>предупреждений всего</span>
                     </div>
-                    <div className="empty-card compact">
-                      <strong>{profileStats.gigachatApiTokens.toLocaleString('ru-RU')}</strong>
-                      <span>токенов GigaChat API</span>
-                    </div>
+                    {profileStats.gigachatApiTokens > 0 && (
+                      <div className="empty-card compact">
+                        <strong>{profileStats.gigachatApiTokens.toLocaleString('ru-RU')}</strong>
+                        <span>токенов GigaChat API</span>
+                      </div>
+                    )}
                     <div className="empty-card compact profile-fun-wide">
                       <strong>{profileStats.lastGeneratedAt ? new Date(profileStats.lastGeneratedAt).toLocaleDateString() : '—'}</strong>
                       <span>последняя генерация</span>

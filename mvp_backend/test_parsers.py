@@ -164,7 +164,7 @@ except ModuleNotFoundError:
     sys.modules['fastapi.security'] = fastapi_security_stub
 
 from models import ParsedFile, ParsedSheet, RepairApplyPayload, RepairPreviewPayload, TargetField
-from parsers import ParseError, _build_form_model, _resolve_generic_form_layout_source, parse_file, resolve_generation_source
+from parsers import ParseError, _build_form_model, _resolve_generic_form_layout_source, parse_file, parse_target_schema, resolve_generation_source
 from pdf_zoning import classify_pdf_document_zones
 from document_parser import _merge_ocr_image_results, _suppress_consumed_group_fragments
 from form_layout import (
@@ -240,6 +240,67 @@ class DocumentParserTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_root, ignore_errors=True)
 
+    def test_parse_target_schema_allows_empty_array_alongside_string_arrays(self) -> None:
+        target_json = """
+        {
+          "input": [
+            {
+              "organizationName": "ООО \\"Рога и копыта\\"",
+              "innOrKio": "1234567890",
+              "isResidentRF": "NOWHERE",
+              "isTaxResidencyOnlyRF": "NO",
+              "fatcaBeneficiaryOptionList": [
+                "IS_DISREGARDED_ENTITY"
+              ]
+            },
+            {
+              "organizationName": "ООО \\"Иноагент\\"",
+              "innOrKio": "0987654321",
+              "isResidentRF": "YES",
+              "isTaxResidencyOnlyRF": "NO",
+              "fatcaBeneficiaryOptionList": [
+                "IS_DISREGARDED_ENTITY",
+                "IS_FATCA_FOREIGN_INSTITUTE"
+              ]
+            },
+            {
+              "organizationName": "ООО \\"Наши люди\\"",
+              "innOrKio": "6789054321",
+              "isResidentRF": "YES",
+              "isTaxResidencyOnlyRF": "YES",
+              "fatcaBeneficiaryOptionList": []
+            }
+          ]
+        }
+        """
+
+        target_fields, payload, schema, summary = parse_target_schema(target_json)
+
+        self.assertTrue(target_fields)
+        self.assertIsInstance(payload, list)
+        self.assertEqual(schema["type"], "array")
+        self.assertEqual(summary["root_type"], "array")
+
+    def test_parse_target_schema_unwraps_single_input_array_wrapper(self) -> None:
+        target_json = """
+        {
+          "input": [
+            {
+              "organizationName": "ООО \\"Рога и копыта\\"",
+              "innOrKio": "1234567890",
+              "isResidentRF": "NOWHERE"
+            }
+          ]
+        }
+        """
+
+        target_fields, payload, schema, summary = parse_target_schema(target_json)
+
+        self.assertIsInstance(payload, list)
+        self.assertEqual(schema["type"], "array")
+        self.assertTrue(summary["root_is_array"])
+        self.assertEqual([field.name for field in target_fields], ["organizationName", "innOrKio", "isResidentRF"])
+
     def test_docx_table_is_parsed_without_generic_no_columns_warning(self) -> None:
         path = self.test_root / 'table.docx'
         doc = Document()
@@ -269,6 +330,58 @@ class DocumentParserTests(unittest.TestCase):
         self.assertEqual(parsed.content_type, 'text')
         self.assertEqual(parsed.extraction_status, 'text_extracted')
         self.assertNotIn('No columns detected in the file.', parsed.warnings)
+
+    def test_docx_paragraph_kv_rows_are_reconstructed_into_wide_table(self) -> None:
+        path = self.test_root / 'paragraph_format.docx'
+        doc = Document()
+        doc.add_paragraph('Paragraph Format')
+        doc.add_paragraph(
+            'dealId: DEAL_12345, dealName: Проект Alpha, creationDate: 2025-07-15, '
+            'stage: Переговоры, revenue: 1000000, organization: ООО Организация, '
+            'product: Продукт A, responsible: Иванов Иван'
+        )
+        doc.add_paragraph(
+            'dealId: DEAL_67890, dealName: Проект Beta, creationDate: 2025-06-10, '
+            'stage: Закрыта успешно, revenue: 750000, organization: ООО Техно, '
+            'product: Сервис Y, responsible: Сидоров Алексей'
+        )
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.content_type, 'table')
+        self.assertEqual(parsed.document_mode, 'data_table_mode')
+        self.assertEqual(
+            parsed.columns,
+            ['dealId', 'dealName', 'creationDate', 'stage', 'revenue', 'organization', 'product', 'responsible'],
+        )
+        self.assertEqual(parsed.rows[0]['dealId'], 'DEAL_12345')
+        self.assertEqual(parsed.rows[0]['organization'], 'ООО Организация')
+        self.assertEqual(parsed.rows[1]['responsible'], 'Сидоров Алексей')
+        self.assertTrue(any('Reconstructed tabular preview' in warning for warning in parsed.warnings))
+
+    def test_docx_single_line_pipe_payload_is_reconstructed_into_repeated_rows(self) -> None:
+        path = self.test_root / 'one_line_format.docx'
+        doc = Document()
+        doc.add_paragraph('One Line Format')
+        doc.add_paragraph(
+            'DEAL_12345 | Проект Alpha | 2025-07-15 | Переговоры | 1000000 | ООО Организация | '
+            'Продукт A | Иванов Иван | DEAL_67890 | Проект Beta | 2025-06-10 | '
+            'Закрыта успешно | 750000 | ООО Техно | Сервис Y | Сидоров Алексей'
+        )
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.content_type, 'table')
+        self.assertEqual(parsed.document_mode, 'data_table_mode')
+        self.assertEqual(parsed.columns, ['identifier', 'name', 'date', 'stage', 'amount', 'organization', 'product', 'responsible'])
+        self.assertEqual(len(parsed.rows), 2)
+        self.assertEqual(parsed.rows[0]['identifier'], 'DEAL_12345')
+        self.assertEqual(parsed.rows[0]['amount'], '1000000')
+        self.assertEqual(parsed.rows[1]['organization'], 'ООО Техно')
+        self.assertEqual(parsed.rows[1]['responsible'], 'Сидоров Алексей')
+        self.assertTrue(any('Reconstructed tabular preview' in warning for warning in parsed.warnings))
 
     def test_docx_with_multiple_regular_tables_stays_tabular(self) -> None:
         path = self.test_root / 'three_tables.docx'
