@@ -300,6 +300,35 @@ def resolve_generation_source(
     raise ParseError(f'{label} "{selected_sheet}" not found. Available: {available_sheets}')
 
 
+def resolve_draft_json_source(
+    parsed_file: ParsedFile,
+    selected_sheet: str | None = None,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    if selected_sheet is not None and selected_sheet.strip() != '':
+        return resolve_generation_source(parsed_file, selected_sheet=selected_sheet)
+
+    if len(parsed_file.sheets) <= 1:
+        return resolve_generation_source(parsed_file)
+
+    merged_columns: list[str] = []
+    merged_rows: list[dict[str, Any]] = []
+    for sheet in parsed_file.sheets:
+        for column in sheet.columns:
+            if column not in merged_columns:
+                merged_columns.append(column)
+        merged_rows.extend(dict(row) for row in sheet.rows)
+
+    if merged_columns or merged_rows:
+        source_label = 'sheets' if parsed_file.file_type in {'xlsx', 'xls'} else 'tables'
+        return (
+            merged_columns,
+            merged_rows,
+            [f'Draft JSON uses merged source structure from {len(parsed_file.sheets)} {source_label}.'],
+        )
+
+    return resolve_generation_source(parsed_file)
+
+
 def preview_business_form_resolutions(
     parsed_file: ParsedFile,
     *,
@@ -967,18 +996,19 @@ def _collect_excel_sheets(
 
     for sheet_name in sheet_names:
         rows_iter = list(iter_sheet_rows(sheet_name))
-        columns, rows, sheet_warnings = _sheet_rows_to_records(sheet_name, rows_iter)
+        sheet_tables, sheet_warnings = _extract_excel_tables_from_rows(sheet_name, rows_iter)
         warnings.extend(sheet_warnings)
 
-        if not columns and not rows:
+        if not sheet_tables:
             continue
 
         non_empty_sheets.append(sheet_name)
-        sheets.append(ParsedSheet(name=sheet_name, columns=columns, rows=rows[:PREVIEW_ROW_LIMIT]))
-        for column in columns:
-            if column not in combined_columns:
-                combined_columns.append(column)
-        combined_rows.extend(rows)
+        sheets.extend(sheet_tables)
+        for table in sheet_tables:
+            for column in table.columns:
+                if column not in combined_columns:
+                    combined_columns.append(column)
+            combined_rows.extend(dict(row) for row in table.rows)
 
     if len(non_empty_sheets) > 1:
         warnings.append(f'Merged {len(non_empty_sheets)} sheets: {", ".join(non_empty_sheets)}')
@@ -986,6 +1016,90 @@ def _collect_excel_sheets(
         warnings.append(f'Workbook has multiple sheets. Used the only non-empty sheet: {non_empty_sheets[0]}')
 
     return combined_columns, combined_rows[:PREVIEW_ROW_LIMIT], warnings, sheets
+
+
+def _extract_excel_tables_from_rows(sheet_name: str, rows_iter: list[tuple[Any, ...] | list[Any]]) -> tuple[list[ParsedSheet], list[str]]:
+    warnings: list[str] = []
+    if not rows_iter:
+        return [], warnings
+
+    raw_blocks = _split_excel_row_blocks(rows_iter)
+    if not raw_blocks:
+        return [], warnings
+
+    parsed_tables: list[tuple[str | None, list[str], list[dict[str, Any]]]] = []
+    for raw_block in raw_blocks:
+        table_title: str | None = None
+        block_rows = raw_block
+        if len(raw_block) >= 2 and _looks_like_excel_table_title(raw_block[0]) and _count_visible_excel_cells(raw_block[1]) >= 2:
+            table_title = _first_visible_excel_cell_text(raw_block[0])
+            block_rows = raw_block[1:]
+
+        columns, rows, table_warnings = _sheet_rows_to_records(sheet_name, block_rows)
+        warnings.extend(table_warnings)
+        if not columns and not rows:
+            continue
+        parsed_tables.append((table_title, columns, rows))
+
+    total_tables = len(parsed_tables)
+    sheets = [
+        ParsedSheet(
+            name=_build_excel_table_name(sheet_name, table_index, total_tables, table_title),
+            columns=columns,
+            rows=rows[:PREVIEW_ROW_LIMIT],
+        )
+        for table_index, (table_title, columns, rows) in enumerate(parsed_tables, start=1)
+    ]
+
+    if total_tables > 1:
+        warnings.append(f'Sheet "{sheet_name}" was split into {total_tables} tables.')
+
+    return sheets, warnings
+
+
+def _split_excel_row_blocks(rows_iter: list[tuple[Any, ...] | list[Any]]) -> list[list[list[Any]]]:
+    blocks: list[list[list[Any]]] = []
+    current_block: list[list[Any]] = []
+
+    for raw_row in rows_iter:
+        row = list(raw_row)
+        if any(_has_visible_value(value) for value in row):
+            current_block.append(row)
+            continue
+        if current_block:
+            blocks.append(current_block)
+            current_block = []
+
+    if current_block:
+        blocks.append(current_block)
+
+    return blocks
+
+
+def _looks_like_excel_table_title(row: list[Any]) -> bool:
+    visible_values = [value for value in row if _has_visible_value(value)]
+    return len(visible_values) == 1 and isinstance(visible_values[0], str) and visible_values[0].strip() != ''
+
+
+def _count_visible_excel_cells(row: list[Any]) -> int:
+    return sum(1 for value in row if _has_visible_value(value))
+
+
+def _first_visible_excel_cell_text(row: list[Any]) -> str | None:
+    for value in row:
+        if _has_visible_value(value):
+            return str(value).strip()
+    return None
+
+
+def _build_excel_table_name(sheet_name: str, table_index: int, total_tables: int, table_title: str | None) -> str:
+    normalized_sheet_name = sheet_name.strip() or f'Sheet {table_index}'
+    normalized_title = (table_title or '').strip()
+    if total_tables > 1:
+        if normalized_title:
+            return f'{normalized_sheet_name} · {normalized_title}'
+        return f'{normalized_sheet_name} · Table {table_index}'
+    return normalized_sheet_name
 
 
 def _sheet_rows_to_records(sheet_name: str, rows_iter: list[tuple[Any, ...] | list[Any]]) -> tuple[list[str], list[dict[str, Any]], list[str]]:

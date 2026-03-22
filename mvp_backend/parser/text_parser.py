@@ -6,12 +6,15 @@ from typing import Any
 TEXT_BLOCK_LIMIT = 24
 SECTION_LIMIT = 12
 FACT_LIMIT = 16
+TABLE_LIMIT = 8
 
 _WHITESPACE_RE = re.compile(r'[ \t]+')
 _FACT_PATTERNS = (
     re.compile(r'^(?P<label>[^.:]{2,60}?)\s+(?:is|are|equals|was|were)\s+(?P<value>[^.]{2,180})\.?$', re.IGNORECASE),
     re.compile(r'^(?P<label>[^.:]{2,60}?)\s+(?:является|составляет|равен|равна|равно)\s+(?P<value>[^.]{2,180})\.?$', re.IGNORECASE),
 )
+_MARKDOWN_SEPARATOR_RE = re.compile(r'^:?-{3,}:?$')
+_TABLE_DELIMITERS = ('\t', '|', ';', ',', '__MULTISPACE__')
 
 
 def normalize_text(value: Any) -> str:
@@ -103,11 +106,117 @@ def extract_text_facts(raw_text: str, *, limit: int = FACT_LIMIT) -> list[dict[s
     return facts
 
 
+def extract_tables(raw_text: str, *, limit: int = TABLE_LIMIT) -> list[dict[str, Any]]:
+    if not raw_text:
+        return []
+
+    raw_blocks = [block for block in re.split(r'(?:\r?\n\s*){2,}', str(raw_text)) if block.strip()]
+    tables: list[dict[str, Any]] = []
+    for block in raw_blocks:
+        lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+
+        parsed_table = _parse_table_block(lines)
+        if parsed_table is None:
+            continue
+
+        columns, rows = parsed_table
+        if not columns or not rows:
+            continue
+
+        tables.append(
+            {
+                'name': f'Table {len(tables) + 1}',
+                'columns': columns,
+                'rows': rows,
+            }
+        )
+        if len(tables) >= limit:
+            break
+
+    return tables
+
+
 def _paragraphs(raw_text: str) -> list[str]:
     normalized = normalize_text(raw_text)
     if not normalized:
         return []
     return [chunk.strip() for chunk in normalized.split('\n\n') if chunk.strip()]
+
+
+def _parse_table_block(lines: list[str]) -> tuple[list[str], list[dict[str, str]]] | None:
+    best_candidate: tuple[list[str], list[dict[str, str]]] | None = None
+    best_score = 0
+
+    for delimiter in _TABLE_DELIMITERS:
+        parsed_rows = _split_table_lines(lines, delimiter)
+        if len(parsed_rows) < 2:
+            continue
+
+        if delimiter == '|':
+            parsed_rows = [row for row in parsed_rows if not _is_markdown_separator_row(row)]
+            if len(parsed_rows) < 2:
+                continue
+
+        header = parsed_rows[0]
+        if len(header) < 2 or sum(1 for cell in header if cell) < 2:
+            continue
+
+        columns = [cell or f'column{index + 1}' for index, cell in enumerate(header)]
+        rows: list[dict[str, str]] = []
+        for raw_row in parsed_rows[1:]:
+            padded_row = raw_row + [''] * max(0, len(columns) - len(raw_row))
+            row = {columns[index]: padded_row[index] for index in range(len(columns))}
+            if any(value != '' for value in row.values()):
+                rows.append(row)
+
+        if not rows:
+            continue
+
+        score = len(columns) * (len(rows) + 1)
+        if score > best_score:
+            best_score = score
+            best_candidate = (columns, rows)
+
+    return best_candidate
+
+
+def _split_table_lines(lines: list[str], delimiter: str) -> list[list[str]]:
+    parsed_rows: list[list[str]] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if delimiter == '__MULTISPACE__':
+            if re.search(r'\s{2,}', line) is None:
+                return []
+            cells = [_clean_table_cell(cell) for cell in re.split(r'\s{2,}', line) if cell.strip()]
+        elif delimiter == '|':
+            if line.count('|') < 2:
+                return []
+            trimmed = line.strip('|')
+            cells = [_clean_table_cell(cell) for cell in trimmed.split('|')]
+        else:
+            if delimiter not in line:
+                return []
+            cells = [_clean_table_cell(cell) for cell in line.split(delimiter)]
+
+        if len(cells) < 2:
+            return []
+        parsed_rows.append(cells)
+
+    return parsed_rows
+
+
+def _clean_table_cell(value: str) -> str:
+    return _WHITESPACE_RE.sub(' ', str(value).replace('\xa0', ' ')).strip()
+
+
+def _is_markdown_separator_row(cells: list[str]) -> bool:
+    normalized_cells = [cell.strip() for cell in cells if cell.strip()]
+    return bool(normalized_cells) and all(_MARKDOWN_SEPARATOR_RE.fullmatch(cell) for cell in normalized_cells)
 
 
 def _sentences(raw_text: str) -> list[str]:

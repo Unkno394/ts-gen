@@ -264,6 +264,47 @@ class DocumentParserTests(unittest.TestCase):
         self.assertEqual(parsed.extraction_status, 'text_extracted')
         self.assertNotIn('No columns detected in the file.', parsed.warnings)
 
+    def test_docx_with_multiple_regular_tables_stays_tabular(self) -> None:
+        path = self.test_root / 'three_tables.docx'
+        doc = Document()
+
+        inventory = doc.add_table(rows=3, cols=3)
+        inventory.rows[0].cells[0].text = 'SKU'
+        inventory.rows[0].cells[1].text = 'Item Name'
+        inventory.rows[0].cells[2].text = 'Price'
+        inventory.rows[1].cells[0].text = 'SKU001'
+        inventory.rows[1].cells[1].text = 'Laptop'
+        inventory.rows[1].cells[2].text = '45000'
+        inventory.rows[2].cells[0].text = 'SKU002'
+        inventory.rows[2].cells[1].text = 'Mouse'
+        inventory.rows[2].cells[2].text = '900'
+
+        warehouse = doc.add_table(rows=3, cols=2)
+        warehouse.rows[0].cells[0].text = 'Warehouse'
+        warehouse.rows[0].cells[1].text = 'Stock'
+        warehouse.rows[1].cells[0].text = 'WH-A'
+        warehouse.rows[1].cells[1].text = '18'
+        warehouse.rows[2].cells[0].text = 'WH-B'
+        warehouse.rows[2].cells[1].text = '24'
+
+        employees = doc.add_table(rows=3, cols=2)
+        employees.rows[0].cells[0].text = 'Employee'
+        employees.rows[0].cells[1].text = 'Department'
+        employees.rows[1].cells[0].text = 'Ann'
+        employees.rows[1].cells[1].text = 'Sales'
+        employees.rows[2].cells[0].text = 'Ben'
+        employees.rows[2].cells[1].text = 'Ops'
+
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.content_type, 'table')
+        self.assertEqual(parsed.document_mode, 'data_table_mode')
+        self.assertEqual(len(parsed.sheets), 3)
+        self.assertTrue(any('Found 3 tables in DOCX.' in warning for warning in parsed.warnings))
+        self.assertFalse(any('form-like layout document' in warning for warning in parsed.warnings))
+
     def test_docx_form_text_extracts_kv_pairs_and_candidates(self) -> None:
         path = self.test_root / 'form.docx'
         doc = Document()
@@ -298,6 +339,29 @@ class DocumentParserTests(unittest.TestCase):
         self.assertGreaterEqual(len(parsed.sections), 1)
         self.assertEqual(columns, ['ФИО', 'Дата рождения', 'Страна налогового резидентства'])
         self.assertEqual(rows[0]['Страна налогового резидентства'], 'Германия')
+
+    def test_txt_with_multiple_tables_exposes_each_table_as_sheet(self) -> None:
+        path = self.test_root / 'multi_table.txt'
+        path.write_text(
+            'productId\tproductName\tprice\n'
+            '1\tLaptop\t1000\n'
+            '2\tMouse\t25\n'
+            '\n'
+            'orderId\tstatus\ttotal\n'
+            'A-1\tpaid\t1025\n'
+            'A-2\tpending\t400\n',
+            encoding='utf-8',
+        )
+
+        parsed = parse_file(path, path.name)
+
+        self.assertEqual(parsed.file_type, 'txt')
+        self.assertEqual([sheet.name for sheet in parsed.sheets], ['Table 1', 'Table 2'])
+        self.assertEqual(parsed.sheets[0].columns, ['productId', 'productName', 'price'])
+        self.assertEqual(parsed.sheets[1].columns, ['orderId', 'status', 'total'])
+        self.assertEqual(parsed.sheets[0].rows[0]['productName'], 'Laptop')
+        self.assertEqual(parsed.sheets[1].rows[0]['status'], 'paid')
+        self.assertTrue(any('Found 2 tables in TXT' in warning for warning in parsed.warnings))
 
     def test_image_like_input_reports_ocr_requirement(self) -> None:
         path = self.test_root / 'scan.png'
@@ -1955,6 +2019,83 @@ class ExcelParserTests(unittest.TestCase):
         self.assertEqual(parsed.sheets[0].rows, [{'customerName': 'alice', 'amount': 10}])
         self.assertEqual(parsed.sheets[1].rows, [{'customerName': 'bob', 'amount': 20}])
         self.assertIn('Merged 2 sheets: Jan, Feb', parsed.warnings)
+
+    def test_multiple_tables_in_single_excel_sheet_are_split(self) -> None:
+        fake_workbook = FakeWorkbook(
+            {
+                'Two Tables': FakeWorksheet(
+                    [
+                        ('TABLE 1: Sales Data', None, None, None, None),
+                        ('Product ID', 'Product Name', 'Price', 'Quantity', 'Revenue'),
+                        ('P001', 'Laptop', 45000, 5, 225000),
+                        ('P002', 'Mouse', 800, 20, 16000),
+                        (None, None, None, None, None),
+                        ('TABLE 2: Employee Data', None, None, None, None),
+                        ('Employee ID', 'Name', 'Department', 'Salary', 'Years Experience'),
+                        ('E001', 'John Smith', 'IT', 75000, 5),
+                        ('E002', 'Jane Doe', 'Sales', 65000, 3),
+                    ]
+                )
+            }
+        )
+
+        with patch('parsers.load_workbook', return_value=fake_workbook):
+            path = Path('two_tables.xlsx')
+            parsed = parse_file(path, path.name)
+
+        self.assertEqual(
+            [sheet.name for sheet in parsed.sheets],
+            ['Two Tables · TABLE 1: Sales Data', 'Two Tables · TABLE 2: Employee Data'],
+        )
+        self.assertEqual(parsed.sheets[0].columns, ['Product ID', 'Product Name', 'Price', 'Quantity', 'Revenue'])
+        self.assertEqual(parsed.sheets[1].columns, ['Employee ID', 'Name', 'Department', 'Salary', 'Years Experience'])
+        self.assertEqual(parsed.sheets[0].rows[0]['Product Name'], 'Laptop')
+        self.assertEqual(parsed.sheets[1].rows[0]['Name'], 'John Smith')
+        self.assertTrue(any('Sheet "Two Tables" was split into 2 tables.' in warning for warning in parsed.warnings))
+
+    def test_resolve_draft_json_source_merges_all_excel_sheets_without_selected_sheet(self) -> None:
+        parsed = ParsedFile(
+            file_name='multi_sheet.xlsx',
+            file_type='xlsx',
+            columns=['customerName', 'amount', 'status'],
+            rows=[
+                {'customerName': 'alice', 'amount': 10},
+                {'status': 'paid'},
+            ],
+            sheets=[
+                ParsedSheet(name='Jan', columns=['customerName', 'amount'], rows=[{'customerName': 'alice', 'amount': 10}]),
+                ParsedSheet(name='Feb', columns=['status'], rows=[{'status': 'paid'}]),
+            ],
+            warnings=[],
+        )
+
+        columns, rows, warnings = resolve_draft_json_source(parsed)
+
+        self.assertEqual(columns, ['customerName', 'amount', 'status'])
+        self.assertEqual(rows, [{'customerName': 'alice', 'amount': 10}, {'status': 'paid'}])
+        self.assertEqual(warnings, ['Draft JSON uses merged source structure from 2 sheets.'])
+
+    def test_resolve_draft_json_source_uses_selected_sheet(self) -> None:
+        parsed = ParsedFile(
+            file_name='multi_sheet.xlsx',
+            file_type='xlsx',
+            columns=['customerName', 'amount', 'status'],
+            rows=[
+                {'customerName': 'alice', 'amount': 10},
+                {'status': 'paid'},
+            ],
+            sheets=[
+                ParsedSheet(name='Jan', columns=['customerName', 'amount'], rows=[{'customerName': 'alice', 'amount': 10}]),
+                ParsedSheet(name='Feb', columns=['status'], rows=[{'status': 'paid'}]),
+            ],
+            warnings=[],
+        )
+
+        columns, rows, warnings = resolve_draft_json_source(parsed, selected_sheet='Feb')
+
+        self.assertEqual(columns, ['status'])
+        self.assertEqual(rows, [{'status': 'paid'}])
+        self.assertEqual(warnings, ['Generated mapping from selected sheet: Feb'])
 
     def test_resolve_generation_source_uses_selected_sheet(self) -> None:
         parsed = ParsedFile(

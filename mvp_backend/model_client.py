@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import base64
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,50 @@ GIGACHAT_TOKEN_LEEWAY_SECONDS = 60
 DEFAULT_GIGACHAT_CA_BUNDLE = '/app/certs/russian_trusted_root_ca_pem.crt'
 
 _gigachat_token_cache: dict[str, dict[str, Any]] = {}
+_request_usage_capture: ContextVar[dict[str, Any] | None] = ContextVar('request_usage_capture', default=None)
+
+
+def begin_model_usage_capture() -> Token[dict[str, Any] | None]:
+    return _request_usage_capture.set(
+        {
+            'provider': None,
+            'model_name': None,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'total_tokens': 0,
+            'estimated_tokens_saved': 0,
+            'call_count': 0,
+        }
+    )
+
+
+def get_captured_model_usage() -> dict[str, Any]:
+    current = _request_usage_capture.get()
+    if not isinstance(current, dict):
+        return {
+            'provider': None,
+            'model_name': None,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'total_tokens': 0,
+            'estimated_tokens_saved': 0,
+            'call_count': 0,
+        }
+    return {
+        'provider': current.get('provider'),
+        'model_name': current.get('model_name'),
+        'input_tokens': int(current.get('input_tokens') or 0),
+        'output_tokens': int(current.get('output_tokens') or 0),
+        'total_tokens': int(current.get('total_tokens') or 0),
+        'estimated_tokens_saved': int(current.get('estimated_tokens_saved') or 0),
+        'call_count': int(current.get('call_count') or 0),
+    }
+
+
+def end_model_usage_capture(token: Token[dict[str, Any] | None]) -> dict[str, Any]:
+    captured = get_captured_model_usage()
+    _request_usage_capture.reset(token)
+    return captured
 
 
 def rank_mapping_candidate(
@@ -536,6 +581,7 @@ def _call_model(*, instructions: str, payload: dict[str, Any], runtime: dict[str
         )
         usage = _extract_model_usage(response)
         if usage is not None:
+            _record_model_usage(runtime=runtime, usage=usage)
             logger.info(
                 'llm usage: provider=%s model=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d precached_prompt_tokens=%d',
                 provider,
@@ -562,6 +608,21 @@ def _call_model(*, instructions: str, payload: dict[str, Any], runtime: dict[str
         return content
 
     raise RuntimeError('Провайдер модели не настроен. Поддерживается только GigaChat.')
+
+
+def _record_model_usage(*, runtime: dict[str, Any], usage: dict[str, int]) -> None:
+    captured = _request_usage_capture.get()
+    if not isinstance(captured, dict):
+        return
+
+    captured['provider'] = str(runtime.get('provider') or captured.get('provider') or '').strip() or None
+    captured['model_name'] = str(runtime.get('model_name') or captured.get('model_name') or '').strip() or None
+    captured['input_tokens'] = int(captured.get('input_tokens') or 0) + int(usage.get('prompt_tokens') or 0)
+    captured['output_tokens'] = int(captured.get('output_tokens') or 0) + int(usage.get('completion_tokens') or 0)
+    captured['total_tokens'] = int(captured.get('total_tokens') or 0) + int(usage.get('total_tokens') or 0)
+    captured['estimated_tokens_saved'] = int(captured.get('estimated_tokens_saved') or 0) + int(usage.get('precached_prompt_tokens') or 0)
+    captured['call_count'] = int(captured.get('call_count') or 0) + 1
+    _request_usage_capture.set(captured)
 
 
 def _get_gigachat_access_token(runtime: dict[str, Any]) -> str:

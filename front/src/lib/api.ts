@@ -103,6 +103,13 @@ type BackendGenerateResponse = {
   mode: 'guest' | 'authorized';
   parsed_file: BackendParsedFile;
   form_explainability?: BackendFormExplainability | null;
+  token_usage?: {
+    provider?: string | null;
+    model_name?: string | null;
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  } | null;
   mappings: Array<{
     source: string | null;
     target: string;
@@ -204,6 +211,13 @@ type BackendHistoryResponse = {
     generated_typescript: string;
     preview: Record<string, unknown>[];
     warnings: string[];
+    token_usage?: {
+      provider?: string | null;
+      model_name?: string | null;
+      input_tokens?: number;
+      output_tokens?: number;
+      total_tokens?: number;
+    } | null;
     validation?: {
       target_schema?: Record<string, unknown> | unknown[] | null;
       target_schema_summary?: {
@@ -586,6 +600,9 @@ type BackendDraftJsonResponse = {
     source_column: string;
     target_field: string;
     default_value: unknown;
+    representative_value?: unknown;
+    sample_values?: unknown[];
+    null_ratio?: number | null;
     field_type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'null' | 'any';
     status?: 'suggested' | 'accepted' | 'rejected';
     source_of_truth?: 'heuristic_fallback' | 'personal_memory' | 'model_suggestion' | 'global_pattern';
@@ -1264,6 +1281,15 @@ export async function generateFromBackend({ file, targetJson, userId: _userId, s
     })),
     preview: payload.preview,
     warnings: payload.warnings,
+    tokenUsage: payload.token_usage
+      ? {
+          provider: payload.token_usage.provider ?? null,
+          modelName: payload.token_usage.model_name ?? null,
+          inputTokens: payload.token_usage.input_tokens ?? 0,
+          outputTokens: payload.token_usage.output_tokens ?? 0,
+          totalTokens: payload.token_usage.total_tokens ?? 0,
+        }
+      : null,
     targetSchema: payload.target_schema ?? null,
     requiredFields: payload.required_fields ?? [],
     tsValid: payload.ts_valid ?? false,
@@ -1377,6 +1403,15 @@ export async function fetchHistory(_userId: string): Promise<HistoryItem[]> {
     })),
     preview: item.preview,
     warnings: item.warnings,
+    tokenUsage: item.token_usage
+      ? {
+          provider: item.token_usage.provider ?? null,
+          modelName: item.token_usage.model_name ?? null,
+          inputTokens: item.token_usage.input_tokens ?? 0,
+          outputTokens: item.token_usage.output_tokens ?? 0,
+          totalTokens: item.token_usage.total_tokens ?? 0,
+        }
+      : null,
     validation: item.validation
       ? {
           targetSchema: item.validation.target_schema ?? null,
@@ -1667,6 +1702,9 @@ export async function generateDraftJsonFromBackend(params: {
       sourceColumn: item.source_column,
       targetField: item.target_field,
       defaultValue: item.default_value,
+      representativeValue: item.representative_value ?? item.default_value,
+      sampleValues: item.sample_values ?? [],
+      nullRatio: item.null_ratio ?? null,
       fieldType: item.field_type,
       status: item.status,
       sourceOfTruth: item.source_of_truth,

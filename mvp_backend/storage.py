@@ -1106,6 +1106,7 @@ def save_generation(
     upload_record_id: int | None = None,
     schema_fingerprint_id: int | None = None,
     promotion_mode: str = 'automatic',
+    generation_metrics: dict[str, Any] | None = None,
 ) -> int:
     db = get_db()
     internal_user_id = ensure_user_record(external_id=user_id)
@@ -1238,6 +1239,69 @@ def save_generation(
         )
         artifact_id = int(artifact_cursor.lastrowid)
 
+        if generation_metrics:
+            input_tokens = max(0, int(generation_metrics.get('input_tokens') or 0))
+            output_tokens = max(0, int(generation_metrics.get('output_tokens') or 0))
+            total_tokens = max(0, int(generation_metrics.get('total_tokens') or (input_tokens + output_tokens)))
+            if total_tokens != input_tokens + output_tokens:
+                total_tokens = input_tokens + output_tokens
+
+            db.run(
+                '''
+                INSERT INTO generation_metrics (
+                    generation_id,
+                    version_id,
+                    provider,
+                    model_name,
+                    engine,
+                    generation_time_ms,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cache_hits,
+                    cache_misses,
+                    estimated_tokens_saved,
+                    success,
+                    error_message,
+                    cost_usd
+                )
+                VALUES (
+                    :generation_id,
+                    :version_id,
+                    :provider,
+                    :model_name,
+                    :engine,
+                    :generation_time_ms,
+                    :input_tokens,
+                    :output_tokens,
+                    :total_tokens,
+                    :cache_hits,
+                    :cache_misses,
+                    :estimated_tokens_saved,
+                    :success,
+                    :error_message,
+                    :cost_usd
+                )
+                ''',
+                {
+                    'generation_id': generation_id,
+                    'version_id': version_id,
+                    'provider': str(generation_metrics.get('provider') or 'unknown'),
+                    'model_name': str(generation_metrics.get('model_name') or 'unknown'),
+                    'engine': generation_metrics.get('engine'),
+                    'generation_time_ms': max(0, int(generation_metrics.get('generation_time_ms') or 0)),
+                    'input_tokens': input_tokens,
+                    'output_tokens': output_tokens,
+                    'total_tokens': total_tokens,
+                    'cache_hits': max(0, int(generation_metrics.get('cache_hits') or 0)),
+                    'cache_misses': max(0, int(generation_metrics.get('cache_misses') or 0)),
+                    'estimated_tokens_saved': max(0, int(generation_metrics.get('estimated_tokens_saved') or 0)),
+                    'success': 1 if generation_metrics.get('success', True) else 0,
+                    'error_message': generation_metrics.get('error_message'),
+                    'cost_usd': generation_metrics.get('cost_usd'),
+                },
+            )
+
         resolved_schema_fingerprint_id = schema_fingerprint_id or ensure_schema_fingerprint(
             user_id=user_id,
             internal_user_id=internal_user_id,
@@ -1344,6 +1408,11 @@ def get_history(user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
             a.preview_json,
             a.warnings_json,
             a.validation_json,
+            gm.provider AS token_usage_provider,
+            gm.model_name AS token_usage_model_name,
+            COALESCE(gm.input_tokens, 0) AS token_usage_input_tokens,
+            COALESCE(gm.output_tokens, 0) AS token_usage_output_tokens,
+            COALESCE(gm.total_tokens, 0) AS token_usage_total_tokens,
             g.created_at
         FROM generations g
         INNER JOIN users u
@@ -1352,6 +1421,18 @@ def get_history(user_id: str, limit: int | None = None) -> list[dict[str, Any]]:
             ON v.id = g.current_version_id
         LEFT JOIN generation_artifacts a
             ON a.version_id = v.id
+        LEFT JOIN (
+            SELECT
+                generation_id,
+                MAX(provider) AS provider,
+                MAX(model_name) AS model_name,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(total_tokens) AS total_tokens
+            FROM generation_metrics
+            GROUP BY generation_id
+        ) gm
+            ON gm.generation_id = g.id
         WHERE u.external_id = :external_id
         ORDER BY g.updated_at DESC, g.id DESC
     '''
@@ -3504,6 +3585,9 @@ def save_draft_json_suggestions(
                         {
                             'raw_confidence': suggestion.get('confidence'),
                             'reason': suggestion.get('reason'),
+                            'sample_values': list(suggestion.get('sample_values') or []),
+                            'null_ratio': suggestion.get('null_ratio'),
+                            'representative_value': suggestion.get('representative_value'),
                         }
                     ),
                     'created_at': now,

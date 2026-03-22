@@ -19,6 +19,13 @@ export type HistoryItem = {
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
   warnings: string[];
+  tokenUsage?: {
+    provider?: string | null;
+    modelName?: string | null;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null;
   validation?: GenerationValidation | null;
 };
 
@@ -199,6 +206,13 @@ export type GenerationResult = {
   schemaFingerprintId?: number | null;
   parsedFile?: ParsedFileInfo | null;
   formExplainability?: FormExplainability | null;
+  tokenUsage?: {
+    provider?: string | null;
+    modelName?: string | null;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null;
   code: string;
   mappings: MappingInfo[];
   preview: Record<string, unknown>[];
@@ -282,6 +296,9 @@ export type DraftFieldSuggestion = {
   sourceColumn: string;
   targetField: string;
   defaultValue: unknown;
+  representativeValue?: unknown;
+  sampleValues?: unknown[];
+  nullRatio?: number | null;
   fieldType: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'null' | 'any';
   status?: 'suggested' | 'accepted' | 'rejected';
   sourceOfTruth?: 'heuristic_fallback' | 'personal_memory' | 'model_suggestion' | 'global_pattern';

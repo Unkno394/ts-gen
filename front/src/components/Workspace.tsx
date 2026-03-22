@@ -82,6 +82,8 @@ const defaultSchema = `{
   "createdAt": ""
 }`;
 
+const CLEAR_HISTORY_BUSY_ID = '__clear_history__';
+
 const defaultCode = `// Generated TypeScript will appear here
 export function transform(row: any) {
   return {};
@@ -400,9 +402,17 @@ function buildFormPreviewSheet(parsedFile: ParsedFileInfo): ParsedSheetInfo | nu
   return buildPreviewSheet('Form extraction', ['field', 'value', 'source'], rows);
 }
 
+function shouldPreferTableSheetsInFormPreview(parsedFile: ParsedFileInfo | null): boolean {
+  return parsedFile?.documentMode === 'form_layout_mode' && parsedFile.sheets.length > 1;
+}
+
 function buildPreviewSheetsForParsedFile(parsedFile: ParsedFileInfo | null): ParsedSheetInfo[] {
   if (!parsedFile) {
     return [];
+  }
+
+  if (shouldPreferTableSheetsInFormPreview(parsedFile)) {
+    return parsedFile.sheets;
   }
 
   if (parsedFile.documentMode === 'form_layout_mode') {
@@ -603,24 +613,188 @@ function preferredSourceStructureTab(parsedFile: ParsedFileInfo | null): SourceS
   return 'warnings';
 }
 
+function hasVisibleWorkbookCell(value: unknown): boolean {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (typeof value === 'string') {
+    return value.trim() !== '';
+  }
+  return true;
+}
+
+function splitWorkbookRowBlocks(rows: unknown[][]): unknown[][][] {
+  const blocks: unknown[][][] = [];
+  let currentBlock: unknown[][] = [];
+
+  rows.forEach((rawRow) => {
+    const row = Array.isArray(rawRow) ? rawRow : [];
+    if (row.some((value) => hasVisibleWorkbookCell(value))) {
+      currentBlock.push(row);
+      return;
+    }
+    if (currentBlock.length > 0) {
+      blocks.push(currentBlock);
+      currentBlock = [];
+    }
+  });
+
+  if (currentBlock.length > 0) {
+    blocks.push(currentBlock);
+  }
+
+  return blocks;
+}
+
+function countVisibleWorkbookCells(row: unknown[]): number {
+  return row.reduce<number>((count, value) => count + (hasVisibleWorkbookCell(value) ? 1 : 0), 0);
+}
+
+function looksLikeWorkbookTableTitle(row: unknown[]): boolean {
+  const visibleValues = row.filter((value) => hasVisibleWorkbookCell(value));
+  return visibleValues.length === 1 && typeof visibleValues[0] === 'string' && visibleValues[0].trim() !== '';
+}
+
+function firstVisibleWorkbookCellText(row: unknown[]): string | null {
+  const value = row.find((item) => hasVisibleWorkbookCell(item));
+  if (value === undefined) {
+    return null;
+  }
+  return String(value).trim();
+}
+
+function stringifyWorkbookHeader(value: unknown, index: number): string {
+  if (value === null || value === undefined) {
+    return `Column ${index}`;
+  }
+  if (typeof value === 'string') {
+    const stripped = value.trim();
+    return stripped || `Column ${index}`;
+  }
+  return String(value);
+}
+
+function buildWorkbookTableName(sheetName: string, tableIndex: number, totalTables: number, tableTitle: string | null): string {
+  const normalizedSheetName = sheetName.trim() || `Sheet ${tableIndex}`;
+  const normalizedTitle = tableTitle?.trim() ?? '';
+  if (totalTables > 1) {
+    if (normalizedTitle) {
+      return `${normalizedSheetName} · ${normalizedTitle}`;
+    }
+    return `${normalizedSheetName} · Table ${tableIndex}`;
+  }
+  return normalizedSheetName;
+}
+
+function workbookRowsToRecords(sheetName: string, rowsIter: unknown[][]): {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  warnings: string[];
+} {
+  const warnings: string[] = [];
+  if (rowsIter.length === 0) {
+    return { columns: [], rows: [], warnings };
+  }
+
+  const rawHeaders = rowsIter[0] ?? [];
+  if (rawHeaders.length === 0) {
+    return { columns: [], rows: [], warnings };
+  }
+
+  if (
+    rawHeaders.some(
+      (column) =>
+        column === null ||
+        column === undefined ||
+        typeof column !== 'string' ||
+        (typeof column === 'string' && (column.trim() === '' || column.startsWith('Unnamed:')))
+    )
+  ) {
+    warnings.push(
+      `Sheet "${sheetName}": Excel first row is treated as column headers. Some headers are empty or non-text, so the first row may contain data instead of column names.`
+    );
+  }
+
+  const columns = rawHeaders.map((column, index) => stringifyWorkbookHeader(column, index + 1));
+  const rows = rowsIter.slice(1).flatMap((rawRow) => {
+    const values = Array.isArray(rawRow) ? rawRow : [];
+    if (!values.some((value) => hasVisibleWorkbookCell(value))) {
+      return [];
+    }
+
+    const record: Record<string, unknown> = {};
+    columns.forEach((column, index) => {
+      record[column] = values[index] ?? null;
+    });
+    return [record];
+  });
+
+  return { columns, rows, warnings };
+}
+
+function extractWorkbookTablesFromSheet(sheetName: string, rows: unknown[][]): {
+  tables: ParsedSheetInfo[];
+  warnings: string[];
+} {
+  const warnings: string[] = [];
+  const blocks = splitWorkbookRowBlocks(rows);
+  if (blocks.length === 0) {
+    return { tables: [], warnings };
+  }
+
+  const parsedTables: Array<{ title: string | null; columns: string[]; rows: Record<string, unknown>[] }> = [];
+  blocks.forEach((block) => {
+    let tableTitle: string | null = null;
+    let blockRows = block;
+    if (block.length >= 2 && looksLikeWorkbookTableTitle(block[0]) && countVisibleWorkbookCells(block[1]) >= 2) {
+      tableTitle = firstVisibleWorkbookCellText(block[0]);
+      blockRows = block.slice(1);
+    }
+
+    const parsed = workbookRowsToRecords(sheetName, blockRows);
+    warnings.push(...parsed.warnings);
+    if (parsed.columns.length === 0 && parsed.rows.length === 0) {
+      return;
+    }
+    parsedTables.push({
+      title: tableTitle,
+      columns: parsed.columns,
+      rows: parsed.rows,
+    });
+  });
+
+  const tables = parsedTables.map((table, index) =>
+    buildPreviewSheet(buildWorkbookTableName(sheetName, index + 1, parsedTables.length, table.title), table.columns, table.rows.slice(0, 8))
+  );
+
+  if (tables.length > 1) {
+    warnings.push(`Sheet "${sheetName}" was split into ${tables.length} tables.`);
+  }
+
+  return { tables, warnings };
+}
+
 function parseWorkbookSheets(workbook: WorkBook, xlsxModule: typeof import('xlsx')): {
   columns: string[];
   rows: Record<string, unknown>[];
   sheets: ParsedSheetInfo[];
   warnings: string[];
 } {
-  const sheets = workbook.SheetNames.map((sheetName) => {
+  const warnings: string[] = [];
+  const sheets = workbook.SheetNames.flatMap((sheetName) => {
     const sheet = workbook.Sheets[sheetName];
-    const json = xlsxModule.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
-    const columns = Object.keys(json[0] ?? {});
-    const rows = json
-      .slice(0, 8)
-      .map((row: Record<string, unknown>) => row as Record<string, string | number | boolean | null>);
-    return buildPreviewSheet(sheetName, columns, rows);
+    const rows = xlsxModule.utils.sheet_to_json<unknown[]>(sheet, {
+      header: 1,
+      defval: null,
+      raw: true,
+      blankrows: true,
+    });
+    const extracted = extractWorkbookTablesFromSheet(sheetName, rows);
+    warnings.push(...extracted.warnings);
+    return extracted.tables;
   }).filter((sheet) => sheet.columns.length > 0 || sheet.rows.length > 0);
 
   const firstSheet = sheets[0] ?? buildPreviewSheet(workbook.SheetNames[0] ?? 'Sheet 1', [], []);
-  const warnings: string[] = [];
 
   if (workbook.SheetNames.length > 1) {
     warnings.push(`Preview is split by sheets. Found ${workbook.SheetNames.length} sheet(s).`);
@@ -1030,7 +1204,7 @@ function previewSectionLabel(extension: string | undefined, totalSections: numbe
     return totalSections > 1 ? 'Таблицы документа' : 'Таблица документа';
   }
   if (extension === 'xlsx' || extension === 'xls') {
-    return 'Листы файла';
+    return totalSections > 1 ? 'Таблицы файла' : 'Таблица файла';
   }
   return 'Секции preview';
 }
@@ -1050,6 +1224,9 @@ function sourceStructureTabLabel(tab: SourceStructureTab): string {
 }
 
 function previewSectionDisplayLabel(parsedFile: ParsedFileInfo | null, totalSections: number): string {
+  if (shouldPreferTableSheetsInFormPreview(parsedFile)) {
+    return totalSections > 1 ? 'Таблицы формы' : 'Таблица формы';
+  }
   if (parsedFile?.documentMode === 'form_layout_mode') {
     return totalSections > 1 ? 'Извлечённые секции формы' : 'Извлечённая секция формы';
   }
@@ -1057,6 +1234,9 @@ function previewSectionDisplayLabel(parsedFile: ParsedFileInfo | null, totalSect
 }
 
 function sourceStructureTabDisplayLabel(tab: SourceStructureTab, parsedFile: ParsedFileInfo | null): string {
+  if (tab === 'tables' && shouldPreferTableSheetsInFormPreview(parsedFile)) {
+    return 'Таблицы';
+  }
   if (tab === 'tables' && parsedFile?.documentMode === 'form_layout_mode') {
     return 'Форма';
   }
@@ -1159,6 +1339,21 @@ function compareReviewLabels(left: string, right: string): number {
   return reviewItemCollator.compare(normalizedLeft, normalizedRight);
 }
 
+function pluralizeRu(count: number, one: string, few: string, many: string): string {
+  const normalized = Math.abs(count) % 100;
+  const lastDigit = normalized % 10;
+  if (normalized >= 11 && normalized <= 19) {
+    return many;
+  }
+  if (lastDigit === 1) {
+    return one;
+  }
+  if (lastDigit >= 2 && lastDigit <= 4) {
+    return few;
+  }
+  return many;
+}
+
 function mappingReviewSortLabel(mapping: MappingInfo): string {
   if (mapping.source && mapping.source !== 'not found') {
     return mapping.source;
@@ -1220,7 +1415,22 @@ function learningEventActionLabel(event: LearningEvent): string | null {
 }
 
 function mappingNeedsExplicitReview(mapping: MappingInfo): boolean {
-  return Boolean(mapping.suggestionId) || mapping.status === 'suggested' || mapping.sourceOfTruth === 'model_suggestion' || mapping.sourceOfTruth === 'position_fallback' || mapping.sourceOfTruth === 'unresolved';
+  if (mapping.status === 'rejected') {
+    return true;
+  }
+  if (mapping.sourceOfTruth === 'model_suggestion' || mapping.sourceOfTruth === 'position_fallback' || mapping.sourceOfTruth === 'unresolved') {
+    return true;
+  }
+  if ((mapping.status ?? 'accepted') !== 'suggested') {
+    return false;
+  }
+  if (mapping.sourceOfTruth === 'deterministic_rule' || mapping.sourceOfTruth === 'personal_memory') {
+    return false;
+  }
+  if (mapping.sourceOfTruth === 'global_pattern' || mapping.sourceOfTruth === 'semantic_graph') {
+    return mapping.confidence === 'low' || mapping.confidence === 'none';
+  }
+  return true;
 }
 
 function draftSuggestionNeedsExplicitReview(suggestion: DraftFieldSuggestion): boolean {
@@ -1245,6 +1455,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [activeHistoryId, setActiveHistoryId] = useState<string | null>(null);
   const [historyDeleteTarget, setHistoryDeleteTarget] = useState<HistoryItem | null>(null);
   const [historyDeleteBusyId, setHistoryDeleteBusyId] = useState<string | null>(null);
+  const [historyClearDialogOpen, setHistoryClearDialogOpen] = useState(false);
   const [historyDeleteError, setHistoryDeleteError] = useState('');
   const [saveMessage, setSaveMessage] = useState('');
   const [dragActive, setDragActive] = useState(false);
@@ -1304,15 +1515,12 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [sectionStateCache, setSectionStateCache] = useState<Record<string, SectionWorkspaceState>>({});
   const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
+  const [profileAccountCardHeight, setProfileAccountCardHeight] = useState<number | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
   const sourcePreviewRefreshTimerRef = useRef<number | null>(null);
   const previewGridWrapRef = useRef<HTMLDivElement | null>(null);
+  const profileAccountCardRef = useRef<HTMLElement | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
-  const currentFormExplainability = result.formExplainability ?? null;
-  const currentRepairPlan = currentFormExplainability?.repairPlan ?? null;
-  const currentRepairActions = currentRepairPlan?.actions ?? [];
-  const currentFormQuality = currentFormExplainability?.qualitySummary ?? null;
-  const currentFormRedFlags = currentFormQuality?.redFlags ?? [];
 
   const refreshLearningData = async () => {
     if (profile.skipped) {
@@ -1337,7 +1545,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   };
 
   useEffect(() => {
-    if (!historyDeleteTarget || historyDeleteBusyId !== null) {
+    if ((!historyDeleteTarget && !historyClearDialogOpen) || historyDeleteBusyId !== null) {
       return;
     }
 
@@ -1345,12 +1553,13 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       if (event.key === 'Escape') {
         setHistoryDeleteError('');
         setHistoryDeleteTarget(null);
+        setHistoryClearDialogOpen(false);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [historyDeleteBusyId, historyDeleteTarget]);
+  }, [historyClearDialogOpen, historyDeleteBusyId, historyDeleteTarget]);
 
   useEffect(() => {
     return () => {
@@ -1628,6 +1837,34 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     };
   }, []);
 
+  useEffect(() => {
+    if (activeView !== 'profile') {
+      setProfileAccountCardHeight(null);
+      return;
+    }
+
+    const accountCard = profileAccountCardRef.current;
+    if (!accountCard) {
+      return;
+    }
+
+    const syncHeight = () => {
+      setProfileAccountCardHeight(Math.ceil(accountCard.getBoundingClientRect().height));
+    };
+
+    syncHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      syncHeight();
+    });
+    observer.observe(accountCard);
+    return () => observer.disconnect();
+  }, [activeView]);
+
   const pendingCorrections = useMemo(() => {
     if (profile.skipped || !correctionBaseline) {
       return [] as ManualCorrectionInput[];
@@ -1716,18 +1953,17 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     );
   }, [correctionSaveError, correctionSaveNotice, draftJsonError, draftJsonNotice, learningReviewError, learningReviewNotice, parsedFile?.warnings, repairError, repairNotice, result.warnings, saveMessage, sourcePreviewRefreshError, sourcePreviewRefreshNotice]);
 
-  const visibleTsDiagnostics = useMemo(() => result.tsDiagnostics ?? [], [result.tsDiagnostics]);
-  const visiblePreviewDiagnostics = useMemo(() => result.previewDiagnostics ?? [], [result.previewDiagnostics]);
-
   const profileStats = useMemo(() => {
     const totalGenerations = history.length;
     const uniqueFiles = new Set(history.map((item) => item.fileName)).size;
     const totalWarnings = history.reduce((sum, item) => sum + item.warnings.length, 0);
+    const gigachatApiTokens = history.reduce((sum, item) => sum + (item.tokenUsage?.totalTokens ?? 0), 0);
     const lastGeneratedAt = history[0]?.createdAt ?? null;
     return {
       totalGenerations,
       uniqueFiles,
       totalWarnings,
+      gigachatApiTokens,
       lastGeneratedAt,
     };
   }, [history]);
@@ -1862,6 +2098,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       return;
     }
     setHistoryDeleteError('');
+    setHistoryClearDialogOpen(false);
     setHistoryDeleteTarget(item);
   };
 
@@ -1871,6 +2108,23 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
     setHistoryDeleteError('');
     setHistoryDeleteTarget(null);
+  };
+
+  const openClearHistoryModal = () => {
+    if (profile.skipped || historyDeleteBusyId !== null || history.length === 0) {
+      return;
+    }
+    setHistoryDeleteError('');
+    setHistoryDeleteTarget(null);
+    setHistoryClearDialogOpen(true);
+  };
+
+  const closeClearHistoryModal = () => {
+    if (historyDeleteBusyId !== null) {
+      return;
+    }
+    setHistoryDeleteError('');
+    setHistoryClearDialogOpen(false);
   };
 
   const onDeleteHistoryItem = async () => {
@@ -1911,6 +2165,62 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       setSaveMessage(`Запрос "${item.fileName}" удален из истории.`);
     } catch (error) {
       setHistoryDeleteError(error instanceof Error ? error.message : 'Не удалось удалить запрос из истории.');
+    } finally {
+      setHistoryDeleteBusyId(null);
+    }
+  };
+
+  const onClearHistory = async () => {
+    if (profile.skipped || historyDeleteBusyId !== null || history.length === 0) {
+      return;
+    }
+
+    const historyIds = new Set(history.map((item) => item.id));
+    setHistoryDeleteBusyId(CLEAR_HISTORY_BUSY_ID);
+    setHistoryDeleteError('');
+    setHistoryDeleteTarget(null);
+
+    try {
+      for (const item of history) {
+        await deleteHistoryEntry(profile.id, item.id);
+      }
+
+      setSectionStateCache((current) => {
+        let changed = false;
+        const nextEntries = Object.entries(current).map(([sectionKey, state]) => {
+          let nextState = state;
+          for (const item of history) {
+            const detached = detachGenerationLinkFromSectionState(nextState, item.id);
+            if (detached !== nextState) {
+              nextState = detached;
+              changed = true;
+            }
+          }
+          return [sectionKey, nextState] as const;
+        });
+        return changed ? Object.fromEntries(nextEntries) : current;
+      });
+      setResult((current) =>
+        current.generationId !== null && current.generationId !== undefined && historyIds.has(String(current.generationId))
+          ? { ...current, generationId: null }
+          : current
+      );
+      setCorrectionBaseline((current) => (current && historyIds.has(current.generationId) ? null : current));
+      if (
+        (result.generationId !== null && result.generationId !== undefined && historyIds.has(String(result.generationId))) ||
+        (correctionBaseline && historyIds.has(correctionBaseline.generationId))
+      ) {
+        setGenerationConfirmed(false);
+      }
+      if (activeHistoryId && historyIds.has(activeHistoryId)) {
+        setActiveHistoryId(null);
+      }
+
+      setHistoryClearDialogOpen(false);
+      await onSaveHistory();
+      setSaveMessage('История генераций очищена.');
+    } catch (error) {
+      setHistoryDeleteError(error instanceof Error ? error.message : 'Не удалось очистить историю генераций.');
     } finally {
       setHistoryDeleteBusyId(null);
     }
@@ -2212,6 +2522,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const applySectionState = (nextState: SectionWorkspaceState | null | undefined) => {
     if (!nextState) {
+      setSchema(defaultSchema);
       setResult({ code: defaultCode, mappings: [], preview: [], warnings: [] });
       setDraftSuggestions([]);
       setDraftJsonSaved(false);
@@ -2606,7 +2917,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
       const generated = await generateDraftJsonFromBackend({
         file: selectedFile,
         userId: profile.skipped ? undefined : profile.id,
-        selectedSheet: parsedFile?.sheets.length ? currentPreviewSheet?.name : undefined,
+        selectedSheet: currentPreviewSheet?.name,
       });
 
       setParsedFile(generated.parsedFile ?? parsedFile);
@@ -3103,6 +3414,13 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
   };
 
+  void formatDiagnosticLabel;
+  void onPreviewRepair;
+  void onApplyRepair;
+  void repairActionChunkCount;
+  void repairBusy;
+  void activeRepairActionKey;
+
   return (
     <div
       className="workspace-stage"
@@ -3151,7 +3469,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
               <div className="field-block">
                 <div className="field-caption">Target JSON</div>
-                <textarea className="editor-area" onChange={(event) => setSchema(event.target.value)} value={schema} />
+                <textarea className="editor-area schema-editor-area" onChange={(event) => setSchema(event.target.value)} value={schema} />
               </div>
 
               <div className="generator-action-row">
@@ -3189,39 +3507,49 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               )}
             </section>
           ) : (
-            <section className="profile-nav-card sidebar-history-card">
-              <div className="panel-title">
-                <History size={16} /> История генераций
-              </div>
-              <div className="history-list sidebar-history-list">
-                {history.length === 0 && <div className="empty-card compact">Пока пусто.</div>}
-                {history.map((item) => (
-                  <div className="history-item-row" key={item.id}>
-                    <button
-                      className={item.id === activeHistoryId ? 'history-item active' : 'history-item'}
-                      onClick={() => restoreHistoryItem(item)}
-                      type="button"
-                    >
-                      <strong>{item.fileName}</strong>
-                      <span>{new Date(item.createdAt).toLocaleString()}</span>
-                    </button>
-                    <button
-                      aria-label={`Удалить ${item.fileName} из истории`}
-                      className="history-item-delete"
-                      disabled={historyDeleteBusyId !== null}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        openHistoryDeleteModal(item);
-                      }}
-                      title="Удалить из истории"
-                      type="button"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </section>
+            <>
+              <section
+                className="profile-nav-card sidebar-history-card sidebar-history-card-match-account"
+                style={profileAccountCardHeight ? { maxHeight: profileAccountCardHeight } : undefined}
+              >
+                <div className="panel-title">
+                  <History size={16} /> История генераций
+                </div>
+                <div className="history-list sidebar-history-list">
+                  {history.length === 0 && <div className="empty-card compact">Пока пусто.</div>}
+                  {history.map((item) => (
+                    <div className="history-item-row" key={item.id}>
+                      <button
+                        className={item.id === activeHistoryId ? 'history-item active' : 'history-item'}
+                        onClick={() => restoreHistoryItem(item)}
+                        type="button"
+                      >
+                        <strong>{item.fileName}</strong>
+                        <span>{new Date(item.createdAt).toLocaleString()}</span>
+                      </button>
+                      <button
+                        aria-label={`Удалить ${item.fileName} из истории`}
+                        className="history-item-delete"
+                        disabled={historyDeleteBusyId !== null}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          openHistoryDeleteModal(item);
+                        }}
+                        title="Удалить из истории"
+                        type="button"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+              {!profile.skipped && history.length > 0 && (
+                <button className="secondary-btn sidebar-history-reset" disabled={historyDeleteBusyId !== null} onClick={openClearHistoryModal} type="button">
+                  <X size={16} /> {historyDeleteBusyId === CLEAR_HISTORY_BUSY_ID ? 'Сбрасываем...' : 'Сбросить историю'}
+                </button>
+              )}
+            </>
           )}
         </aside>
 
@@ -3278,6 +3606,11 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   {sourcePreviewRefreshError && <div className="warning-item auth-status auth-status-error source-refresh-status">{sourcePreviewRefreshError}</div>}
                   {sourceStructureTab === 'tables' && previewSheets.length > 0 && (
                     <>
+                      {(parsedFile?.sheets.length ?? 0) > 1 && (
+                        <p className="subtle-text mapping-editor-note">
+                          Draft JSON строится по текущей выбранной таблице предпросмотра.
+                        </p>
+                      )}
                       {previewSheets.length > 1 && (
                         <>
                           <div className="preview-switcher">
@@ -3501,155 +3834,6 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </em>
                     </div>
                   </div>
-                  <p className="subtle-text mapping-editor-note">
-                    Readiness показывает полноту и объём ручной проверки в runtime. Accuracy-метрики считаются отдельно оффлайн на benchmark-наборах.
-                  </p>
-                  {result.sourceQualityAdjustment?.applied && (
-                    <p className="subtle-text mapping-editor-note">
-                      Source quality adjustment: confidence был понижен из-за качества source extraction. Причины:{' '}
-                      {Object.entries(result.sourceQualityAdjustment.reasons)
-                        .map(([reason, count]) => `${reason} (${count})`)
-                        .join(', ')}
-                      .
-                    </p>
-                  )}
-                  {currentFormExplainability && (
-                    <div className="generation-diagnostics-stack">
-                      <div className="generation-diagnostics-group">
-                        <strong>Form extraction</strong>
-                        <div className="generation-diagnostics-list">
-                          <div className="generation-diagnostic-item">
-                            <span>
-                              {currentFormExplainability.documentMode} → {currentFormExplainability.finalSourceMode ?? 'unknown'}
-                            </span>
-                            <small>
-                              scalar: {currentFormExplainability.scalarCount}, groups: {currentFormExplainability.groupCount}, sections:{' '}
-                              {currentFormExplainability.sectionCount}, layout lines: {currentFormExplainability.layoutLineCount}
-                            </small>
-                          </div>
-                          <div className="generation-diagnostic-item">
-                            <span>
-                              resolved {currentFormQuality?.resolvedFieldCount ?? 0}/{currentFormQuality?.targetFieldCount ?? 0}
-                            </span>
-                            <small>
-                              ambiguous: {(currentFormQuality?.ambiguousFields ?? []).join(', ') || 'none'} · critical unresolved:{' '}
-                              {(currentFormQuality?.unresolvedCriticalFields ?? []).join(', ') || 'none'}
-                            </small>
-                          </div>
-                        </div>
-                      </div>
-                      {currentFormRedFlags.length > 0 && (
-                        <div className="generation-diagnostics-group">
-                          <strong>Red flags</strong>
-                          <div className="warning-list">
-                            {currentFormRedFlags.map((flag) => (
-                              <div className="warning-item" key={flag.code}>
-                                <strong>{flag.code}</strong>
-                                <div>{flag.message ?? 'Нужно проверить form extraction.'}</div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      {currentRepairPlan && currentRepairActions.length > 0 && (
-                        <div className="generation-diagnostics-group">
-                          <strong>Режим «Переделать»</strong>
-                          <div className="review-queue-list">
-                            {currentRepairActions.map((action) => {
-                              const actionKey = buildRepairActionKey(action);
-                              const isActive = activeRepairActionKey === actionKey;
-                              const isPreviewForAction =
-                                isActive && repairPreview !== null && buildRepairActionKey(repairPreview.action) === actionKey;
-                              return (
-                                <div className="review-queue-item" key={actionKey}>
-                                  <strong>{repairActionLabel(action)}</strong>
-                                  <span>
-                                    {action.reason} · {action.priority} priority · {repairActionChunkCount(action)} chunk(s)
-                                  </span>
-                                  <div className="mapping-decision-row">
-                                    <button className="secondary-btn" disabled={repairBusy} onClick={() => void onPreviewRepair(action)} type="button">
-                                      {repairBusy && isActive ? 'Собираем preview...' : 'Предпросмотр'}
-                                    </button>
-                                    {isPreviewForAction && repairPreview.previewStatus === 'patch_available' && (
-                                      <button className="primary-btn" disabled={repairBusy} onClick={() => void onApplyRepair()} type="button">
-                                        {repairBusy ? 'Применяем...' : 'Применить'}
-                                      </button>
-                                    )}
-                                  </div>
-                                  {isPreviewForAction && (
-                                    <div className="generation-diagnostics-stack">
-                                      <div className="generation-diagnostic-item">
-                                        <span>{repairPreview.previewStatus}</span>
-                                        <small>
-                                          local chunks: groups {repairPreview.localChunks.groups.length}, scalars {repairPreview.localChunks.scalars.length},
-                                          lines {repairPreview.localChunks.lines.length}
-                                        </small>
-                                      </div>
-                                      {repairPreview.proposedResolutions.length > 0 && (
-                                        <div className="generation-diagnostic-item">
-                                          <span>Proposed resolutions</span>
-                                          <small>
-                                            {repairPreview.proposedResolutions
-                                              .map((item) => `${item.field}: ${item.status} via ${item.resolvedBy}`)
-                                              .join(' · ')}
-                                          </small>
-                                        </div>
-                                      )}
-                                      {Object.keys(repairPreview.proposedPatch ?? {}).length > 0 && (
-                                        <pre className="preview-pane source-text-pane">{JSON.stringify(repairPreview.proposedPatch, null, 2)}</pre>
-                                      )}
-                                      {repairPreview.warnings.length > 0 && (
-                                        <div className="warning-list">
-                                          {repairPreview.warnings.map((warning, index) => (
-                                            <div className="warning-item" key={`${actionKey}-warning-${index}`}>
-                                              {warning}
-                                            </div>
-                                          ))}
-                                        </div>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                          <p className="subtle-text mapping-editor-note">
-                            Repair работает по локальным chunks из form layout, а не по полному документу. Сначала preview, потом apply.
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {(visibleTsDiagnostics.length > 0 || visiblePreviewDiagnostics.length > 0) && (
-                    <div className="generation-diagnostics-stack">
-                      {visibleTsDiagnostics.length > 0 && (
-                        <div className="generation-diagnostics-group">
-                          <strong>TypeScript diagnostics</strong>
-                          <div className="generation-diagnostics-list">
-                            {visibleTsDiagnostics.slice(0, 6).map((diagnostic, index) => (
-                              <div className="generation-diagnostic-item" key={`ts-${index}`}>
-                                <span>{formatDiagnosticLabel(diagnostic)}</span>
-                                <small>{diagnostic.message}</small>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      {visiblePreviewDiagnostics.length > 0 && (
-                        <div className="generation-diagnostics-group">
-                          <strong>Preview vs schema</strong>
-                          <div className="generation-diagnostics-list">
-                            {visiblePreviewDiagnostics.slice(0, 6).map((diagnostic, index) => (
-                              <div className="generation-diagnostic-item" key={`preview-${index}`}>
-                                <span>{formatDiagnosticLabel(diagnostic)}</span>
-                                <small>{diagnostic.message}</small>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </section>
 
                 <section className="insight-card">
@@ -3686,7 +3870,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       ))}
                     </div>
                   ) : (
-                    <div className="empty-card compact">Сейчас всё разобрано. Можно сохранять draft JSON и подтверждать генерацию.</div>
+                    <div className="empty-card compact review-queue-empty-card">Сейчас всё разобрано. Можно сохранять draft JSON и подтверждать генерацию.</div>
                   )}
                   <p className="subtle-text mapping-editor-note">
                     Пока здесь есть элементы, сохранение draft JSON и подтверждение генерации будут ждать вашего решения.
@@ -3697,7 +3881,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   <div className="pane-header">
                     <SquarePen size={16} /> Mapping overrides
                   </div>
-                  <div className="mapping-editor-list">
+                  <div className="mapping-editor-list mapping-editor-list-scroll">
                     {result.mappings.length === 0 && <div className="empty-card compact">После генерации здесь появятся найденные соответствия.</div>}
                     {sortedMappingRows.map(({ mapping, index }) => (
                       <div
@@ -3884,7 +4068,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   <div className="pane-header">
                     <TriangleAlert size={16} /> Warnings
                   </div>
-                  <div className="warning-list">
+                  <div className="warning-list warning-list-scroll">
                     {visibleWarnings.map((warning, index) => (
                       <div className="warning-item" key={index}>
                         {warning}
@@ -3989,6 +4173,10 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       <span>предупреждений всего</span>
                     </div>
                     <div className="empty-card compact">
+                      <strong>{profileStats.gigachatApiTokens.toLocaleString('ru-RU')}</strong>
+                      <span>токенов GigaChat API</span>
+                    </div>
+                    <div className="empty-card compact profile-fun-wide">
                       <strong>{profileStats.lastGeneratedAt ? new Date(profileStats.lastGeneratedAt).toLocaleDateString() : '—'}</strong>
                       <span>последняя генерация</span>
                     </div>
@@ -4100,7 +4288,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                   </p>
                 </section>
 
-                <section className="insight-card profile-history-card">
+                <section className="insight-card profile-history-card" ref={profileAccountCardRef}>
                   <div className="pane-header">
                     <Sparkles size={16} /> События обучения
                   </div>
@@ -4126,7 +4314,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </button>
                     ))}
                   </div>
-                  <div className="profile-list">
+                  <div className="profile-list knowledge-scroll-list learning-events-list">
                     {learningEvents.length === 0 && <div className="empty-card compact">Пока нет событий обучения. Они появятся после подтверждений, сохранений в память и попадания кейсов в dataset.</div>}
                     {learningEvents.length > 0 && filteredLearningEvents.length === 0 && (
                       <div className="empty-card compact">
@@ -4208,6 +4396,45 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
               </button>
               <button className="primary-btn history-delete-confirm" disabled={historyDeleteBusyId !== null} onClick={() => void onDeleteHistoryItem()} type="button">
                 <X size={16} /> {historyDeleteBusyId === historyDeleteTarget.id ? 'Удаляем...' : 'Удалить запрос'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {historyClearDialogOpen && !profile.skipped && (
+        <div className="profile-modal-backdrop" role="presentation" onClick={closeClearHistoryModal}>
+          <section className="profile-modal history-delete-modal glass-card" role="dialog" aria-modal="true" aria-labelledby="history-clear-title" onClick={(event) => event.stopPropagation()}>
+            <div className="profile-modal-header">
+              <div className="history-delete-heading">
+                <div className="history-delete-icon" aria-hidden="true">
+                  <TriangleAlert size={18} />
+                </div>
+                <div>
+                  <div className="eyebrow">History cleanup</div>
+                  <h3 id="history-clear-title">Очистить всю историю генераций?</h3>
+                </div>
+              </div>
+              <button className="icon-btn" disabled={historyDeleteBusyId !== null} onClick={closeClearHistoryModal} title="Закрыть" type="button">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="history-delete-copy">
+              <p>
+                Из истории будут удалены <strong>{history.length}</strong> {pluralizeRu(history.length, 'запись', 'записи', 'записей')}.
+              </p>
+              <p className="subtle-text">Связанные сохранённые результаты и исходные файлы тоже будут удалены из backend-хранилища.</p>
+            </div>
+
+            {historyDeleteError && <div className="warning-item auth-status auth-status-error">{historyDeleteError}</div>}
+
+            <div className="history-delete-actions">
+              <button className="secondary-btn" disabled={historyDeleteBusyId !== null} onClick={closeClearHistoryModal} type="button">
+                Отмена
+              </button>
+              <button className="primary-btn history-delete-confirm" disabled={historyDeleteBusyId !== null} onClick={() => void onClearHistory()} type="button">
+                <X size={16} /> {historyDeleteBusyId === CLEAR_HISTORY_BUSY_ID ? 'Очищаем...' : 'Очистить историю'}
               </button>
             </div>
           </section>

@@ -126,10 +126,61 @@ class DraftJsonPipelineTests(unittest.TestCase):
             )
 
         self.assertIn('customerName', draft_json)
+        self.assertEqual(draft_json['customerName'], 'Иванов Иван')
+        self.assertEqual(draft_json['summaRub'], 120000)
         customer_name_field = next(item for item in field_suggestions if item['source_column'] == 'ФИО клиента')
         self.assertEqual(customer_name_field['source_of_truth'], 'personal_memory')
         self.assertEqual(customer_name_field['status'], 'accepted')
+        self.assertEqual(customer_name_field['sample_values'], ['Иванов Иван'])
+        self.assertEqual(customer_name_field['representative_value'], 'Иванов Иван')
         self.assertEqual(warnings, [])
+
+    def test_draft_json_prefers_representative_sample_values(self) -> None:
+        with patch('draft_json_pipeline.suggest_draft_json_fields', return_value=([], [])):
+            draft_json, field_suggestions, warnings = generate_draft_json_for_source(
+                source_columns=['inn', 'createdAt', 'isActive', 'comment'],
+                source_rows=[
+                    {'inn': '7701234567', 'createdAt': '01.02.2025', 'isActive': 'да', 'comment': '-'},
+                    {'inn': '7701234568', 'createdAt': '02.02.2025', 'isActive': 'нет', 'comment': 'Первый нормальный комментарий'},
+                ],
+            )
+
+        self.assertEqual(
+            draft_json,
+            {
+                'inn': 7701234567,
+                'createdAt': '2025-02-01',
+                'isActive': True,
+                'comment': 'Первый нормальный комментарий',
+            },
+        )
+        comment_field = next(item for item in field_suggestions if item['source_column'] == 'comment')
+        self.assertEqual(comment_field['sample_values'], ['Первый нормальный комментарий'])
+        self.assertEqual(comment_field['null_ratio'], 0.5)
+        self.assertEqual(warnings, [])
+
+    def test_sparse_column_can_fall_back_to_null_for_large_almost_empty_source(self) -> None:
+        with patch('draft_json_pipeline.suggest_draft_json_fields', return_value=([], [])):
+            draft_json, field_suggestions, _ = generate_draft_json_for_source(
+                source_columns=['rareValue'],
+                source_rows=[
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': ''},
+                    {'rareValue': 'only-one'},
+                ],
+            )
+
+        self.assertEqual(draft_json, {'rareValue': None})
+        rare_field = field_suggestions[0]
+        self.assertEqual(rare_field['field_type'], 'string')
+        self.assertEqual(rare_field['null_ratio'], 0.9)
 
 
 if __name__ == '__main__':

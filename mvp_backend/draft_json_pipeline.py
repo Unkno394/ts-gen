@@ -84,6 +84,9 @@ def generate_draft_json_for_source(
         confidence = 'low'
         target_key = str(heuristic['suggested_key'])
         default_value = heuristic['default_value']
+        sample_values = list(heuristic.get('sample_values') or [])
+        null_ratio = heuristic.get('null_ratio')
+        representative_value = heuristic.get('representative_value', default_value)
 
         personal_match = _pick_candidate(personal_candidates.get(source_key, []), min_score=PERSONAL_DRAFT_NAME_MIN_SCORE)
         if personal_match is not None and personal_match.get('target_field'):
@@ -96,7 +99,6 @@ def generate_draft_json_for_source(
             model_match = model_by_source.get(source_column)
             if model_match is not None and model_match.get('target'):
                 target_key = str(model_match['target'])
-                default_value = model_match.get('default_value', default_value)
                 source_of_truth = 'model_suggestion'
                 status = 'suggested'
                 confidence = str(model_match.get('confidence') or 'medium')
@@ -118,6 +120,9 @@ def generate_draft_json_for_source(
                 'target_field': unique_key,
                 'default_value': default_value,
                 'field_type': heuristic['field_type'],
+                'sample_values': sample_values,
+                'null_ratio': null_ratio,
+                'representative_value': representative_value,
                 'status': status,
                 'source_of_truth': source_of_truth,
                 'confidence': confidence,

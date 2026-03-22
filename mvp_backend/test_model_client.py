@@ -590,6 +590,62 @@ class ModelClientRuntimeTests(unittest.TestCase):
             )
         )
 
+    def test_gigachat_usage_is_accumulated_per_request_capture(self) -> None:
+        with patch.dict(
+            'os.environ',
+            {
+                'TSGEN_MODEL_PROVIDER': 'gigachat',
+                'TSGEN_MODEL_BASE_URL': 'https://gigachat.devices.sberbank.ru/api/v1',
+                'TSGEN_MODEL_NAME': 'GigaChat-2-Pro',
+                'TSGEN_MODEL_API_KEY': 'gigachat-access-token',
+            },
+            clear=False,
+        ):
+            def fake_post_json(
+                url: str,
+                payload: dict,
+                headers: dict,
+                timeout_seconds: float,
+                ssl_context=None,
+            ) -> dict:
+                return {
+                    'choices': [
+                        {
+                            'message': {
+                                'content': '{"target":"amount","best_candidate":"Сумма","confidence":0.91,"reason":"exact"}'
+                            }
+                        }
+                    ],
+                    'usage': {
+                        'prompt_tokens': 40,
+                        'completion_tokens': 7,
+                        'total_tokens': 47,
+                        'precached_prompt_tokens': 3,
+                    },
+                }
+
+            capture = model_client.begin_model_usage_capture()
+            try:
+                with patch('model_client._post_json', side_effect=fake_post_json):
+                    ranking, warnings = model_client.rank_mapping_candidate(
+                        target_field='amount',
+                        target_type='number',
+                        candidates=['Сумма', 'Дата'],
+                    )
+                    usage = model_client.get_captured_model_usage()
+            finally:
+                model_client.end_model_usage_capture(capture)
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(ranking['best_candidate'], 'Сумма')
+        self.assertEqual(usage['provider'], 'gigachat')
+        self.assertEqual(usage['model_name'], 'GigaChat-2-Pro')
+        self.assertEqual(usage['input_tokens'], 40)
+        self.assertEqual(usage['output_tokens'], 7)
+        self.assertEqual(usage['total_tokens'], 47)
+        self.assertEqual(usage['estimated_tokens_saved'], 3)
+        self.assertEqual(usage['call_count'], 1)
+
     def test_gigachat_markdown_fence_json_is_parsed(self) -> None:
         with patch.dict(
             'os.environ',

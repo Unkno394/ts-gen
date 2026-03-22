@@ -742,18 +742,39 @@ input::-ms-reveal {
   overflow: hidden;
 }
 
+.sidebar-history-card-match-account {
+  flex: 0 1 auto;
+}
+
 .history-list.sidebar-history-list {
   flex: 1 1 auto;
   min-height: 0;
   height: auto;
   max-height: none;
-  -ms-overflow-style: none;
-  scrollbar-width: none;
+  padding-right: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
 }
 
 .history-list.sidebar-history-list::-webkit-scrollbar {
-  width: 0;
-  height: 0;
+  width: 8px;
+}
+
+.history-list.sidebar-history-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(183, 195, 255, 0.34);
+}
+
+.history-list.sidebar-history-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sidebar-history-reset {
+  width: 100%;
+  flex: 0 0 auto;
+  min-height: 46px;
 }
 
 .generator-panel .primary-btn,
@@ -816,6 +837,8 @@ input::-ms-reveal {
 
 .insight-card {
   min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel-title,
@@ -874,7 +897,17 @@ input::-ms-reveal {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+  margin-top: 14px;
   margin-bottom: 10px;
+}
+
+.generator-action-row > .secondary-btn {
+  width: 100%;
+  min-height: 54px;
+}
+
+.generator-action-row > :only-child {
+  grid-column: 1 / -1;
 }
 
 .editor-area {
@@ -884,6 +917,12 @@ input::-ms-reveal {
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 18px;
   background: rgba(6, 8, 15, 0.82);
+}
+
+.schema-editor-area {
+  padding: 24px 26px !important;
+  line-height: 1.7;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
 }
 
 .history-list {
@@ -1217,6 +1256,11 @@ input::-ms-reveal {
   --knowledge-scroll-item-min-height: 166px;
 }
 
+.learning-events-list {
+  --knowledge-scroll-gap: 14px;
+  --knowledge-scroll-item-min-height: 134px;
+}
+
 .profile-list-item {
   display: flex;
   align-items: center;
@@ -1514,6 +1558,11 @@ input::-ms-reveal {
 
 .profile-fun-grid .empty-card strong {
   font-size: 28px;
+}
+
+.profile-fun-grid .empty-card.profile-fun-wide {
+  grid-column: 1 / -1;
+  min-height: 98px;
 }
 
 .memory-layer-grid {
@@ -1894,16 +1943,22 @@ input::-ms-reveal {
 .data-grid-wrap,
 .code-pane,
 .preview-pane {
-  min-height: 320px;
-  max-height: 420px;
-  overflow: auto;
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 18px;
   background: rgba(6, 8, 15, 0.86);
 }
 
+.data-grid-wrap {
+  max-height: 420px;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+
 .code-pane,
 .preview-pane {
+  min-height: 320px;
+  max-height: 420px;
+  overflow: auto;
   margin: 0;
   padding: 16px;
   font-size: 13px;
@@ -1934,6 +1989,35 @@ input::-ms-reveal {
 .mapping-editor-list {
   display: grid;
   gap: 12px;
+}
+
+.mapping-editor-list-scroll {
+  --mapping-editor-scroll-gap: 12px;
+  --mapping-editor-row-height: 208px;
+  max-height: calc(var(--mapping-editor-row-height) * 2 + var(--mapping-editor-scroll-gap));
+  padding-right: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.mapping-editor-list-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.mapping-editor-list-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(183, 195, 255, 0.34);
+}
+
+.mapping-editor-list-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.mapping-editor-list-scroll .mapping-editor-row,
+.mapping-editor-list-scroll .empty-card {
+  min-height: var(--mapping-editor-row-height);
 }
 
 .mapping-editor-row {
@@ -2132,8 +2216,8 @@ input::-ms-reveal {
 
 .review-queue-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .review-queue-stat {
@@ -2166,6 +2250,25 @@ input::-ms-reveal {
   gap: 10px;
   margin-top: 12px;
   min-width: 0;
+  max-height: 312px;
+  padding-right: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.review-queue-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.review-queue-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(183, 195, 255, 0.34);
+}
+
+.review-queue-list::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .review-queue-item {
@@ -2176,6 +2279,17 @@ input::-ms-reveal {
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
   min-width: 0;
+}
+
+.review-queue-empty-card {
+  display: block;
+  min-height: auto;
+  margin-top: 12px;
+  padding: 18px 20px;
+  place-items: stretch;
+  align-content: start;
+  text-align: left;
+  line-height: 1.55;
 }
 
 .review-queue-item span {
@@ -2270,7 +2384,7 @@ input::-ms-reveal {
 .insight-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  align-items: start;
+  align-items: stretch;
   gap: 16px;
 }
 
@@ -2279,6 +2393,35 @@ input::-ms-reveal {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+}
+
+.warning-list-scroll {
+  --warning-scroll-gap: 10px;
+  --warning-item-min-height: 92px;
+  max-height: calc(var(--warning-item-min-height) * 6 + var(--warning-scroll-gap) * 5);
+  padding-right: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.warning-list-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.warning-list-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(183, 195, 255, 0.34);
+}
+
+.warning-list-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.warning-list-scroll .warning-item,
+.warning-list-scroll .empty-card {
+  min-height: var(--warning-item-min-height);
 }
 
 .warning-item,
@@ -2293,21 +2436,22 @@ input::-ms-reveal {
 }
 
 .generation-quality-grid {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 12px;
 }
 
 .generation-quality-item {
   display: grid;
   gap: 6px;
-  flex: 1 1 220px;
   padding: 12px 14px;
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
+  min-height: 156px;
   min-width: 0;
+  align-content: start;
 }
 
 .generation-quality-item span {

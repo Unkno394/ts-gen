@@ -21,6 +21,7 @@ from email_service import (
 )
 from generator import build_preview, generate_typescript
 from learning_pipeline import resolve_generation_mappings_detailed
+from model_client import begin_model_usage_capture, end_model_usage_capture, get_captured_model_usage
 from models import (
     AuthPayload,
     ChangeEmailPayload,
@@ -56,6 +57,7 @@ from parsers import (
     parse_file,
     parse_target_schema,
     preview_business_form_resolutions,
+    resolve_draft_json_source,
     resolve_generation_source,
 )
 from storage import (
@@ -1251,6 +1253,7 @@ async def generate(
     current_user: dict[str, str] | None = Depends(get_optional_current_user),
 ) -> dict:
     cleanup_expired_guest_files()
+    usage_capture = begin_model_usage_capture()
 
     filename = file.filename or 'uploaded_file'
     file_bytes = await file.read()
@@ -1331,6 +1334,7 @@ async def generate(
         }
         all_warnings = parsed.warnings + source_warnings + mapping_warnings
         serialized_mappings = [_model_to_dict(m) for m in mappings]
+        captured_model_usage = get_captured_model_usage()
 
         generation_id = None
         response_mappings = serialized_mappings
@@ -1352,6 +1356,17 @@ async def generate(
                 upload_record_id=upload_record_id,
                 schema_fingerprint_id=resolved_schema_fingerprint_id,
                 promotion_mode='confirmed_only',
+                generation_metrics={
+                    'provider': captured_model_usage.get('provider') or 'gigachat',
+                    'model_name': captured_model_usage.get('model_name') or 'unknown',
+                    'input_tokens': captured_model_usage.get('input_tokens') or 0,
+                    'output_tokens': captured_model_usage.get('output_tokens') or 0,
+                    'total_tokens': captured_model_usage.get('total_tokens') or 0,
+                    'estimated_tokens_saved': captured_model_usage.get('estimated_tokens_saved') or 0,
+                    'cache_hits': 0,
+                    'cache_misses': int(captured_model_usage.get('call_count') or 0),
+                    'success': True,
+                },
             )
             response_mappings = save_mapping_suggestions(
                 generation_id=generation_id,
@@ -1384,6 +1399,13 @@ async def generate(
             'generated_typescript': ts_code,
             'preview': preview,
             'warnings': all_warnings,
+            'token_usage': {
+                'provider': captured_model_usage.get('provider'),
+                'model_name': captured_model_usage.get('model_name'),
+                'input_tokens': int(captured_model_usage.get('input_tokens') or 0),
+                'output_tokens': int(captured_model_usage.get('output_tokens') or 0),
+                'total_tokens': int(captured_model_usage.get('total_tokens') or 0),
+            },
             'target_schema': target_schema,
             'required_fields': target_schema_summary['required_fields'],
             'ts_valid': bool(ts_validation['valid']),
@@ -1425,6 +1447,10 @@ async def generate(
         raise HTTPException(status_code=500, detail='Произошла внутренняя ошибка сервера. Попробуйте ещё раз.') from exc
 
 
+    finally:
+        end_model_usage_capture(usage_capture)
+
+
 @router.post('/draft-json')
 async def draft_json(
     file: UploadFile = File(...),
@@ -1449,12 +1475,13 @@ async def draft_json(
             user_id=resolved_user_id,
         )
         parsed = parse_file(saved_path, filename)
-        source_columns, source_rows, source_warnings = resolve_generation_source(parsed, selected_sheet)
+        effective_selected_sheet = selected_sheet.strip() if selected_sheet and selected_sheet.strip() else None
+        source_columns, source_rows, source_warnings = resolve_draft_json_source(parsed, selected_sheet=effective_selected_sheet)
         parsed_file_json = json.dumps(_model_to_dict(parsed), ensure_ascii=False)
         schema_fingerprint_id = ensure_schema_fingerprint(
             parsed_file_json=parsed_file_json,
             target_json=json.dumps({}, ensure_ascii=False),
-            selected_sheet=selected_sheet,
+            selected_sheet=effective_selected_sheet,
             source_columns=source_columns,
             user_id=resolved_user_id,
         )
@@ -1538,6 +1565,13 @@ def history(current_user: dict[str, str] = Depends(get_current_user)) -> dict:
                 'preview': json.loads(item['preview_json']),
                 'warnings': json.loads(item['warnings_json']),
                 'validation': json.loads(item['validation_json']) if item.get('validation_json') else {},
+                'token_usage': {
+                    'provider': item.get('token_usage_provider'),
+                    'model_name': item.get('token_usage_model_name'),
+                    'input_tokens': int(item.get('token_usage_input_tokens') or 0),
+                    'output_tokens': int(item.get('token_usage_output_tokens') or 0),
+                    'total_tokens': int(item.get('token_usage_total_tokens') or 0),
+                },
                 'created_at': item['created_at'],
             }
         )

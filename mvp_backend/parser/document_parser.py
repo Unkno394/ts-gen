@@ -9,7 +9,7 @@ from docx_parser import parse_docx
 from form_layout import extract_layout_layer, understand_generic_form
 from form_parser import extract_kv_pairs
 from pdf_parser import parse_pdf
-from text_parser import extract_sections, extract_text_facts, normalize_text, split_text_blocks
+from text_parser import extract_sections, extract_tables, extract_text_facts, normalize_text, split_text_blocks
 
 
 class UnsupportedFileTypeError(ValueError):
@@ -64,15 +64,21 @@ def _parse_text_file(path: Path) -> dict[str, Any]:
     for encoding in encodings_to_try:
         try:
             text = path.read_text(encoding=encoding)
+            tables = extract_tables(text)
+            columns = [str(column) for column in tables[0].get('columns', [])] if tables else []
+            rows = [dict(row) for row in tables[0].get('rows', []) if isinstance(row, dict)] if tables else []
+            warnings: list[str] = []
+            if len(tables) > 1:
+                warnings.append(f'Found {len(tables)} tables in TXT.')
             return {
                 'file_name': path.name,
                 'file_type': 'txt',
-                'columns': [],
-                'rows': [],
-                'tables': [],
+                'columns': columns,
+                'rows': rows,
+                'tables': tables,
                 'text': text,
                 'blocks': [],
-                'warnings': [],
+                'warnings': warnings,
             }
         except Exception as exc:  # noqa: BLE001
             last_error = exc
@@ -134,6 +140,7 @@ def _enrich_document_result(*, path: Path, ext: str, base_result: dict[str, Any]
         kv_pairs=kv_pairs,
     )
     document_mode = 'data_table_mode'
+    downgrade_form_mode_for_multitable_docx = False
     if isinstance(form_model, dict):
         layout_meta = form_model.get('layout_meta')
         if isinstance(layout_meta, dict) and layout_meta.get('document_mode') == 'form_layout_mode':

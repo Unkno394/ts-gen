@@ -1110,6 +1110,43 @@ class StorageLearningTests(unittest.TestCase):
         self.assertIsNone(upload_row['generation_id'])
         self.assertEqual(str(upload_row['status']), 'deleted')
 
+    def test_history_includes_saved_gigachat_token_usage(self) -> None:
+        generation_id = storage.save_generation(
+            user_id='user-token-usage',
+            file_name='token-usage.csv',
+            file_path='runtime/token-usage.csv',
+            file_type='csv',
+            target_json=json.dumps({'customerName': '', 'amount': 0}, ensure_ascii=False),
+            mappings_json=json.dumps(
+                [
+                    {'source': 'customer_name', 'target': 'customerName', 'confidence': 'high', 'reason': 'exact'},
+                    {'source': 'amount', 'target': 'amount', 'confidence': 'high', 'reason': 'exact'},
+                ],
+                ensure_ascii=False,
+            ),
+            generated_typescript='export function transform() { return {}; }',
+            preview_json=json.dumps([{'customerName': 'Alice', 'amount': 10}], ensure_ascii=False),
+            warnings_json=json.dumps([], ensure_ascii=False),
+            generation_metrics={
+                'provider': 'gigachat',
+                'model_name': 'GigaChat-2-Pro',
+                'input_tokens': 120,
+                'output_tokens': 18,
+                'total_tokens': 138,
+                'estimated_tokens_saved': 4,
+                'success': True,
+            },
+        )
+
+        history_item = storage.get_history('user-token-usage')[0]
+
+        self.assertEqual(int(history_item['id']), generation_id)
+        self.assertEqual(history_item['token_usage_provider'], 'gigachat')
+        self.assertEqual(history_item['token_usage_model_name'], 'GigaChat-2-Pro')
+        self.assertEqual(int(history_item['token_usage_input_tokens']), 120)
+        self.assertEqual(int(history_item['token_usage_output_tokens']), 18)
+        self.assertEqual(int(history_item['token_usage_total_tokens']), 138)
+
 
 if __name__ == '__main__':
     unittest.main()
