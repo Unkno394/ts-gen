@@ -12,7 +12,7 @@ from matcher import (
     normalize,
     prepare_field_name,
 )
-from model_client import rank_mapping_candidate
+from model_client import rank_mapping_candidate, suggest_field_mappings
 from models import FieldMapping, TargetField
 from storage import (
     get_global_mapping_pattern_candidates,
@@ -443,6 +443,19 @@ def resolve_generation_mappings_detailed(
         explain_rows.append(_build_explain_row(unresolved_mapping))
 
     resolved = [resolved_by_target[target.name] for target in target_fields]
+    resolved, llm_fallback_warnings, llm_fallback_stats = _apply_llm_fallback_for_unresolved_mappings(
+        resolved=resolved,
+        source_columns=source_columns,
+        source_rows=source_rows or [],
+        used_sources=used_sources,
+        personal_candidates=personal_candidates,
+        global_candidates=global_candidates,
+        schema_fingerprint_id=schema_fingerprint_id,
+    )
+    warnings.extend(llm_fallback_warnings)
+    if llm_fallback_stats:
+        stats['model_suggestion'] += llm_fallback_stats.get('resolved_count', 0)
+
     resolved, routing_warnings, routing_stats = _apply_source_routing_penalties(
         resolved=resolved,
         source_routing_context=source_routing_context,
@@ -450,8 +463,11 @@ def resolve_generation_mappings_detailed(
     warnings.extend(routing_warnings)
     if routing_stats:
         stats['source_routing_adjusted'] = routing_stats['adjusted_count']
+
+    explain_rows = [_build_explain_row(mapping) for mapping in resolved]
     deduped_warnings = _dedupe(warnings)
     unresolved_fields = [mapping.target for mapping in resolved if mapping.source is None]
+    stats['unresolved'] = len(unresolved_fields)
 
     if all(mapping.source is None for mapping in resolved) and len(source_columns) == len(target_fields):
         logger.warning(
@@ -506,6 +522,100 @@ def resolve_generation_mappings_detailed(
             ],
         },
     }
+
+
+def _apply_llm_fallback_for_unresolved_mappings(
+    *,
+    resolved: list[FieldMapping],
+    source_columns: list[str],
+    source_rows: list[dict[str, Any]],
+    used_sources: set[str],
+    personal_candidates: dict[str, list[dict[str, Any]]],
+    global_candidates: dict[str, list[dict[str, Any]]],
+    schema_fingerprint_id: int | None,
+) -> tuple[list[FieldMapping], list[str], dict[str, int]]:
+    unresolved = [mapping for mapping in resolved if mapping.source is None]
+    if not unresolved or not source_columns:
+        return resolved, [], {'resolved_count': 0}
+
+    unresolved_targets = [mapping.target for mapping in unresolved]
+    logger.info(
+        'mapping null-fallback start: unresolved_targets=%d source_columns=%d sample_rows=%d',
+        len(unresolved_targets),
+        len(source_columns),
+        len(source_rows),
+    )
+    personal_hints = _collect_model_hint_preview(personal_candidates, unresolved_targets)
+    global_hints = _collect_model_hint_preview(global_candidates, unresolved_targets)
+    llm_mappings, llm_warnings = suggest_field_mappings(
+        source_columns=source_columns,
+        target_fields=unresolved_targets,
+        sample_rows=source_rows,
+        personal_hints=personal_hints,
+        global_hints=global_hints,
+    )
+    if not llm_mappings:
+        logger.info(
+            'mapping null-fallback returned no mappings: unresolved_targets=%s warnings=%s',
+            unresolved_targets,
+            '; '.join(llm_warnings) if llm_warnings else 'none',
+        )
+        llm_warnings.append(
+            f'LLM fallback for unresolved fields returned no mappings: {", ".join(unresolved_targets)}.'
+        )
+        return resolved, llm_warnings, {'resolved_count': 0}
+
+    updated: list[FieldMapping] = []
+    resolved_count = 0
+    used_sources_local = set(used_sources)
+    llm_mapping_by_target = {
+        str(item.get('target')): item
+        for item in llm_mappings
+        if isinstance(item, dict) and item.get('target')
+    }
+
+    for mapping in resolved:
+        if mapping.source is not None:
+            updated.append(mapping)
+            continue
+
+        llm_mapping = llm_mapping_by_target.get(mapping.target)
+        source_field = str(llm_mapping.get('source') or '').strip() if llm_mapping else ''
+        if not source_field or source_field in used_sources_local or source_field not in source_columns:
+            updated.append(mapping)
+            continue
+
+        metadata = dict(mapping.candidate_metadata or {})
+        metadata.update(
+            {
+                'null_fallback_triggered': True,
+                'fallback_path': 'unresolved_model_batch',
+                'model_reason': str(llm_mapping.get('reason') or 'semantic_model'),
+            }
+        )
+        updated_mapping = _clone_mapping(
+            mapping,
+            source=source_field,
+            confidence=str(llm_mapping.get('confidence') or 'medium'),
+            reason=str(llm_mapping.get('reason') or 'semantic_model'),
+            status='suggested',
+            source_of_truth='model_suggestion',
+            schema_fingerprint_id=schema_fingerprint_id,
+            candidate_metadata=metadata,
+        )
+        updated.append(updated_mapping)
+        used_sources_local.add(source_field)
+        resolved_count += 1
+        llm_warnings.append(
+            f'Поле "{mapping.target}" было автоматически отправлено в модель после null/unresolved результата и сопоставлено с "{source_field}".'
+        )
+
+    logger.info(
+        'mapping null-fallback done: resolved_count=%d unresolved_before=%d',
+        resolved_count,
+        len(unresolved_targets),
+    )
+    return updated, llm_warnings, {'resolved_count': resolved_count}
 
 
 def build_candidates_for_unresolved_field(
@@ -848,6 +958,33 @@ def _group_candidates_by_target(candidates: list[dict[str, Any]]) -> dict[str, l
             continue
         grouped[str(target_value)].append(candidate)
     return grouped
+
+
+def _collect_model_hint_preview(
+    grouped_candidates: dict[str, list[dict[str, Any]]],
+    target_fields: list[str],
+) -> list[dict[str, Any]]:
+    preview: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for target_field in target_fields:
+        normalized_target = normalize(target_field)
+        for candidate in grouped_candidates.get(normalized_target, [])[:3]:
+            source_field = str(candidate.get('source_field') or '').strip()
+            if not source_field:
+                continue
+            pair = (target_field, source_field)
+            if pair in seen_pairs:
+                continue
+            preview.append(
+                {
+                    'target_field': target_field,
+                    'source_field': source_field,
+                    'score': float(candidate.get('score', 0.0)),
+                    'reason': str(candidate.get('reason') or ''),
+                }
+            )
+            seen_pairs.add(pair)
+    return preview
 
 
 def _is_strong_deterministic_mapping(mapping: FieldMapping) -> bool:

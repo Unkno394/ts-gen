@@ -220,6 +220,20 @@ class ModelClientRuntimeTests(unittest.TestCase):
         self.assertEqual(mappings, [])
         self.assertEqual(warnings, ['GigaChat не ответил вовремя за 5 сек.'])
 
+    def test_truncate_sample_rows_spreads_rows_across_large_document(self) -> None:
+        rows = [
+            {'page': 1, 'code': '1000', 'description': 'Операции с денежными средствами в наличной форме:'},
+            {'page': 1, 'code': '1003', 'description': 'Покупка наличной иностранной валюты физическим лицом'},
+            {'page': 4, 'code': '3001', 'description': 'Зачисление или перевод на счет денежных средств'},
+            {'page': 9, 'code': '5007', 'description': 'Операции по иным основаниям'},
+            {'page': 13, 'code': '8001', 'description': 'Заключительная таблица документа'},
+        ]
+
+        truncated = model_client._truncate_sample_rows(rows, 3)
+
+        self.assertEqual([row['page'] for row in truncated], [1, 4, 13])
+        self.assertEqual([row['code'] for row in truncated], ['1000', '3001', '8001'])
+
     def test_rank_mapping_candidate_returns_best_candidate(self) -> None:
         with patch.dict(
             'os.environ',
@@ -732,6 +746,83 @@ class ModelClientRuntimeTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(len(mappings), 1)
         self.assertEqual(mappings[0]['reason'], 'noisy')
+
+    def test_uses_ai_question_provider_fallback_when_gigachat_fails(self) -> None:
+        captured: dict[str, object] = {}
+
+        with patch.dict(
+            'os.environ',
+            {
+                'TSGEN_MODEL_PROVIDER': 'gigachat',
+                'TSGEN_MODEL_BASE_URL': 'https://gigachat.devices.sberbank.ru/api/v1',
+                'TSGEN_MODEL_NAME': 'GigaChat-2-Max',
+                'TSGEN_GIGACHAT_AUTH_KEY': 'client-id:client-secret',
+                'AI_QUESTION_PROVIDER_1_NAME': 'groq-70b',
+                'AI_QUESTION_PROVIDER_1_URL': 'https://api.groq.com/openai/v1/chat/completions',
+                'AI_QUESTION_PROVIDER_1_MODEL': 'llama-3.3-70b-versatile',
+                'AI_QUESTION_PROVIDER_1_KEY': 'groq-test-key',
+            },
+            clear=False,
+        ):
+            def fake_post_form_json(
+                url: str,
+                payload: dict,
+                headers: dict,
+                timeout_seconds: float,
+                ssl_context=None,
+            ) -> dict:
+                raise RuntimeError('Не удалось подключиться к GigaChat OAuth: temporary network failure')
+
+            def fake_post_json(
+                url: str,
+                payload: dict,
+                headers: dict,
+                timeout_seconds: float,
+                ssl_context=None,
+            ) -> dict:
+                captured['url'] = url
+                captured['headers'] = headers
+                captured['payload'] = payload
+                return {
+                    'choices': [
+                        {
+                            'message': {
+                                'content': (
+                                    '{"mappings":[{"target":"customerName","source":"ФИО клиента",'
+                                    '"confidence":"high","reason":"backup_provider"}]}'
+                                )
+                            }
+                        }
+                    ],
+                    'usage': {
+                        'prompt_tokens': 11,
+                        'completion_tokens': 7,
+                        'total_tokens': 18,
+                    },
+                }
+
+            capture = model_client.begin_model_usage_capture()
+            try:
+                with patch('model_client._post_form_json', side_effect=fake_post_form_json), patch(
+                    'model_client._post_json', side_effect=fake_post_json
+                ):
+                    mappings, warnings = model_client.suggest_field_mappings(
+                        source_columns=['ФИО клиента'],
+                        target_fields=['customerName'],
+                        sample_rows=[{'ФИО клиента': 'Иванов Иван'}],
+                    )
+                    usage = model_client.get_captured_model_usage()
+            finally:
+                model_client.end_model_usage_capture(capture)
+
+        self.assertEqual(len(mappings), 1)
+        self.assertEqual(mappings[0]['source'], 'ФИО клиента')
+        self.assertEqual(captured['url'], 'https://api.groq.com/openai/v1/chat/completions')
+        self.assertEqual(captured['headers'], {'Authorization': 'Bearer groq-test-key'})
+        self.assertEqual(captured['payload']['model'], 'llama-3.3-70b-versatile')
+        self.assertIn('Использован резервный LLM провайдер: groq-70b.', warnings)
+        self.assertEqual(usage['provider'], 'groq-70b')
+        self.assertEqual(usage['total_tokens'], 18)
 
 
 if __name__ == '__main__':

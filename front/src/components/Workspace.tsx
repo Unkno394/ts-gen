@@ -2657,6 +2657,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
 
   const handleSelectedFile = async (file: File) => {
     setSelectedFile(file);
+    setTargetJsonPrepared(tryNormalizeJsonText(schema) !== null);
     let parsed = await parseFile(file);
     if (needsBackendSourcePreview(parsed.extension)) {
       try {
@@ -2672,7 +2673,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     setParsedFile(parsed);
     setActivePreviewSheet(parsed.sheets[0]?.name ?? null);
     setSourceStructureTab(preferredSourceStructureTab(parsed));
-    setTargetJsonPrepared(Boolean(uploadedTargetJson));
+    setTargetJsonPrepared(tryNormalizeJsonText(schema) !== null);
     setSectionStateCache({});
     setAutoGenerateSectionKey(null);
     setSaveMessage('');
@@ -3046,7 +3047,7 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
         file: selectedFile,
         targetJson: normalizedSchema,
         userId: profile.skipped ? undefined : profile.id,
-        selectedSheet: parsedFile?.sheets.length ? currentPreviewSheet?.name : undefined,
+        selectedSheet: parsedFile?.extension === 'xlsx' || parsedFile?.extension === 'xls' ? currentPreviewSheet?.name : undefined,
         parsedFile: shouldUseParsedFileOverride(parsedFile) ? parsedFile : null,
       });
 

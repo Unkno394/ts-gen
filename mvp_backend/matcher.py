@@ -51,11 +51,22 @@ SYNONYM_GROUPS = {
     'date': {'date', 'day', 'дата', 'data'},
     'created': {'create', 'created', 'creation', 'создан', 'создания', 'sozdan', 'sozdaniya'},
     'updated': {'update', 'updated', 'lastupdate', 'обновлен', 'обновления', 'obnovlen', 'obnovleniya'},
-    'id': {'id', 'identifier', 'код', 'номер', 'identyfikator', 'nomer', 'kod'},
+    'id': {'id', 'identifier', 'code', 'код', 'номер', 'identyfikator', 'nomer', 'kod'},
     'amount': {'amount', 'sum', 'total', 'сумма', 'стоимость', 'итого', 'summa', 'itogo'},
     'revenue': {'revenue', 'income', 'выручка', 'доход', 'vyruchka', 'dohod'},
     'name': {'name', 'title', 'fullname', 'full_name', 'название', 'имя', 'фио', 'nazvanie', 'imya', 'fio'},
-    'description': {'description', 'details', 'comment', 'описание', 'комментарий', 'opisanie', 'kommentariy'},
+    'description': {
+        'description',
+        'descr',
+        'details',
+        'comment',
+        'описание',
+        'комментарий',
+        'наименование',
+        'opisanie',
+        'kommentariy',
+        'naimenovanie',
+    },
     'product': {'product', 'item', 'sku', 'товар', 'продукт', 'tovar', 'produkt'},
     'quantity': {'quantity', 'qty', 'count', 'количество', 'qty.', 'kolichestvo'},
     'organization': {'organization', 'org', 'company', 'организация', 'компания', 'organizaciya', 'kompaniya'},
@@ -116,7 +127,7 @@ SYNONYM_GROUPS['supply'] = {'supply', 'postavka'}
 SYNONYM_GROUPS['type'] = {'type', 'tip'}
 SYNONYM_GROUPS['vat'] = {'vat', 'nds'}
 
-STOPWORD_TOKENS = {'of', 'by', 'with', 'na', 'po', 's'}
+STOPWORD_TOKENS = {'of', 'by', 'with', 'na', 'po', 's', 'param', 'input', 'items', 'rows', 'data'}
 
 CANONICAL_LOOKUP = {
     alias: canonical
@@ -449,6 +460,27 @@ def _find_alias_sensitive_match(
         )
         if match is not None:
             return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_id'}
+
+    if 'name' in target_canonical:
+        match = find_source(
+            lambda source_tokens, source_canonical: 'naimenovanie' in source_tokens
+            or ('name' in source_canonical and 'description' not in source_canonical)
+        )
+        if match is not None:
+            return {'source': match['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_name'}
+
+    if 'description' in target_canonical:
+        explicit_description = find_source(
+            lambda source_tokens, _source_canonical: bool(source_tokens & {'opisanie', 'description', 'descr', 'comment', 'kommentariy'})
+        )
+        if explicit_description is not None:
+            return {'source': explicit_description['original_name'], 'confidence': 'high', 'reason': 'alias_sensitive_description'}
+
+        fallback_description = find_source(
+            lambda source_tokens, source_canonical: 'naimenovanie' in source_tokens or 'description' in source_canonical
+        )
+        if fallback_description is not None:
+            return {'source': fallback_description['original_name'], 'confidence': 'medium', 'reason': 'alias_sensitive_description_fallback'}
 
     if 'invoice' in target_tokens and 'amount' in target_tokens:
         if 'vat' in target_tokens:

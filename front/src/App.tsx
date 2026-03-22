@@ -19,6 +19,30 @@ function readJSON<T>(key: string, fallback: T): T {
   }
 }
 
+function safeSetLocalStorage(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    console.error(error);
+    if (key === HISTORY_KEY) {
+      try {
+        localStorage.removeItem(HISTORY_KEY);
+      } catch {
+        // Ignore storage cleanup failures.
+      }
+    }
+  }
+}
+
+function isUnauthorizedError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'status' in error &&
+    Number((error as { status?: unknown }).status) === 401
+  );
+}
+
 function SplashScreen() {
   const [activeFrame, setActiveFrame] = useState(0);
 
@@ -58,7 +82,7 @@ function SplashScreen() {
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => readJSON<UserProfile | null>(USER_KEY, null));
-  const [history, setHistory] = useState<HistoryItem[]>(() => readJSON<HistoryItem[]>(HISTORY_KEY, []));
+  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [showSplash, setShowSplash] = useState(true);
 
   useEffect(() => {
@@ -82,22 +106,42 @@ export default function App() {
           return;
         }
 
-        localStorage.setItem(USER_KEY, JSON.stringify(nextProfile));
+        safeSetLocalStorage(USER_KEY, JSON.stringify(nextProfile));
         setProfile(nextProfile);
+      } catch (error) {
+        if (!cancelled) {
+          console.error(error);
+          if (isUnauthorizedError(error)) {
+            clearAuthToken();
+            localStorage.removeItem(USER_KEY);
+            localStorage.removeItem(HISTORY_KEY);
+            setHistory([]);
+            setProfile(null);
+          }
+        }
+        return;
+      }
 
-        const next = await fetchHistory(nextProfile.id);
+      try {
+        const next = await fetchHistory(profile.id);
         if (!cancelled) {
           setHistory(next);
-          localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+          try {
+            localStorage.removeItem(HISTORY_KEY);
+          } catch {
+            // Ignore storage cleanup failures.
+          }
         }
       } catch (error) {
         if (!cancelled) {
           console.error(error);
-          clearAuthToken();
-          localStorage.removeItem(USER_KEY);
-          localStorage.removeItem(HISTORY_KEY);
-          setHistory([]);
-          setProfile(null);
+          if (isUnauthorizedError(error)) {
+            clearAuthToken();
+            localStorage.removeItem(USER_KEY);
+            localStorage.removeItem(HISTORY_KEY);
+            setHistory([]);
+            setProfile(null);
+          }
         }
       }
     }
@@ -111,7 +155,7 @@ export default function App() {
   const actions = useMemo(
     () => ({
       login(next: UserProfile) {
-        localStorage.setItem(USER_KEY, JSON.stringify(next));
+        safeSetLocalStorage(USER_KEY, JSON.stringify(next));
         setProfile(next);
       },
       logout() {
@@ -125,10 +169,14 @@ export default function App() {
         if (!profile || profile.skipped) return;
         const next = await fetchHistory(profile.id);
         setHistory(next);
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+        try {
+          localStorage.removeItem(HISTORY_KEY);
+        } catch {
+          // Ignore storage cleanup failures.
+        }
       },
       updateProfile(next: UserProfile) {
-        localStorage.setItem(USER_KEY, JSON.stringify(next));
+        safeSetLocalStorage(USER_KEY, JSON.stringify(next));
         setProfile(next);
       }
     }),

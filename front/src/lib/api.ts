@@ -861,6 +861,16 @@ function resolveTimeoutMs(envKey: 'VITE_REQUEST_TIMEOUT_MS' | 'VITE_GENERATE_TIM
 
 const GENERATE_REQUEST_TIMEOUT_MS = resolveTimeoutMs('VITE_GENERATE_TIMEOUT_MS', 180_000);
 
+class ApiRequestError extends Error {
+  status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.status = status;
+  }
+}
+
 function normalizeBackendError(detail: string, status?: number): string {
   const normalized = detail.trim();
 
@@ -1186,7 +1196,7 @@ async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     const detail = payload && typeof payload.detail === 'string' ? payload.detail : `Request failed: ${response.status}`;
-    throw new Error(normalizeBackendError(detail, response.status));
+    throw new ApiRequestError(normalizeBackendError(detail, response.status), response.status);
   }
   return response.json() as Promise<T>;
 }

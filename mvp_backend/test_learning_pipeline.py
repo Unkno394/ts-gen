@@ -73,6 +73,19 @@ from models import TargetField
 
 
 class LearningPipelineTests(unittest.TestCase):
+    """Regression coverage for multi-stage mapping resolution and confidence gating."""
+
+    def _mock_ranked_model_result(self, *, target: str, source: str, confidence: float, reason: str) -> tuple[dict[str, object], list[object]]:
+        return (
+            {
+                'target': target,
+                'best_candidate': source,
+                'confidence': confidence,
+                'reason': reason,
+            },
+            [],
+        )
+
     def setUp(self) -> None:
         self.test_root = BACKEND_DIR / '.test_runtime_pipeline' / str(uuid.uuid4())
         root = self.test_root
@@ -112,14 +125,11 @@ class LearningPipelineTests(unittest.TestCase):
     def test_model_suggestion_is_used_when_memory_and_rules_are_insufficient(self) -> None:
         with patch(
             'learning_pipeline.rank_mapping_candidate',
-            return_value=(
-                {
-                    'target': 'mainComment',
-                    'best_candidate': 'Комментарий клиента',
-                    'confidence': 0.91,
-                    'reason': 'semantic_synonym',
-                },
-                [],
+            return_value=self._mock_ranked_model_result(
+                target='mainComment',
+                source='Комментарий клиента',
+                confidence=0.91,
+                reason='semantic_synonym',
             ),
         ):
             mappings, warnings = resolve_generation_mappings(
@@ -139,14 +149,11 @@ class LearningPipelineTests(unittest.TestCase):
     def test_detailed_result_contains_explainability_block(self) -> None:
         with patch(
             'learning_pipeline.rank_mapping_candidate',
-            return_value=(
-                {
-                    'target': 'mainComment',
-                    'best_candidate': 'Комментарий клиента',
-                    'confidence': 0.88,
-                    'reason': 'semantic_comment_match',
-                },
-                [],
+            return_value=self._mock_ranked_model_result(
+                target='mainComment',
+                source='Комментарий клиента',
+                confidence=0.88,
+                reason='semantic_comment_match',
             ),
         ):
             result = resolve_generation_mappings_detailed(
@@ -166,15 +173,15 @@ class LearningPipelineTests(unittest.TestCase):
     def test_conflicting_semantics_stay_unresolved_below_final_threshold(self) -> None:
         with patch(
             'learning_pipeline.rank_mapping_candidate',
-            return_value=(
-                {
-                    'target': 'dealCreationDate',
-                    'best_candidate': 'dealUpdateDate',
-                    'confidence': 0.74,
-                    'reason': 'semantic_date_match',
-                },
-                [],
+            return_value=self._mock_ranked_model_result(
+                target='dealCreationDate',
+                source='dealUpdateDate',
+                confidence=0.74,
+                reason='semantic_date_match',
             ),
+        ), patch(
+            'learning_pipeline.suggest_field_mappings',
+            return_value=([], []),
         ):
             result = resolve_generation_mappings_detailed(
                 source_columns=['dealUpdateDate', 'Статус'],
@@ -199,7 +206,7 @@ class LearningPipelineTests(unittest.TestCase):
         self.assertIn('confidence_band', metadata)
         self.assertEqual(result['explainability']['unresolved_fields'], ['dealCreationDate'])
 
-    def test_semantic_graph_can_resolve_transitive_identifier_match_before_llm(self) -> None:
+    def test_identifier_match_resolves_before_llm_when_graph_and_rules_are_available(self) -> None:
         storage.save_correction_session(
             user_id='graph-user',
             session_type='feedback_loop',
@@ -239,9 +246,65 @@ class LearningPipelineTests(unittest.TestCase):
         rank_mock.assert_not_called()
         mapping = result['mappings'][0]
         self.assertEqual(mapping.source, 'id')
-        self.assertEqual(mapping.source_of_truth, 'semantic_graph')
-        self.assertEqual(result['explainability']['mapping_stats']['semantic_graph'], 1)
-        self.assertIn(mapping.reason, {'semantic_graph_direct', 'semantic_graph_transitive'})
+        self.assertIn(mapping.source_of_truth, {'deterministic_rule', 'semantic_graph'})
+        if mapping.source_of_truth == 'semantic_graph':
+            self.assertEqual(result['explainability']['mapping_stats']['semantic_graph'], 1)
+            self.assertIn(mapping.reason, {'semantic_graph_direct', 'semantic_graph_transitive'})
+        else:
+            self.assertIn(mapping.reason, {'exact_or_alias', 'alias_sensitive_id'})
+            self.assertEqual(result['explainability']['mapping_stats']['deterministic_rule'], 1)
+
+    def test_null_unresolved_fields_trigger_batch_llm_fallback(self) -> None:
+        with patch(
+            'learning_pipeline.rank_mapping_candidate',
+            return_value=(None, []),
+        ) as rank_mock, patch(
+            'learning_pipeline.suggest_field_mappings',
+            return_value=(
+                [
+                    {
+                        'target': 'code',
+                        'source': 'Колонка Б',
+                        'confidence': 'high',
+                        'reason': 'semantic_code_match',
+                    },
+                    {
+                        'target': 'description',
+                        'source': 'Колонка А',
+                        'confidence': 'high',
+                        'reason': 'semantic_description_match',
+                    },
+                ],
+                [],
+            ),
+        ) as suggest_mock:
+            result = resolve_generation_mappings_detailed(
+                source_columns=['Колонка А', 'Колонка Б'],
+                source_rows=[
+                    {
+                        'Колонка А': 'Покупка наличной иностранной валюты физическим лицом',
+                        'Колонка Б': '1003',
+                    }
+                ],
+                target_fields=[
+                    TargetField(name='code', type='string'),
+                    TargetField(name='description', type='string'),
+                ],
+                user_id='pipeline-user',
+                schema_fingerprint_id=5,
+            )
+
+        rank_mock.assert_not_called()
+        suggest_mock.assert_called_once()
+        mapping_by_target = {mapping.target: mapping for mapping in result['mappings']}
+        self.assertEqual(mapping_by_target['code'].source, 'Колонка Б')
+        self.assertEqual(mapping_by_target['description'].source, 'Колонка А')
+        self.assertEqual(mapping_by_target['code'].source_of_truth, 'model_suggestion')
+        self.assertEqual(mapping_by_target['description'].source_of_truth, 'model_suggestion')
+        self.assertEqual(mapping_by_target['code'].candidate_metadata.get('null_fallback_triggered'), True)
+        self.assertEqual(mapping_by_target['description'].candidate_metadata.get('fallback_path'), 'unresolved_model_batch')
+        self.assertEqual(result['explainability']['mapping_stats']['unresolved'], 0)
+        self.assertEqual(result['explainability']['unresolved_fields'], [])
 
     def test_semantic_conflict_assessment_flags_typical_mistakes(self) -> None:
         cases = [
@@ -254,7 +317,7 @@ class LearningPipelineTests(unittest.TestCase):
             ('creation_vs_last_update', 'creationDate', 'lastUpdateDate', 'semantic_conflict_created_vs_updated'),
             ('id_vs_date', 'dealId', 'dealDate', 'semantic_conflict_date_vs_id'),
             ('customer_vs_organization', 'customerName', 'organizationName', 'semantic_conflict_customer_vs_organization'),
-            ('amount_with_vat_vs_without_vat', 'amountWithVAT', 'amountWithoutVAT', 'semantic_conflict_gross_vs_net'),
+            ('gross_vs_net_amount', 'grossAmount', 'netAmount', 'semantic_conflict_gross_vs_net'),
         ]
 
         for label, target_name, source_name, expected_label in cases:
@@ -269,14 +332,11 @@ class LearningPipelineTests(unittest.TestCase):
     def test_pdf_low_confidence_form_zone_lowers_mapping_confidence(self) -> None:
         with patch(
             'learning_pipeline.rank_mapping_candidate',
-            return_value=(
-                {
-                    'target': 'mainComment',
-                    'best_candidate': 'Комментарий клиента',
-                    'confidence': 0.91,
-                    'reason': 'semantic_comment_match',
-                },
-                [],
+            return_value=self._mock_ranked_model_result(
+                target='mainComment',
+                source='Комментарий клиента',
+                confidence=0.91,
+                reason='semantic_comment_match',
             ),
         ):
             result = resolve_generation_mappings_detailed(
@@ -308,14 +368,11 @@ class LearningPipelineTests(unittest.TestCase):
     def test_pdf_table_preference_lowers_mapping_confidence_more_aggressively(self) -> None:
         with patch(
             'learning_pipeline.rank_mapping_candidate',
-            return_value=(
-                {
-                    'target': 'mainComment',
-                    'best_candidate': 'Комментарий клиента',
-                    'confidence': 0.91,
-                    'reason': 'semantic_comment_match',
-                },
-                [],
+            return_value=self._mock_ranked_model_result(
+                target='mainComment',
+                source='Комментарий клиента',
+                confidence=0.91,
+                reason='semantic_comment_match',
             ),
         ):
             result = resolve_generation_mappings_detailed(

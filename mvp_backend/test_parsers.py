@@ -301,6 +301,32 @@ class DocumentParserTests(unittest.TestCase):
         self.assertTrue(summary["root_is_array"])
         self.assertEqual([field.name for field in target_fields], ["organizationName", "innOrKio", "isResidentRF"])
 
+    def test_parse_target_schema_flattens_nested_object_fields_inside_array_items(self) -> None:
+        target_json = """
+        {
+          "input": [
+            {
+              "param": {
+                "id": "RADIOLOGIST",
+                "name": "Рентгенолог",
+                "descr": "Диагностика",
+                "createDate": "2025-05-20"
+              }
+            }
+          ]
+        }
+        """
+
+        target_fields, payload, schema, summary = parse_target_schema(target_json)
+
+        self.assertIsInstance(payload, list)
+        self.assertEqual(schema["type"], "array")
+        self.assertTrue(summary["root_is_array"])
+        self.assertEqual(
+            [field.name for field in target_fields],
+            ["param.id", "param.name", "param.descr", "param.createDate"],
+        )
+
     def test_docx_table_is_parsed_without_generic_no_columns_warning(self) -> None:
         path = self.test_root / 'table.docx'
         doc = Document()
@@ -2603,6 +2629,73 @@ class ExcelParserTests(unittest.TestCase):
 
         with self.assertRaises(ParseError):
             resolve_generation_source(parsed, 'Лист2')
+
+    def test_resolve_generation_source_normalizes_multi_table_document_continuations_for_array_targets(self) -> None:
+        parsed = ParsedFile(
+            file_name='115-codes.pdf',
+            file_type='pdf',
+            columns=['Наименование видов операций', 'Код вида операций'],
+            rows=[
+                {'Наименование видов операций': 'Операции с денежными средствами в наличной форме:', 'Код вида операций': '1000'},
+                {'Наименование видов операций': 'Покупка наличной иностранной валюты физическим лицом', 'Код вида операций': '1003'},
+            ],
+            content_type='form',
+            document_mode='form_layout_mode',
+            sheets=[
+                ParsedSheet(
+                    name='Page 1 · Table 1',
+                    columns=['Наименование видов операций', 'Код вида операций'],
+                    rows=[
+                        {'Наименование видов операций': 'Операции с денежными средствами в наличной форме:', 'Код вида операций': '1000'},
+                        {'Наименование видов операций': 'Покупка наличной иностранной валюты физическим лицом', 'Код вида операций': '1003'},
+                    ],
+                ),
+                ParsedSheet(
+                    name='Page 2 · Table 1',
+                    columns=['Продажа наличной иностранной валюты физическим лицом', '1004'],
+                    rows=[
+                        {
+                            'Продажа наличной иностранной валюты физическим лицом': 'Приобретение физическим лицом ценных бумаг за наличный расчёт',
+                            '1004': '1005',
+                        },
+                    ],
+                ),
+                ParsedSheet(
+                    name='Page 3 · Table 1',
+                    columns=['Посторонний текст страницы', 'column2'],
+                    rows=[
+                        {
+                            'Посторонний текст страницы': 'Получение физическим лицом денежных средств по чеку на предъявителя, выданному нерезидентом',
+                            'column2': '1006',
+                        },
+                    ],
+                ),
+            ],
+            warnings=[],
+        )
+
+        columns, rows, warnings = resolve_generation_source(
+            parsed,
+            target_fields=[
+                TargetField(name='code', type='string'),
+                TargetField(name='description', type='string'),
+            ],
+            prefer_tabular_for_array_target=True,
+        )
+
+        self.assertEqual(columns, ['Наименование видов операций', 'Код вида операций'])
+        self.assertEqual(
+            rows,
+            [
+                {'Наименование видов операций': 'Покупка наличной иностранной валюты физическим лицом', 'Код вида операций': '1003'},
+                {'Наименование видов операций': 'Продажа наличной иностранной валюты физическим лицом', 'Код вида операций': '1004'},
+                {'Наименование видов операций': 'Приобретение физическим лицом ценных бумаг за наличный расчёт', 'Код вида операций': '1005'},
+                {'Наименование видов операций': 'Получение физическим лицом денежных средств по чеку на предъявителя, выданному нерезидентом', 'Код вида операций': '1006'},
+            ],
+        )
+        self.assertIn('Generated mapping from normalized merged source structure across 3 tables.', warnings)
+        self.assertIn('Filtered 1 obvious section heading row(s) from the tabular array source.', warnings)
+        self.assertIn('Generation preferred tabular source because target JSON root is an array.', warnings)
 
 
 if __name__ == '__main__':

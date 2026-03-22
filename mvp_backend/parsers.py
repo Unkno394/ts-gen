@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 from copy import deepcopy
 import sys
 from datetime import date, datetime, time
@@ -50,6 +51,8 @@ IMAGE_FILE_TYPES = {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tif', 'tiff', 'webp'}
 PDF_FORM_ZONE_MIN_CONFIDENCE = 0.65
 PDF_TABLE_ZONE_MIN_CONFIDENCE = 0.7
 logger = logging.getLogger(__name__)
+PLACEHOLDER_COLUMN_RE = re.compile(r'^column\d+$', re.IGNORECASE)
+NUMERIC_CODE_RE = re.compile(r'^\d{3,8}$')
 
 FORM_CRITICAL_TARGET_FIELDS = {
     'isresidentrf',
@@ -62,7 +65,7 @@ class ParseError(ValueError):
     pass
 
 
-def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
+def parse_file(file_path: Path, original_name: str | None = None, *, preview_only: bool = True) -> ParsedFile:
     ext = file_path.suffix.lower().lstrip('.')
     original_name = original_name or file_path.name
     parsed_kwargs: dict[str, Any] = {
@@ -88,27 +91,41 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
 
     if ext == 'csv':
         columns, rows = _parse_csv(file_path)
+        preview_rows = rows[:PREVIEW_ROW_LIMIT] if preview_only else rows
         parsed_kwargs.update(
             {
                 'columns': columns,
-                'rows': rows[:PREVIEW_ROW_LIMIT],
+                'rows': preview_rows,
                 'content_type': 'table',
                 'extraction_status': 'structured_extracted',
                 'source_candidates': [
                     SourceCandidate(**candidate)
                     for candidate in build_source_candidates(
-                        tables=[{'name': original_name, 'columns': columns, 'rows': rows[:PREVIEW_ROW_LIMIT]}]
+                        tables=[{'name': original_name, 'columns': columns, 'rows': preview_rows}]
                     )
                 ],
             }
         )
     elif ext in {'xlsx', 'xls'}:
         columns, rows, extra_warnings, sheets = _parse_excel(file_path)
+        preview_rows = rows[:PREVIEW_ROW_LIMIT] if preview_only else rows
+        preview_sheets = (
+            [
+                ParsedSheet(
+                    name=sheet.name,
+                    columns=sheet.columns,
+                    rows=sheet.rows[:PREVIEW_ROW_LIMIT],
+                )
+                for sheet in sheets
+            ]
+            if preview_only
+            else sheets
+        )
         parsed_kwargs.update(
             {
                 'columns': columns,
-                'rows': rows[:PREVIEW_ROW_LIMIT],
-                'sheets': sheets,
+                'rows': preview_rows,
+                'sheets': preview_sheets,
                 'warnings': extra_warnings,
                 'content_type': 'table',
                 'extraction_status': 'structured_extracted',
@@ -121,15 +138,15 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
                                 'columns': sheet.columns,
                                 'rows': sheet.rows,
                             }
-                            for sheet in sheets
+                            for sheet in preview_sheets
                         ]
-                        or [{'name': original_name, 'columns': columns, 'rows': rows[:PREVIEW_ROW_LIMIT]}]
+                        or [{'name': original_name, 'columns': columns, 'rows': preview_rows}]
                     )
                 ],
             }
         )
     elif ext in {'pdf', 'docx', 'txt'} | IMAGE_FILE_TYPES:
-        parsed_kwargs.update(_parse_document(file_path))
+        parsed_kwargs.update(_parse_document(file_path, preview_only=preview_only))
     else:
         raise ParseError(f'Unsupported file type: {ext}')
 
@@ -155,7 +172,7 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         file_name=original_name,
         file_type=ext,
         columns=columns,
-        rows=rows[:PREVIEW_ROW_LIMIT],
+        rows=rows,
         content_type=str(parsed_kwargs['content_type']),
         document_mode=str(parsed_kwargs['document_mode'] or 'data_table_mode'),
         extraction_status=str(parsed_kwargs['extraction_status']),
@@ -252,10 +269,31 @@ def resolve_generation_source(
     parsed_file: ParsedFile,
     selected_sheet: str | None = None,
     target_fields: list[TargetField] | None = None,
+    prefer_tabular_for_array_target: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     pdf_zone_routing = _get_pdf_zone_routing_signals(parsed_file)
     if parsed_file.form_model is not None and pdf_zone_routing:
         parsed_file.form_model.layout_meta['pdf_zone_routing'] = dict(pdf_zone_routing)
+
+    if prefer_tabular_for_array_target:
+        tabular_source = _resolve_preferred_tabular_source(parsed_file, selected_sheet=selected_sheet)
+        if _is_strong_tabular_array_source(
+            source_columns=tabular_source[0],
+            source_rows=tabular_source[1],
+            target_fields=target_fields or [],
+        ):
+            filtered_rows, filtered_count = _filter_obvious_section_heading_rows(
+                source_columns=tabular_source[0],
+                source_rows=tabular_source[1],
+            )
+            extra_warnings = list(tabular_source[2])
+            if filtered_count:
+                extra_warnings.append(
+                    f'Filtered {filtered_count} obvious section heading row(s) from the tabular array source.'
+                )
+            return tabular_source[0], filtered_rows, _dedupe(
+                extra_warnings + ['Generation preferred tabular source because target JSON root is an array.']
+            )
 
     if parsed_file.document_mode == 'form_layout_mode' and target_fields:
         if not pdf_zone_routing.get('prefer_table_source'):
@@ -290,6 +328,48 @@ def resolve_generation_source(
         return parsed_file.columns, parsed_file.rows, []
 
     if selected_sheet is None or selected_sheet.strip() == '':
+        return _resolve_preferred_tabular_source(parsed_file, selected_sheet=selected_sheet)
+
+    normalized_name = selected_sheet.strip()
+    for sheet in parsed_file.sheets:
+        if sheet.name == normalized_name:
+            return (
+                sheet.columns,
+                sheet.rows,
+                [f'Generated mapping from selected sheet: {sheet.name}'],
+            )
+
+    available_sheets = ', '.join(sheet.name for sheet in parsed_file.sheets)
+    label = 'Worksheet' if parsed_file.file_type in {'xlsx', 'xls'} else 'Table'
+    raise ParseError(f'{label} "{selected_sheet}" not found. Available: {available_sheets}')
+
+
+def _resolve_preferred_tabular_source(
+    parsed_file: ParsedFile,
+    *,
+    selected_sheet: str | None = None,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    if not parsed_file.sheets:
+        return parsed_file.columns, parsed_file.rows, []
+
+    if selected_sheet is None or selected_sheet.strip() == '':
+        if len(parsed_file.sheets) > 1 and parsed_file.file_type not in {'xlsx', 'xls'}:
+            normalized_multi_table = _resolve_normalized_multi_table_document_source(parsed_file.sheets)
+            if normalized_multi_table is not None:
+                return normalized_multi_table
+            merged_columns: list[str] = []
+            merged_rows: list[dict[str, Any]] = []
+            for sheet in parsed_file.sheets:
+                for column in sheet.columns:
+                    if column not in merged_columns:
+                        merged_columns.append(column)
+                merged_rows.extend(dict(row) for row in sheet.rows)
+            if merged_columns or merged_rows:
+                return (
+                    merged_columns,
+                    merged_rows,
+                    [f'Generated mapping from merged source structure across {len(parsed_file.sheets)} tables.'],
+                )
         return parsed_file.columns, parsed_file.rows, []
 
     normalized_name = selected_sheet.strip()
@@ -304,6 +384,240 @@ def resolve_generation_source(
     available_sheets = ', '.join(sheet.name for sheet in parsed_file.sheets)
     label = 'Worksheet' if parsed_file.file_type in {'xlsx', 'xls'} else 'Table'
     raise ParseError(f'{label} "{selected_sheet}" not found. Available: {available_sheets}')
+
+
+def _is_strong_tabular_array_source(
+    *,
+    source_columns: list[str],
+    source_rows: list[dict[str, Any]],
+    target_fields: list[TargetField],
+) -> bool:
+    if len(source_columns) < 2 or len(source_rows) < 2:
+        return False
+    if not target_fields:
+        return True
+    required_column_count = min(max(len(target_fields), 2), 4)
+    return len(source_columns) >= required_column_count
+
+
+def _resolve_normalized_multi_table_document_source(
+    sheets: list[ParsedSheet],
+) -> tuple[list[str], list[dict[str, Any]], list[str]] | None:
+    anchor = next(
+        (
+            sheet
+            for sheet in sheets
+            if _infer_two_column_anchor_headers(sheet.columns, sheet.rows) is not None
+        ),
+        None,
+    )
+    if anchor is None:
+        return None
+
+    anchor_pair = _infer_two_column_anchor_headers(anchor.columns, anchor.rows)
+    if anchor_pair is None:
+        return None
+
+    text_header, code_header = anchor_pair
+    merged_rows: list[dict[str, Any]] = []
+    used_sheet_count = 0
+    normalized_sheet_count = 0
+
+    for sheet in sheets:
+        normalized_rows, used_heuristic = _normalize_sheet_rows_to_anchor_pair(
+            sheet=sheet,
+            text_header=text_header,
+            code_header=code_header,
+        )
+        if not normalized_rows:
+            continue
+        merged_rows.extend(normalized_rows)
+        used_sheet_count += 1
+        if used_heuristic:
+            normalized_sheet_count += 1
+
+    if used_sheet_count < 2 or not merged_rows:
+        return None
+
+    deduped_rows = _dedupe_rows_preserve_order(merged_rows, [text_header, code_header])
+    warnings = [f'Generated mapping from normalized merged source structure across {used_sheet_count} tables.']
+    if normalized_sheet_count:
+        warnings.append(
+            f'Normalized {normalized_sheet_count} continuation table(s) to the anchor tabular schema.'
+        )
+    return [text_header, code_header], deduped_rows, warnings
+
+
+def _infer_two_column_anchor_headers(
+    columns: list[str],
+    rows: list[dict[str, Any]],
+) -> tuple[str, str] | None:
+    unique_columns = _unique_non_empty_columns(columns)
+    if len(unique_columns) < 2:
+        return None
+
+    scored: list[tuple[str, float, float]] = []
+    for column in unique_columns:
+        sample_values = [row.get(column) for row in rows[:5] if isinstance(row, dict)]
+        normalized_header = str(column or '').strip().casefold()
+        text_score = 0.0
+        code_score = 0.0
+
+        if any(token in normalized_header for token in ('наимен', 'описан', 'description', 'name', 'label', 'вид')):
+            text_score += 2.0
+        if any(token in normalized_header for token in ('код', 'code', 'id', 'номер')):
+            code_score += 2.0
+        if any(_looks_like_code_value(value) for value in sample_values):
+            code_score += 1.2
+        if any(_looks_like_text_value(value) for value in sample_values):
+            text_score += 0.8
+        scored.append((column, text_score, code_score))
+
+    text_candidate = max(scored, key=lambda item: item[1], default=None)
+    code_candidate = max(scored, key=lambda item: item[2], default=None)
+    if text_candidate is None or code_candidate is None:
+        return None
+    if text_candidate[0] == code_candidate[0]:
+        return None
+    if text_candidate[1] < 0.8 or code_candidate[2] < 1.2:
+        return None
+    return text_candidate[0], code_candidate[0]
+
+
+def _normalize_sheet_rows_to_anchor_pair(
+    *,
+    sheet: ParsedSheet,
+    text_header: str,
+    code_header: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    if text_header in sheet.columns and code_header in sheet.columns:
+        direct_rows = [
+            {
+                text_header: row.get(text_header),
+                code_header: row.get(code_header),
+            }
+            for row in sheet.rows
+            if isinstance(row, dict) and _has_visible_value(row.get(text_header)) and _has_visible_value(row.get(code_header))
+        ]
+        return direct_rows, False
+
+    normalized_rows: list[dict[str, Any]] = []
+    synthetic_header_used = False
+    header_pair = _extract_text_code_pair(sheet.columns)
+    if header_pair is not None:
+        normalized_rows.append(
+            {
+                text_header: header_pair[0],
+                code_header: header_pair[1],
+            }
+        )
+        synthetic_header_used = True
+
+    ordered_columns = list(sheet.columns)
+    for row in sheet.rows:
+        if not isinstance(row, dict):
+            continue
+        pair = _extract_text_code_pair([row.get(column) for column in ordered_columns])
+        if pair is None:
+            continue
+        normalized_rows.append(
+            {
+                text_header: pair[0],
+                code_header: pair[1],
+            }
+        )
+
+    return normalized_rows, synthetic_header_used
+
+
+def _extract_text_code_pair(values: list[Any]) -> tuple[str, str] | None:
+    normalized_values = [str(value or '').strip() for value in values]
+    non_empty_values = [value for value in normalized_values if value]
+    if len(non_empty_values) < 2:
+        return None
+
+    code_candidates = [value for value in non_empty_values if _looks_like_code_value(value)]
+    if not code_candidates:
+        return None
+    code_value = code_candidates[-1]
+
+    text_candidates = [
+        value
+        for value in non_empty_values
+        if value != code_value and not PLACEHOLDER_COLUMN_RE.fullmatch(value)
+    ]
+    if not text_candidates:
+        return None
+    text_value = max(text_candidates, key=lambda item: (len(item), item))
+    if not _looks_like_text_value(text_value):
+        return None
+    return text_value, code_value
+
+
+def _looks_like_code_value(value: Any) -> bool:
+    stripped = str(value or '').strip()
+    if not stripped:
+        return False
+    if NUMERIC_CODE_RE.fullmatch(stripped):
+        return True
+    if len(stripped) <= 16 and stripped.upper() == stripped and any(char.isdigit() for char in stripped):
+        return True
+    return False
+
+
+def _looks_like_text_value(value: Any) -> bool:
+    stripped = str(value or '').strip()
+    if not stripped:
+        return False
+    if PLACEHOLDER_COLUMN_RE.fullmatch(stripped):
+        return False
+    if _looks_like_code_value(stripped):
+        return False
+    return any(char.isalpha() for char in stripped)
+
+
+def _unique_non_empty_columns(columns: list[str]) -> list[str]:
+    unique: list[str] = []
+    for column in columns:
+        normalized = str(column or '').strip()
+        if not normalized or normalized in unique:
+            continue
+        unique.append(normalized)
+    return unique
+
+
+def _dedupe_rows_preserve_order(rows: list[dict[str, Any]], columns: list[str]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in rows:
+        key = tuple(row.get(column) for column in columns)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _filter_obvious_section_heading_rows(
+    *,
+    source_columns: list[str],
+    source_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    inferred_pair = _infer_two_column_anchor_headers(source_columns, source_rows)
+    if inferred_pair is None:
+        return source_rows, 0
+
+    text_header, code_header = inferred_pair
+    filtered_rows: list[dict[str, Any]] = []
+    dropped_count = 0
+    for row in source_rows:
+        text_value = str(row.get(text_header) or '').strip()
+        code_value = str(row.get(code_header) or '').strip()
+        if text_value.endswith(':') and _looks_like_code_value(code_value):
+            dropped_count += 1
+            continue
+        filtered_rows.append(row)
+    return filtered_rows, dropped_count
 
 
 def resolve_draft_json_source(
@@ -1021,7 +1335,7 @@ def _collect_excel_sheets(
     elif len(sheet_names) > 1 and len(non_empty_sheets) == 1:
         warnings.append(f'Workbook has multiple sheets. Used the only non-empty sheet: {non_empty_sheets[0]}')
 
-    return combined_columns, combined_rows[:PREVIEW_ROW_LIMIT], warnings, sheets
+    return combined_columns, combined_rows, warnings, sheets
 
 
 def _extract_excel_tables_from_rows(sheet_name: str, rows_iter: list[tuple[Any, ...] | list[Any]]) -> tuple[list[ParsedSheet], list[str]]:
@@ -1052,7 +1366,7 @@ def _extract_excel_tables_from_rows(sheet_name: str, rows_iter: list[tuple[Any, 
         ParsedSheet(
             name=_build_excel_table_name(sheet_name, table_index, total_tables, table_title),
             columns=columns,
-            rows=rows[:PREVIEW_ROW_LIMIT],
+            rows=rows,
         )
         for table_index, (table_title, columns, rows) in enumerate(parsed_tables, start=1)
     ]
@@ -1196,7 +1510,7 @@ def _has_visible_value(value: Any) -> bool:
     return True
 
 
-def _parse_document(file_path: Path) -> dict[str, Any]:
+def _parse_document(file_path: Path, *, preview_only: bool = True) -> dict[str, Any]:
     try:
         parsed = parse_document(file_path)
         content_type = str(parsed.get('content_type', 'unknown'))
@@ -1219,7 +1533,7 @@ def _parse_document(file_path: Path) -> dict[str, Any]:
                     ParsedSheet(
                         name=str(table.get('name') or f'Table {index}'),
                         columns=table_columns,
-                        rows=table_rows[:PREVIEW_ROW_LIMIT],
+                        rows=table_rows[:PREVIEW_ROW_LIMIT] if preview_only else table_rows,
                     )
                 )
         original_row_count = len(rows)
@@ -1310,14 +1624,14 @@ def _parse_document(file_path: Path) -> dict[str, Any]:
                     ParsedSheet(
                         name=sheet.name,
                         columns=sheet.columns,
-                        rows=filtered_rows[:PREVIEW_ROW_LIMIT],
+                        rows=filtered_rows[:PREVIEW_ROW_LIMIT] if preview_only else filtered_rows,
                     )
                 )
             sheets = filtered_sheets
 
         return {
             'columns': columns,
-            'rows': rows[:PREVIEW_ROW_LIMIT],
+            'rows': rows[:PREVIEW_ROW_LIMIT] if preview_only else rows,
             'warnings': warnings,
             'sheets': sheets,
             'content_type': content_type,
@@ -1883,11 +2197,25 @@ def _resolve_root_object_schema(target_schema: dict[str, Any]) -> dict[str, Any]
 def _extract_target_fields_from_schema(object_schema: dict[str, Any]) -> list[TargetField]:
     fields: list[TargetField] = []
     for key, field_schema in dict(object_schema.get('properties', {})).items():
-        field_type = field_schema.get('type', 'any')
-        if field_type not in {'string', 'number', 'boolean', 'object', 'array', 'null', 'any'}:
-            field_type = 'any'
-        fields.append(TargetField(name=key, type=field_type))
+        fields.extend(_extract_target_fields_from_property(key, field_schema))
     return fields
+
+
+def _extract_target_fields_from_property(field_name: str, field_schema: dict[str, Any]) -> list[TargetField]:
+    field_type = field_schema.get('type', 'any')
+    if field_type not in {'string', 'number', 'boolean', 'object', 'array', 'null', 'any'}:
+        field_type = 'any'
+
+    if field_type == 'object':
+        properties = dict(field_schema.get('properties', {}))
+        if not properties:
+            return [TargetField(name=field_name, type='object')]
+        nested_fields: list[TargetField] = []
+        for nested_key, nested_schema in properties.items():
+            nested_fields.extend(_extract_target_fields_from_property(f'{field_name}.{nested_key}', nested_schema))
+        return nested_fields
+
+    return [TargetField(name=field_name, type=field_type)]
 
 
 

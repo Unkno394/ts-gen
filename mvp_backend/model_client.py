@@ -44,6 +44,7 @@ DEFAULT_SAMPLE_ROWS = 2
 DEFAULT_HINT_LIMIT = 4
 DEFAULT_MAPPING_MAX_TOKENS = 256
 DEFAULT_DRAFT_MAX_TOKENS = 384
+DEFAULT_HTTP_RETRY_ATTEMPTS = 3
 GIGACHAT_DEFAULT_AUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth'
 GIGACHAT_DEFAULT_BASE_URL = 'https://gigachat.devices.sberbank.ru/api/v1'
 GIGACHAT_TOKEN_LEEWAY_SECONDS = 60
@@ -114,7 +115,7 @@ def rank_mapping_candidate(
             _get_model_runtime_config()['base_url'],
             _get_model_runtime_config()['model_name'],
         )
-        return None, []
+        return None, ['LLM ranking skipped: model runtime disabled.']
 
     runtime = _get_model_runtime_config()
     compact_candidates = [str(candidate).strip() for candidate in candidates if str(candidate).strip()][:5]
@@ -196,7 +197,7 @@ def suggest_field_mappings(
             _get_model_runtime_config()['base_url'],
             _get_model_runtime_config()['model_name'],
         )
-        return [], []
+        return [], ['LLM mapping skipped: model runtime disabled.']
 
     runtime = _get_model_runtime_config()
     sample_preview = _truncate_sample_rows(sample_rows or [], runtime['sample_rows'])
@@ -312,7 +313,7 @@ def suggest_draft_json_fields(
             _get_model_runtime_config()['base_url'],
             _get_model_runtime_config()['model_name'],
         )
-        return [], []
+        return [], ['LLM draft-json skipped: model runtime disabled.']
 
     runtime = _get_model_runtime_config()
     sample_preview = _truncate_sample_rows(sample_rows or [], runtime['sample_rows'])
@@ -421,7 +422,7 @@ def suggest_tabular_source_structure(
             _get_model_runtime_config()['base_url'],
             _get_model_runtime_config()['model_name'],
         )
-        return None, []
+        return None, ['LLM source-structure skipped: model runtime disabled.']
 
     compact_lines = [str(line).strip() for line in lines if str(line).strip()][:12]
     if len(compact_lines) < 2:
@@ -506,7 +507,7 @@ def suggest_target_field_value_rows(
             _get_model_runtime_config()['base_url'],
             _get_model_runtime_config()['model_name'],
         )
-        return [], []
+        return [], ['LLM field-value refresh skipped: model runtime disabled.']
 
     compact_lines = [str(line).strip() for line in lines if str(line).strip()][:8]
     compact_fields = [
@@ -664,15 +665,93 @@ def suggest_form_field_repair(
 
 
 def _model_enabled() -> bool:
-    runtime = _get_model_runtime_config()
-    return runtime['provider'] == 'gigachat'
+    return any(_runtime_is_configured(runtime) for runtime in _iter_model_runtimes())
 
 
 def _form_repair_enabled() -> bool:
-    runtime = _get_model_runtime_config()
-    if runtime['provider'] != 'gigachat':
-        return False
-    return bool(runtime.get('api_key') or runtime.get('gigachat_auth_key'))
+    return _model_enabled()
+
+
+def _iter_model_runtimes() -> list[dict[str, Any]]:
+    runtimes: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    primary = _get_model_runtime_config()
+    for runtime in [primary, *_get_ai_question_provider_runtimes(primary)]:
+        if not _runtime_is_configured(runtime):
+            continue
+        signature = _runtime_signature(runtime)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        runtimes.append(runtime)
+    return runtimes
+
+
+def _runtime_is_configured(runtime: dict[str, Any]) -> bool:
+    provider_kind = str(runtime.get('provider_kind') or runtime.get('provider') or '').strip().lower()
+    base_url = str(runtime.get('base_url') or '').strip()
+    model_name = str(runtime.get('model_name') or '').strip()
+    api_key = str(runtime.get('api_key') or '').strip()
+
+    if provider_kind == 'gigachat':
+        return bool(base_url and model_name and (api_key or str(runtime.get('gigachat_auth_key') or '').strip()))
+    return bool(base_url and model_name and api_key)
+
+
+def _runtime_signature(runtime: dict[str, Any]) -> tuple[str, str, str]:
+    provider_kind = str(runtime.get('provider_kind') or runtime.get('provider') or '').strip().lower()
+    base_url = str(runtime.get('base_url') or '').strip().rstrip('/')
+    model_name = str(runtime.get('model_name') or '').strip()
+    return provider_kind, base_url, model_name
+
+
+def _runtime_label(runtime: dict[str, Any]) -> str:
+    return str(runtime.get('display_name') or runtime.get('provider') or runtime.get('provider_kind') or 'llm').strip()
+
+
+def _get_ai_question_provider_runtimes(primary_runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    default_timeout = float(primary_runtime.get('timeout_seconds') or 20.0)
+    sample_rows = int(primary_runtime.get('sample_rows') or DEFAULT_SAMPLE_ROWS)
+    hint_limit = int(primary_runtime.get('hint_limit') or DEFAULT_HINT_LIMIT)
+    mapping_max_tokens = int(primary_runtime.get('mapping_max_tokens') or DEFAULT_MAPPING_MAX_TOKENS)
+    draft_max_tokens = int(primary_runtime.get('draft_max_tokens') or DEFAULT_DRAFT_MAX_TOKENS)
+
+    provider_indices: list[int] = []
+    for key in os.environ:
+        match = re.fullmatch(r'AI_QUESTION_PROVIDER_(\d+)_NAME', key)
+        if match:
+            provider_indices.append(int(match.group(1)))
+
+    runtimes: list[dict[str, Any]] = []
+    for index in sorted(set(provider_indices)):
+        prefix = f'AI_QUESTION_PROVIDER_{index}_'
+        name = os.getenv(f'{prefix}NAME', '').strip()
+        base_url = os.getenv(f'{prefix}URL', '').strip()
+        model_name = os.getenv(f'{prefix}MODEL', '').strip()
+        api_key = os.getenv(f'{prefix}KEY', '').strip()
+        referer = os.getenv(f'{prefix}REFERER', '').strip()
+        title = os.getenv(f'{prefix}TITLE', '').strip()
+        if not (name and base_url and model_name and api_key):
+            continue
+        runtimes.append(
+            {
+                'provider': name.strip().lower(),
+                'display_name': name,
+                'provider_kind': 'openai_compatible',
+                'base_url': base_url,
+                'model_name': model_name,
+                'api_key': api_key,
+                'timeout_seconds': default_timeout,
+                'sample_rows': sample_rows,
+                'hint_limit': hint_limit,
+                'mapping_max_tokens': mapping_max_tokens,
+                'draft_max_tokens': draft_max_tokens,
+                'http_referer': referer,
+                'app_title': title,
+            }
+        )
+    return runtimes
 
 
 def _call_model_as_json(
@@ -681,35 +760,46 @@ def _call_model_as_json(
     payload: dict[str, Any],
     max_tokens: int,
 ) -> tuple[Any | None, list[str]]:
-    runtime = _get_model_runtime_config()
-    try:
-        content = _call_model(instructions=instructions, payload=payload, runtime=runtime, max_tokens=max_tokens)
-    except RuntimeError as exc:
-        logger.warning('model call failed: provider=%s model=%s error=%s', runtime['provider'], runtime['model_name'], exc)
-        return None, [str(exc)]
+    runtimes = _iter_model_runtimes()
+    if not runtimes:
+        return None, ['Провайдер модели не настроен.']
 
-    logger.info(
-        'llm content received: provider=%s model=%s raw_length=%d preview=%s',
-        runtime['provider'],
-        runtime['model_name'],
-        len(content),
-        _preview_text(content),
-    )
-    parsed = _extract_json_payload(content)
-    if parsed is None:
-        logger.warning(
-            'llm response parse failed: provider=%s model=%s raw_length=%d preview=%s',
+    warnings: list[str] = []
+    for attempt_index, runtime in enumerate(runtimes, start=1):
+        try:
+            content = _call_model(instructions=instructions, payload=payload, runtime=runtime, max_tokens=max_tokens)
+        except RuntimeError as exc:
+            logger.warning('model call failed: provider=%s model=%s error=%s', runtime['provider'], runtime['model_name'], exc)
+            warnings.append(str(exc))
+            continue
+
+        logger.info(
+            'llm content received: provider=%s model=%s raw_length=%d preview=%s',
             runtime['provider'],
             runtime['model_name'],
             len(content),
             _preview_text(content),
         )
-        return None, ['Модель вернула ответ, который не удалось разобрать как JSON.']
-    return parsed, []
+        parsed = _extract_json_payload(content)
+        if parsed is None:
+            logger.warning(
+                'llm response parse failed: provider=%s model=%s raw_length=%d preview=%s',
+                runtime['provider'],
+                runtime['model_name'],
+                len(content),
+                _preview_text(content),
+            )
+            warnings.append(f'{_runtime_label(runtime)} вернул ответ, который не удалось разобрать как JSON.')
+            continue
+        if attempt_index > 1:
+            warnings.append(f'Использован резервный LLM провайдер: {_runtime_label(runtime)}.')
+        return parsed, _dedupe(warnings)
+    return None, _dedupe(warnings)
 
 
 def _call_model(*, instructions: str, payload: dict[str, Any], runtime: dict[str, Any], max_tokens: int) -> str:
     provider = str(runtime['provider'])
+    provider_kind = str(runtime.get('provider_kind') or provider)
     base_url = str(runtime['base_url'])
     model_name = str(runtime['model_name'])
     api_key = str(runtime['api_key'])
@@ -717,7 +807,7 @@ def _call_model(*, instructions: str, payload: dict[str, Any], runtime: dict[str
     user_content = _compact_json_text(payload)
     ssl_context = _build_ssl_context(runtime)
 
-    if provider == 'gigachat':
+    if provider_kind == 'gigachat':
         access_token = api_key or _get_gigachat_access_token(runtime)
         logger.info(
             'llm transport gigachat: url=%s model=%s timeout_seconds=%.1f max_tokens=%d prompt_bytes=%d token_source=%s',
@@ -776,7 +866,64 @@ def _call_model(*, instructions: str, payload: dict[str, Any], runtime: dict[str
             raise RuntimeError('GigaChat вернул пустой ответ.')
         return content
 
-    raise RuntimeError('Провайдер модели не настроен. Поддерживается только GigaChat.')
+    if provider_kind == 'openai_compatible':
+        logger.info(
+            'llm transport openai-compatible: provider=%s url=%s model=%s timeout_seconds=%.1f max_tokens=%d prompt_bytes=%d',
+            _runtime_label(runtime),
+            f'{base_url.rstrip("/")}',
+            model_name,
+            timeout_seconds,
+            max_tokens,
+            len(user_content),
+        )
+        request_payload = {
+            'model': model_name,
+            'temperature': 0,
+            'max_tokens': max_tokens,
+            'messages': [
+                {'role': 'system', 'content': instructions},
+                {'role': 'user', 'content': user_content},
+            ],
+        }
+        headers = {'Authorization': _as_bearer_header(api_key)}
+        referer = str(runtime.get('http_referer') or '').strip()
+        title = str(runtime.get('app_title') or '').strip()
+        if referer:
+            headers['HTTP-Referer'] = referer
+        if title:
+            headers['X-Title'] = title
+        try:
+            response = _post_json(
+                f'{base_url.rstrip("/")}',
+                request_payload,
+                headers=headers,
+                timeout_seconds=timeout_seconds,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(_rewrite_provider_error_message(str(exc), _runtime_label(runtime))) from exc
+
+        usage = _extract_model_usage(response)
+        if usage is not None:
+            _record_model_usage(runtime=runtime, usage=usage)
+            logger.info(
+                'llm usage: provider=%s model=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d precached_prompt_tokens=%d',
+                provider,
+                model_name,
+                usage['prompt_tokens'],
+                usage['completion_tokens'],
+                usage['total_tokens'],
+                usage['precached_prompt_tokens'],
+            )
+        choices = response.get('choices') if isinstance(response, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError(f'{_runtime_label(runtime)} не вернул choices.')
+        message = choices[0].get('message') if isinstance(choices[0], dict) else None
+        content = _extract_openai_message_content(message)
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f'{_runtime_label(runtime)} вернул пустой ответ.')
+        return content
+
+    raise RuntimeError(f'Провайдер модели "{provider}" не поддерживается.')
 
 
 def _record_model_usage(*, runtime: dict[str, Any], usage: dict[str, int]) -> None:
@@ -925,25 +1072,33 @@ def _post_json(
         headers=request_headers,
         method='POST',
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
-            body = response.read().decode('utf-8')
-            logger.info(
-                'llm http response: url=%s status=%s body_length=%d',
-                url,
-                getattr(response, 'status', 'unknown'),
-                len(body),
-            )
-    except (TimeoutError, socket.timeout) as exc:
-        logger.warning('llm timeout: url=%s timeout_seconds=%.1f error=%s', url, timeout_seconds, exc)
-        raise RuntimeError(f'Локальная модель не ответила вовремя за {timeout_seconds:.0f} сек.') from exc
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode('utf-8', errors='replace')
-        logger.warning('llm http error: url=%s status=%s body=%s', url, exc.code, body[:300])
-        raise RuntimeError(f'Локальная модель вернула HTTP {exc.code}: {body[:300]}') from exc
-    except urllib.error.URLError as exc:
-        logger.warning('llm connection error: url=%s reason=%s', url, exc.reason)
-        raise RuntimeError(f'Не удалось подключиться к локальной модели: {exc.reason}') from exc
+    retry_attempts = max(1, _safe_env_int('TSGEN_MODEL_HTTP_RETRY_ATTEMPTS', DEFAULT_HTTP_RETRY_ATTEMPTS))
+    body = ''
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+                body = response.read().decode('utf-8')
+                logger.info(
+                    'llm http response: url=%s status=%s body_length=%d',
+                    url,
+                    getattr(response, 'status', 'unknown'),
+                    len(body),
+                )
+                break
+        except (TimeoutError, socket.timeout) as exc:
+            logger.warning('llm timeout: url=%s timeout_seconds=%.1f attempt=%d/%d error=%s', url, timeout_seconds, attempt, retry_attempts, exc)
+            if attempt >= retry_attempts:
+                raise RuntimeError(f'GigaChat не ответил вовремя за {timeout_seconds:.0f} сек.') from exc
+            time.sleep(min(0.35 * attempt, 1.0))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode('utf-8', errors='replace')
+            logger.warning('llm http error: url=%s status=%s attempt=%d/%d body=%s', url, exc.code, attempt, retry_attempts, body[:300])
+            raise RuntimeError(f'GigaChat вернул HTTP {exc.code}: {body[:300]}') from exc
+        except urllib.error.URLError as exc:
+            logger.warning('llm connection error: url=%s attempt=%d/%d reason=%s', url, attempt, retry_attempts, exc.reason)
+            if attempt >= retry_attempts or not _should_retry_url_error(exc):
+                raise RuntimeError(f'Не удалось подключиться к GigaChat: {exc.reason}') from exc
+            time.sleep(min(0.35 * attempt, 1.0))
 
     try:
         parsed = json.loads(body)
@@ -976,25 +1131,33 @@ def _post_form_json(
         headers=request_headers,
         method='POST',
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
-            body = response.read().decode('utf-8')
-            logger.info(
-                'llm http form response: url=%s status=%s body_length=%d',
-                url,
-                getattr(response, 'status', 'unknown'),
-                len(body),
-            )
-    except (TimeoutError, socket.timeout) as exc:
-        logger.warning('llm form timeout: url=%s timeout_seconds=%.1f error=%s', url, timeout_seconds, exc)
-        raise RuntimeError(f'GigaChat OAuth не ответил вовремя за {timeout_seconds:.0f} сек.') from exc
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode('utf-8', errors='replace')
-        logger.warning('llm form http error: url=%s status=%s body=%s', url, exc.code, body[:300])
-        raise RuntimeError(f'GigaChat OAuth вернул HTTP {exc.code}: {body[:300]}') from exc
-    except urllib.error.URLError as exc:
-        logger.warning('llm form connection error: url=%s reason=%s', url, exc.reason)
-        raise RuntimeError(f'Не удалось подключиться к GigaChat OAuth: {exc.reason}') from exc
+    retry_attempts = max(1, _safe_env_int('TSGEN_MODEL_HTTP_RETRY_ATTEMPTS', DEFAULT_HTTP_RETRY_ATTEMPTS))
+    body = ''
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+                body = response.read().decode('utf-8')
+                logger.info(
+                    'llm http form response: url=%s status=%s body_length=%d',
+                    url,
+                    getattr(response, 'status', 'unknown'),
+                    len(body),
+                )
+                break
+        except (TimeoutError, socket.timeout) as exc:
+            logger.warning('llm form timeout: url=%s timeout_seconds=%.1f attempt=%d/%d error=%s', url, timeout_seconds, attempt, retry_attempts, exc)
+            if attempt >= retry_attempts:
+                raise RuntimeError(f'GigaChat OAuth не ответил вовремя за {timeout_seconds:.0f} сек.') from exc
+            time.sleep(min(0.35 * attempt, 1.0))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode('utf-8', errors='replace')
+            logger.warning('llm form http error: url=%s status=%s attempt=%d/%d body=%s', url, exc.code, attempt, retry_attempts, body[:300])
+            raise RuntimeError(f'GigaChat OAuth вернул HTTP {exc.code}: {body[:300]}') from exc
+        except urllib.error.URLError as exc:
+            logger.warning('llm form connection error: url=%s attempt=%d/%d reason=%s', url, attempt, retry_attempts, exc.reason)
+            if attempt >= retry_attempts or not _should_retry_url_error(exc):
+                raise RuntimeError(f'Не удалось подключиться к GigaChat OAuth: {exc.reason}') from exc
+            time.sleep(min(0.35 * attempt, 1.0))
 
     try:
         parsed = json.loads(body)
@@ -1006,6 +1169,22 @@ def _post_form_json(
     return parsed
 
 
+def _should_retry_url_error(exc: urllib.error.URLError) -> bool:
+    reason = exc.reason
+    if isinstance(reason, socket.gaierror):
+        return True
+    reason_text = str(reason).lower()
+    return any(
+        marker in reason_text
+        for marker in (
+            'temporary failure in name resolution',
+            'no address associated with hostname',
+            'name or service not known',
+            'timed out',
+        )
+    )
+
+
 def _get_model_runtime_config() -> dict[str, Any]:
     default_timeout_raw = os.getenv('TSGEN_MODEL_TIMEOUT_SECONDS', '20').strip()
     try:
@@ -1014,6 +1193,8 @@ def _get_model_runtime_config() -> dict[str, Any]:
         default_timeout = 20.0
     runtime = {
         'provider': os.getenv('TSGEN_MODEL_PROVIDER', 'gigachat').strip().lower(),
+        'display_name': os.getenv('TSGEN_MODEL_PROVIDER', 'gigachat').strip() or 'gigachat',
+        'provider_kind': os.getenv('TSGEN_MODEL_PROVIDER', 'gigachat').strip().lower(),
         'base_url': os.getenv('TSGEN_MODEL_BASE_URL', GIGACHAT_DEFAULT_BASE_URL).strip(),
         'model_name': os.getenv('TSGEN_MODEL_NAME', 'GigaChat-2-Pro').strip(),
         'api_key': os.getenv('TSGEN_MODEL_API_KEY', '').strip(),
@@ -1028,6 +1209,8 @@ def _get_model_runtime_config() -> dict[str, Any]:
         'gigachat_auth_scheme': os.getenv('TSGEN_GIGACHAT_AUTH_SCHEME', 'Basic').strip(),
         'gigachat_ca_bundle': os.getenv('TSGEN_GIGACHAT_CA_BUNDLE', DEFAULT_GIGACHAT_CA_BUNDLE).strip(),
         'gigachat_ssl_verify': _safe_env_bool('TSGEN_GIGACHAT_SSL_VERIFY', True),
+        'http_referer': os.getenv('TSGEN_MODEL_HTTP_REFERER', '').strip(),
+        'app_title': os.getenv('TSGEN_MODEL_APP_TITLE', '').strip(),
     }
     if not runtime['base_url']:
         runtime['base_url'] = GIGACHAT_DEFAULT_BASE_URL
@@ -1049,6 +1232,8 @@ def _get_model_runtime_config() -> dict[str, Any]:
             runtime.update(
                 {
                     'provider': provider,
+                    'display_name': provider,
+                    'provider_kind': provider,
                     'base_url': base_url,
                     'model_name': model_name,
                 }
@@ -1225,10 +1410,36 @@ def _compact_json_text(value: Any) -> str:
 
 
 def _truncate_sample_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+
+    filtered_rows = [row for row in rows if isinstance(row, dict)]
+    if not filtered_rows:
+        return []
+
+    selected_rows: list[dict[str, Any]]
+    if len(filtered_rows) <= limit:
+        selected_rows = filtered_rows
+    elif limit == 1:
+        selected_rows = [filtered_rows[0]]
+    else:
+        max_index = len(filtered_rows) - 1
+        selected_indices: list[int] = []
+        for slot in range(limit):
+            index = round(slot * max_index / (limit - 1))
+            if index not in selected_indices:
+                selected_indices.append(index)
+        if len(selected_indices) < limit:
+            for index in range(len(filtered_rows)):
+                if index in selected_indices:
+                    continue
+                selected_indices.append(index)
+                if len(selected_indices) >= limit:
+                    break
+        selected_rows = [filtered_rows[index] for index in selected_indices[:limit]]
+
     truncated: list[dict[str, Any]] = []
-    for row in rows[:limit]:
-        if not isinstance(row, dict):
-            continue
+    for row in selected_rows:
         normalized_row: dict[str, Any] = {}
         for key, value in list(row.items())[:12]:
             if isinstance(value, str):
@@ -1350,6 +1561,28 @@ def _extract_json_payload(content: str) -> Any:
         except json.JSONDecodeError:
             continue
     return None
+
+
+def _rewrite_provider_error_message(message: str, provider_label: str) -> str:
+    normalized = str(message or '').strip()
+    if not normalized:
+        return f'{provider_label} вернул неизвестную ошибку.'
+    rewritten = normalized.replace('GigaChat OAuth', provider_label)
+    rewritten = rewritten.replace('GigaChat', provider_label)
+    rewritten = rewritten.replace('Локальная модель', provider_label)
+    return rewritten
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = str(value or '').strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
 
 
 def _iter_json_candidates(content: str) -> list[str]:

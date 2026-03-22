@@ -229,6 +229,28 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(mapping_by_target['unitOfMeasure'].source, 'Единица измерения')
         self.assertEqual(warnings, [])
 
+    def test_maps_operation_code_and_name_columns_without_position_fallback(self) -> None:
+        target_fields = [
+            TargetField(name='code', type='string'),
+            TargetField(name='description', type='string'),
+        ]
+
+        mappings, warnings = map_fields(
+            [
+                'Наименование видов операций',
+                'Код вида операций',
+            ],
+            target_fields,
+            allow_position_fallback=False,
+        )
+
+        mapping_by_target = {mapping.target: mapping for mapping in mappings}
+        self.assertEqual(mapping_by_target['code'].source, 'Код вида операций')
+        self.assertEqual(mapping_by_target['description'].source, 'Наименование видов операций')
+        self.assertIn(mapping_by_target['code'].confidence, {'high', 'medium'})
+        self.assertIn(mapping_by_target['description'].confidence, {'high', 'medium'})
+        self.assertEqual(warnings, [])
+
 
 if __name__ == '__main__':
     unittest.main()

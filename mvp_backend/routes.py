@@ -1131,6 +1131,13 @@ def _maybe_apply_model_field_value_refresh(
 ) -> list[str]:
     if not target_fields:
         return []
+    if (
+        parsed_file.file_type == 'docx'
+        and parsed_file.sheets
+        and parsed_file.document_mode == 'data_table_mode'
+        and _has_usable_tabular_preview(parsed_file)
+    ):
+        return ['Model-assisted field extraction was skipped because DOCX already has a usable local table preview.']
     if _has_usable_tabular_preview(parsed_file) and not force:
         return []
     if parsed_file.file_type in {'csv', 'xlsx', 'xls', 'json'}:
@@ -1214,6 +1221,13 @@ def _maybe_apply_model_source_refresh(
     force: bool = False,
     selected_sheet: str | None = None,
 ) -> list[str]:
+    if (
+        parsed_file.file_type == 'docx'
+        and parsed_file.sheets
+        and parsed_file.document_mode == 'data_table_mode'
+        and _has_usable_tabular_preview(parsed_file)
+    ):
+        return ['Model-assisted source refresh was skipped because DOCX already has a usable local table preview.']
     if _has_usable_tabular_preview(parsed_file) and not force:
         return []
     if parsed_file.file_type in {'csv', 'xlsx', 'xls', 'json'}:
@@ -1736,14 +1750,15 @@ async def generate(
                     parsed_candidate.file_type,
                     parsed_candidate.extraction_status,
                 )
-                parsed = parse_file(saved_path, filename)
+                parsed = parse_file(saved_path, filename, preview_only=False)
         else:
-            parsed = parse_file(saved_path, filename)
+            parsed = parse_file(saved_path, filename, preview_only=False)
         target_fields, target_payload, target_schema, target_schema_summary = parse_target_schema(target_json)
         source_columns, source_rows, source_warnings = resolve_generation_source(
             parsed,
             selected_sheet,
             target_fields=target_fields,
+            prefer_tabular_for_array_target=bool(target_schema_summary.get('root_is_array')),
         )
         parsed_file_json = json.dumps(_model_to_dict(parsed), ensure_ascii=False)
         resolved_schema_fingerprint_id = ensure_schema_fingerprint(
@@ -1944,7 +1959,7 @@ async def draft_json(
             mode=mode,
             user_id=resolved_user_id,
         )
-        parsed = parse_file(saved_path, filename)
+        parsed = parse_file(saved_path, filename, preview_only=False)
         effective_selected_sheet = selected_sheet.strip() if selected_sheet and selected_sheet.strip() else None
         source_columns, source_rows, source_warnings = resolve_draft_json_source(parsed, selected_sheet=effective_selected_sheet)
         parsed_file_json = json.dumps(_model_to_dict(parsed), ensure_ascii=False)

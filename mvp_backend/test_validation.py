@@ -8,7 +8,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from generator import generate_typescript
+from generator import build_preview, generate_typescript
 from models import FieldMapping, TargetField
 from validation import compile_typescript_code, validate_preview_against_target_schema
 
@@ -45,6 +45,18 @@ class TargetSchemaParsingTests(unittest.TestCase):
         self.assertIsInstance(payload, list)
         self.assertEqual(target_schema['type'], 'array')
         self.assertEqual(summary['required_fields'], ['name', 'amount'])
+
+    def test_parse_target_schema_flattens_nested_object_paths(self) -> None:
+        target_fields, payload, target_schema, summary = parse_target_schema(
+            '[{"param": {"id": "", "name": "", "descr": "", "createDate": ""}}]'
+        )
+
+        self.assertEqual(
+            [field.name for field in target_fields],
+            ['param.id', 'param.name', 'param.descr', 'param.createDate'],
+        )
+        self.assertEqual(target_schema['type'], 'array')
+        self.assertTrue(summary['root_is_array'])
 
 
 class PreviewValidationTests(unittest.TestCase):
@@ -89,6 +101,47 @@ class TypescriptCompilationTests(unittest.TestCase):
             self.skipTest('TypeScript compiler is not available in the current environment')
         self.assertFalse(result['valid'])
         self.assertTrue(result['diagnostics'])
+
+    def test_generate_typescript_and_preview_support_nested_object_paths(self) -> None:
+        target_fields = [
+            TargetField(name='param.id', type='string'),
+            TargetField(name='param.name', type='string'),
+            TargetField(name='param.descr', type='string'),
+            TargetField(name='param.createDate', type='string'),
+        ]
+        mappings = [
+            FieldMapping(source='Идентификатор', target='param.id', confidence='high', reason='deterministic'),
+            FieldMapping(source='Наименование', target='param.name', confidence='high', reason='deterministic'),
+            FieldMapping(source='Описание', target='param.descr', confidence='high', reason='deterministic'),
+            FieldMapping(source='Дата создания', target='param.createDate', confidence='high', reason='deterministic'),
+        ]
+        rows = [
+            {
+                'Идентификатор': 'RADIOLOGIST',
+                'Наименование': 'Рентгенолог',
+                'Описание': 'Диагностика',
+                'Дата создания': '2025-05-20',
+            }
+        ]
+
+        code = generate_typescript(target_fields, mappings)
+        preview = build_preview(rows, target_fields, mappings)
+
+        self.assertIn('param: {', code)
+        self.assertIn("id: row['Идентификатор']", code)
+        self.assertEqual(
+            preview,
+            [
+                {
+                    'param': {
+                        'id': 'RADIOLOGIST',
+                        'name': 'Рентгенолог',
+                        'descr': 'Диагностика',
+                        'createDate': '2025-05-20',
+                    }
+                }
+            ],
+        )
 
 
 if __name__ == '__main__':
