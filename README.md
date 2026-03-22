@@ -156,11 +156,23 @@ tsgen-desktop/
 
 Основной `.env` лежит в [mvp_backend/.env](/home/user/Desktop/tsgen-desktop/mvp_backend/.env).
 
-Минимально важные параметры:
+Для локального старта не нужно сразу настраивать всё. Проект можно поднять в двух режимах:
+
+- минимальный локальный запуск:
+  - табличные файлы и базовая генерация работают без `LlamaParse`
+  - email-коды можно не настраивать, если не тестируете полный auth-flow
+- полный локальный запуск:
+  - с `GigaChat`/backup-провайдерами
+  - с `LlamaParse`
+  - с SMTP
+
+Минимальный `.env` для локального запуска:
 
 ```env
 HOST=0.0.0.0
 PORT=8000
+
+LLAMAPARSE_ENABLED=false
 
 TSGEN_MODEL_PROVIDER=gigachat
 TSGEN_MODEL_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
@@ -171,15 +183,33 @@ TSGEN_GIGACHAT_SCOPE=GIGACHAT_API_CORP
 TSGEN_GIGACHAT_AUTH_SCHEME=Basic
 TSGEN_GIGACHAT_CA_BUNDLE=/app/certs/russian_trusted_root_ca_pem.crt
 TSGEN_GIGACHAT_SSL_VERIFY=true
-
-LLAMAPARSE_ENABLED=true
-LLAMAPARSE_API_KEY=...
 ```
 
-Если у вас нет нужды в `LlamaParse`, можно выключить:
+Если вы хотите использовать backup-модели при недоступности `GigaChat`, можно добавить:
 
 ```env
-LLAMAPARSE_ENABLED=false
+AI_QUESTION_PROVIDER_1_NAME=groq-70b
+AI_QUESTION_PROVIDER_1_URL=https://api.groq.com/openai/v1/chat/completions
+AI_QUESTION_PROVIDER_1_MODEL=llama-3.3-70b-versatile
+AI_QUESTION_PROVIDER_1_KEY=...
+```
+
+Если нужен полный email-flow, добавьте SMTP:
+
+```env
+SMTP_HOST=smtp.example.com
+SMTP_PORT=465
+SMTP_USER=...
+SMTP_PASS=...
+SMTP_FROM=...
+SMTP_USE_SSL=true
+```
+
+Если нужен `LlamaParse`, включите:
+
+```env
+LLAMAPARSE_ENABLED=true
+LLAMAPARSE_API_KEY=...
 ```
 
 ## Запуск через Docker
@@ -220,14 +250,55 @@ docker compose logs -f llamaparse
 
 ## Локальный запуск без Docker
 
+### Быстрый локальный старт
+
+1. Склонируйте репозиторий и перейдите в него:
+
+```bash
+git clone <your-repo-url>
+cd tsgen-desktop
+```
+
+2. Подготовьте backend `.env`:
+
+```bash
+cd mvp_backend
+cp .env .env.local.backup 2>/dev/null || true
+```
+
+После этого откройте [mvp_backend/.env](/home/user/Desktop/tsgen-desktop/mvp_backend/.env) и:
+- замените секреты на свои
+- либо временно отключите ненужные интеграции:
+  - `LLAMAPARSE_ENABLED=false`
+  - уберите SMTP, если не нужен email-flow
+
+3. Поднимите backend.
+
+4. Поднимите frontend.
+
+5. Опционально поднимите `llamaparse_service`, если нужен parsing изображений и model-assisted image/text extraction.
+
 ### Backend
 
 ```bash
 cd /home/user/Desktop/tsgen-desktop/mvp_backend
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Backend будет доступен на:
+- `http://localhost:8000`
+- health-check: `http://localhost:8000/health`
+
+Если вы хотите запускать backend-тесты локально:
+
+```bash
+cd /home/user/Desktop/tsgen-desktop/mvp_backend
+source .venv/bin/activate
+python -m unittest
 ```
 
 ### LlamaParse service
@@ -236,9 +307,14 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 cd /home/user/Desktop/tsgen-desktop/llamaparse_service
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port 8030 --reload
 ```
+
+Используйте этот сервис только если:
+- у вас `LLAMAPARSE_ENABLED=true`
+- вы хотите обрабатывать image-like файлы или model-assisted extraction path
 
 ### Frontend
 
@@ -246,6 +322,43 @@ uvicorn app:app --host 0.0.0.0 --port 8030 --reload
 cd /home/user/Desktop/tsgen-desktop/front
 npm install
 npm run dev
+```
+
+Frontend будет доступен на:
+- `http://localhost:5173` в dev-режиме
+
+Во frontend уже нужны runtime-пакеты для generated TypeScript:
+- `xlsx`
+- `mammoth`
+- `pdfjs-dist`
+
+Если вы запускаете сгенерированный TS вне этого проекта, эти пакеты тоже должны быть установлены в вашем внешнем runtime:
+
+```bash
+npm install xlsx mammoth pdfjs-dist
+```
+
+### Проверка, что локальный запуск собрался
+
+Backend:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Frontend:
+
+```bash
+cd /home/user/Desktop/tsgen-desktop/front
+npm run build
+```
+
+Если нужен только быстрый smoke-check backend:
+
+```bash
+cd /home/user/Desktop/tsgen-desktop/mvp_backend
+source .venv/bin/activate
+python -m unittest test_validation
 ```
 
 ## Electron-режим
