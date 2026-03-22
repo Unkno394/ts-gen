@@ -129,6 +129,9 @@ class TypescriptCompilationTests(unittest.TestCase):
 
         self.assertIn('param: {', code)
         self.assertIn("id: row['Идентификатор']", code)
+        self.assertIn("const EXPECTED_SOURCE_COLUMNS = ['Идентификатор', 'Наименование', 'Описание', 'Дата создания'];", code)
+        self.assertIn('function parseDelimitedText(text: string): ParsedSourceRow[] {', code)
+        self.assertIn('export default async function transformBase64File(base64file: string): Promise<GeneratedRow[]> {', code)
         self.assertEqual(
             preview,
             [
