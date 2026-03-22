@@ -1,0 +1,2 @@
+fullName	birthDate	phone	email	city	street	house	documentPurpose
+Иван Иванов	01.01.1990	+7 999 123-45-67	ivan.ivanov@example.com	Москва	Тестовая	10	проверка обработки текста без потери структуры таблицы

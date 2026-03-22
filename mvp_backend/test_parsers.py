@@ -442,6 +442,70 @@ class DocumentParserTests(unittest.TestCase):
         self.assertEqual(rows, [{'ФИО': 'Иванов Иван', 'Дата рождения': '01.01.1990', 'Страна налогового резидентства': 'Германия'}])
         self.assertIn('Generated mapping from extracted fields/text candidates.', warnings)
 
+    def test_docx_single_inline_profile_extracts_multiple_kv_pairs(self) -> None:
+        path = self.test_root / 'single_inline_profile.docx'
+        doc = Document()
+        doc.add_paragraph(
+            'Это тестовый документ в одну строку: '
+            'ФИО Иван Иванов, дата рождения 01.01.1990, телефон +7 999 123-45-67, '
+            'email ivan.ivanov@example.com, адрес г. Москва, ул. Тестовая, д. 10, '
+            'цель документа проверка обработки текста без переносов строк.'
+        )
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+        columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(parsed.content_type, 'form')
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertEqual(
+            [pair.label for pair in parsed.kv_pairs],
+            ['ФИО', 'дата рождения', 'телефон', 'email', 'адрес', 'цель документа'],
+        )
+        self.assertEqual(
+            columns,
+            ['ФИО', 'дата рождения', 'телефон', 'email', 'адрес', 'цель документа'],
+        )
+        self.assertEqual(rows[0]['ФИО'], 'Иван Иванов')
+        self.assertEqual(rows[0]['дата рождения'], '01.01.1990')
+        self.assertEqual(rows[0]['телефон'], '+7 999 123-45-67')
+        self.assertEqual(rows[0]['email'], 'ivan.ivanov@example.com')
+        self.assertEqual(rows[0]['адрес'], 'г. Москва, ул. Тестовая, д. 10')
+        self.assertEqual(rows[0]['цель документа'], 'проверка обработки текста без переносов строк')
+        self.assertIn('Generated mapping from extracted fields/text candidates.', warnings)
+
+    def test_docx_single_inline_profile_generate_uses_extracted_field_candidates(self) -> None:
+        path = self.test_root / 'single_inline_profile_generate.docx'
+        doc = Document()
+        doc.add_paragraph(
+            'Это тестовый документ в одну строку: '
+            'ФИО Иван Иванов, дата рождения 01.01.1990, телефон +7 999 123-45-67, '
+            'email ivan.ivanov@example.com, адрес г. Москва, ул. Тестовая, д. 10, '
+            'цель документа проверка обработки текста без переносов строк.'
+        )
+        doc.save(path)
+
+        parsed = parse_file(path, path.name)
+        columns, rows, warnings = resolve_generation_source(
+            parsed,
+            target_fields=[
+                TargetField(name='fullName', type='string'),
+                TargetField(name='birthDate', type='string'),
+                TargetField(name='phoneNumber', type='string'),
+                TargetField(name='emailAddress', type='string'),
+                TargetField(name='address', type='string'),
+                TargetField(name='documentPurpose', type='string'),
+            ],
+        )
+
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertEqual(
+            columns,
+            ['ФИО', 'дата рождения', 'телефон', 'email', 'адрес', 'цель документа'],
+        )
+        self.assertEqual(rows[0]['ФИО'], 'Иван Иванов')
+        self.assertTrue(any('fell back to extracted field/value candidates' in warning.lower() for warning in warnings))
+
     def test_txt_form_extracts_kv_pairs_and_sections(self) -> None:
         path = self.test_root / 'form.txt'
         path.write_text(
