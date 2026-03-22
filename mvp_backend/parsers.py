@@ -79,6 +79,8 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         'sheets': [],
         'form_model': None,
         'pdf_zone_summary': {},
+        'ocr_used': False,
+        'ocr_metadata': {},
         'warnings': [],
     }
 
@@ -165,6 +167,8 @@ def parse_file(file_path: Path, original_name: str | None = None) -> ParsedFile:
         sheets=list(parsed_kwargs['sheets']),
         form_model=parsed_kwargs.get('form_model'),
         pdf_zone_summary=dict(parsed_kwargs.get('pdf_zone_summary') or {}),
+        ocr_used=bool(parsed_kwargs.get('ocr_used')),
+        ocr_metadata=dict(parsed_kwargs.get('ocr_metadata') or {}),
         warnings=warnings,
     )
 
@@ -238,6 +242,8 @@ def coerce_parsed_file(value: Any) -> ParsedFile:
         sheets=sheets,
         form_model=form_model,
         pdf_zone_summary=dict(value.get('pdf_zone_summary') or {}),
+        ocr_used=bool(value.get('ocr_used')),
+        ocr_metadata=dict(value.get('ocr_metadata') or {}),
         warnings=[str(warning) for warning in value.get('warnings', [])],
     )
 
@@ -1324,6 +1330,8 @@ def _parse_document(file_path: Path) -> dict[str, Any]:
             'source_candidates': source_candidates,
             'form_model': form_model,
             'pdf_zone_summary': dict(parsed.get('pdf_zone_summary') or {}),
+            'ocr_used': bool(parsed.get('ocr_used')),
+            'ocr_metadata': dict(parsed.get('ocr_metadata') or {}),
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception('document parser failed: file=%s error=%s', file_path.name, exc)
@@ -1648,7 +1656,7 @@ def _extraction_status_message(parsed_file: ParsedFile) -> str:
     if parsed_file.extraction_status == 'requires_ocr_or_manual_input':
         return 'Document looks like a scan or image-based PDF. OCR or manual input is required.'
     if parsed_file.extraction_status == 'image_parse_not_supported_yet':
-        return 'Image-like files are detected, but OCR-free extraction is not supported yet.'
+        return 'Image-like file was detected, but the external OCR service is unavailable or did not return text.'
     if parsed_file.extraction_status == 'text_not_extracted':
         return 'Text could not be extracted from the document.'
     return 'No usable source fields were extracted from the document.'

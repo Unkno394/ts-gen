@@ -36,6 +36,7 @@ import {
   fetchRepairPreviewFromBackend,
   fetchLearningEvents,
   fetchLearningMemory,
+  fetchBackendHealth,
   fetchSourcePreviewFromBackend,
   generateDraftJsonFromBackend,
   generateFromBackend,
@@ -49,6 +50,7 @@ import {
 } from '../lib/api';
 import type {
   DraftFieldSuggestion,
+  BackendHealth,
   FormRepairAction,
   GenerationResult,
   HistoryItem,
@@ -558,7 +560,7 @@ function parsedExtractionStatusLabel(extractionStatus: string): string {
   if (extractionStatus === 'structured_extracted') return 'Таблица извлечена';
   if (extractionStatus === 'text_extracted') return 'Текст извлечён';
   if (extractionStatus === 'requires_ocr_or_manual_input') return 'Нужен OCR или ручной ввод';
-  if (extractionStatus === 'image_parse_not_supported_yet') return 'OCR-free image parse пока недоступен';
+  if (extractionStatus === 'image_parse_not_supported_yet') return 'OCR service недоступен или не дал текст';
   if (extractionStatus === 'text_not_extracted') return 'Текст не извлечён';
   return 'Статус неизвестен';
 }
@@ -934,7 +936,7 @@ async function parseFile(file: File): Promise<ParsedFileInfo> {
     kvPairs: [],
     sourceCandidates: [],
     sheets: [],
-    warnings: ['Поддерживаются CSV, XLSX, XLS, PDF, DOCX, TXT и image-like файлы без OCR.'],
+    warnings: ['Поддерживаются CSV, XLSX, XLS, PDF, DOCX, TXT, фотографии и сканы через backend OCR service.'],
   };
 }
 
@@ -1525,11 +1527,21 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
   const [autoGenerateSectionKey, setAutoGenerateSectionKey] = useState<string | null>(null);
   const [reviewFocusTarget, setReviewFocusTarget] = useState<string | null>(null);
   const [profileAccountCardHeight, setProfileAccountCardHeight] = useState<number | null>(null);
+  const [backendHealth, setBackendHealth] = useState<BackendHealth | null>(null);
   const reviewFocusTimerRef = useRef<number | null>(null);
   const sourcePreviewRefreshTimerRef = useRef<number | null>(null);
   const previewGridWrapRef = useRef<HTMLDivElement | null>(null);
   const profileAccountCardRef = useRef<HTMLElement | null>(null);
   const hasGeneratedResult = result.code !== defaultCode;
+  const currentFormExplainability = result.formExplainability ?? null;
+  const currentRepairPlan = currentFormExplainability?.repairPlan ?? null;
+  const currentRepairActions = currentRepairPlan?.actions ?? [];
+  const currentFormQuality = currentFormExplainability?.qualitySummary ?? null;
+  const currentFormRedFlags = currentFormQuality?.redFlags ?? [];
+  const currentPdfZoneSummary = currentFormExplainability?.pdfZoneSummary ?? null;
+  const currentOcrZoneSummary = currentFormExplainability?.ocrZoneSummary ?? null;
+  const visibleTsDiagnostics = (result.tsDiagnostics ?? []).filter((diagnostic) => Boolean(diagnostic?.message));
+  const visiblePreviewDiagnostics = (result.previewDiagnostics ?? []).filter((diagnostic) => Boolean(diagnostic?.message));
 
   const refreshLearningData = async () => {
     if (profile.skipped) {
@@ -1569,6 +1581,12 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [historyClearDialogOpen, historyDeleteBusyId, historyDeleteTarget]);
+
+  useEffect(() => {
+    void fetchBackendHealth()
+      .then((health) => setBackendHealth(health))
+      .catch(() => setBackendHealth(null));
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -1665,7 +1683,9 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
     }
 
     if (parsedFile.contentType === 'image_like') {
-      return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${parsedExtractionStatusLabel(parsedFile.extractionStatus)}`;
+      return `${parsedFile.fileName} · ${parsedContentTypeLabel(parsedFile.contentType)} · ${parsedExtractionStatusLabel(parsedFile.extractionStatus)}${
+        parsedFile.ocrUsed ? ' · OCR used' : ''
+      }`;
     }
 
     if (previewSheets.length > 0) {
@@ -3603,6 +3623,15 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                 <strong>Загрузить CSV/XLSX/PDF/DOCX/TXT/IMG</strong>
                 <span>{fileSummary}</span>
               </label>
+              <div className="subtle-text" style={{ marginTop: 8 }}>
+                OCR service:{' '}
+                <strong>
+                  {backendHealth?.ocrService?.status === 'ok' && backendHealth?.ocrService?.paddleocrAvailable
+                    ? 'available'
+                    : 'unavailable'}
+                </strong>
+                {parsedFile?.ocrUsed ? ' · OCR used for current source' : ''}
+              </div>
 
               <label className="upload-zone upload-zone-target-json">
                 <input accept=".json,application/json" hidden onChange={onTargetJsonFileChange} type="file" />
@@ -3977,6 +4006,219 @@ export function Workspace({ profile, history, onLogout, onProfileUpdate, onSaveH
                       </em>
                     </div>
                   </div>
+                  <p className="subtle-text mapping-editor-note">
+                    Readiness показывает полноту и объём ручной проверки в runtime. Accuracy-метрики считаются отдельно оффлайн на benchmark-наборах.
+                  </p>
+                  {result.sourceQualityAdjustment?.applied && (
+                    <p className="subtle-text mapping-editor-note">
+                      Source quality adjustment: confidence был понижен из-за качества source extraction. Причины:{' '}
+                      {Object.entries(result.sourceQualityAdjustment.reasons)
+                        .map(([reason, count]) => `${reason} (${count})`)
+                        .join(', ')}
+                      .
+                    </p>
+                  )}
+                  {currentFormExplainability && (
+                    <div className="generation-diagnostics-stack">
+                      <div className="generation-diagnostics-group">
+                        <strong>Form extraction</strong>
+                        <div className="generation-diagnostics-list">
+                          <div className="generation-diagnostic-item">
+                            <span>
+                              {currentFormExplainability.documentMode} → {currentFormExplainability.finalSourceMode ?? 'unknown'}
+                            </span>
+                            <small>
+                              scalar: {currentFormExplainability.scalarCount}, groups: {currentFormExplainability.groupCount}, sections:{' '}
+                              {currentFormExplainability.sectionCount}, layout lines: {currentFormExplainability.layoutLineCount}
+                            </small>
+                          </div>
+                          <div className="generation-diagnostic-item">
+                            <span>
+                              resolved {currentFormQuality?.resolvedFieldCount ?? 0}/{currentFormQuality?.targetFieldCount ?? 0}
+                            </span>
+                            <small>
+                              ambiguous: {(currentFormQuality?.ambiguousFields ?? []).join(', ') || 'none'} · critical unresolved:{' '}
+                              {(currentFormQuality?.unresolvedCriticalFields ?? []).join(', ') || 'none'}
+                            </small>
+                          </div>
+                        </div>
+                      </div>
+                      {currentOcrZoneSummary && (
+                        <div className="generation-diagnostics-group">
+                          <strong>OCR extraction</strong>
+                          <div className="generation-diagnostics-list">
+                            <div className="generation-diagnostic-item">
+                              <span>
+                                zones: form {Number(currentOcrZoneSummary.counts?.form ?? 0)}, text {Number(currentOcrZoneSummary.counts?.text ?? 0)},
+                                noise {Number(currentOcrZoneSummary.counts?.noise ?? 0)}
+                              </span>
+                              <small>
+                                selected regions: {Array.isArray(currentOcrZoneSummary.routing?.selectedRegionIds)
+                                  ? currentOcrZoneSummary.routing?.selectedRegionIds?.join(', ') || 'none'
+                                  : 'none'}
+                              </small>
+                            </div>
+                            <div className="generation-diagnostic-item">
+                              <span>
+                                form confidence:{' '}
+                                {typeof currentOcrZoneSummary.routing?.bestFormConfidence === 'number'
+                                  ? currentOcrZoneSummary.routing.bestFormConfidence.toFixed(2)
+                                  : 'n/a'}{' '}
+                                · noise confidence:{' '}
+                                {typeof currentOcrZoneSummary.routing?.bestNoiseConfidence === 'number'
+                                  ? currentOcrZoneSummary.routing.bestNoiseConfidence.toFixed(2)
+                                  : 'n/a'}
+                              </span>
+                              <small>
+                                merge kept {Number(currentOcrZoneSummary.mergeStats?.selectedLineCount ?? 0)}/
+                                {Number(currentOcrZoneSummary.mergeStats?.inputLineCount ?? 0)} lines · dropped noise{' '}
+                                {Number(currentOcrZoneSummary.mergeStats?.droppedNoiseLines ?? 0)} · dropped low confidence{' '}
+                                {Number(currentOcrZoneSummary.mergeStats?.droppedLowConfidenceLines ?? 0)}
+                              </small>
+                            </div>
+                          </div>
+                          <p className="subtle-text mapping-editor-note">
+                            OCR zones route photo/scan extraction before form parsing. Если noise доминирует или form confidence низкий,
+                            repair план рекомендует review OCR routing и checkbox selection.
+                          </p>
+                        </div>
+                      )}
+                      {currentPdfZoneSummary && (
+                        <div className="generation-diagnostics-group">
+                          <strong>PDF zoning</strong>
+                          <div className="generation-diagnostics-list">
+                            <div className="generation-diagnostic-item">
+                              <span>
+                                dominant: {currentPdfZoneSummary.dominantZone ?? 'unknown'} · table {Number(currentPdfZoneSummary.counts?.table ?? 0)} ·
+                                form {Number(currentPdfZoneSummary.counts?.form ?? 0)} · text {Number(currentPdfZoneSummary.counts?.text ?? 0)} · noise{' '}
+                                {Number(currentPdfZoneSummary.counts?.noise ?? 0)}
+                              </span>
+                              <small>
+                                form confidence:{' '}
+                                {typeof currentPdfZoneSummary.routing?.bestFormConfidence === 'number'
+                                  ? currentPdfZoneSummary.routing.bestFormConfidence.toFixed(2)
+                                  : 'n/a'}{' '}
+                                · table confidence:{' '}
+                                {typeof currentPdfZoneSummary.routing?.bestTableConfidence === 'number'
+                                  ? currentPdfZoneSummary.routing.bestTableConfidence.toFixed(2)
+                                  : 'n/a'}
+                              </small>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {currentFormRedFlags.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>Red flags</strong>
+                          <div className="warning-list">
+                            {currentFormRedFlags.map((flag) => (
+                              <div className="warning-item" key={flag.code}>
+                                <strong>{flag.code}</strong>
+                                <div>{flag.message ?? 'Нужно проверить form extraction.'}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {currentRepairPlan && currentRepairActions.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>Режим «Переделать»</strong>
+                          <div className="review-queue-list">
+                            {currentRepairActions.map((action) => {
+                              const actionKey = buildRepairActionKey(action);
+                              const isActive = activeRepairActionKey === actionKey;
+                              const isPreviewForAction =
+                                isActive && repairPreview !== null && buildRepairActionKey(repairPreview.action) === actionKey;
+                              return (
+                                <div className="review-queue-item" key={actionKey}>
+                                  <strong>{repairActionLabel(action)}</strong>
+                                  <span>
+                                    {action.reason} · {action.priority} priority · {repairActionChunkCount(action)} chunk(s)
+                                  </span>
+                                  <div className="mapping-decision-row">
+                                    <button className="secondary-btn" disabled={repairBusy} onClick={() => void onPreviewRepair(action)} type="button">
+                                      {repairBusy && isActive ? 'Собираем preview...' : 'Предпросмотр'}
+                                    </button>
+                                    {isPreviewForAction && repairPreview.previewStatus === 'patch_available' && (
+                                      <button className="primary-btn" disabled={repairBusy} onClick={() => void onApplyRepair()} type="button">
+                                        {repairBusy ? 'Применяем...' : 'Применить'}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {isPreviewForAction && (
+                                    <div className="generation-diagnostics-stack">
+                                      <div className="generation-diagnostic-item">
+                                        <span>{repairPreview.previewStatus}</span>
+                                        <small>
+                                          local chunks: groups {repairPreview.localChunks.groups.length}, scalars {repairPreview.localChunks.scalars.length},
+                                          lines {repairPreview.localChunks.lines.length}
+                                        </small>
+                                      </div>
+                                      {repairPreview.proposedResolutions.length > 0 && (
+                                        <div className="generation-diagnostic-item">
+                                          <span>Proposed resolutions</span>
+                                          <small>
+                                            {repairPreview.proposedResolutions
+                                              .map((item) => `${item.field}: ${item.status} via ${item.resolvedBy}`)
+                                              .join(' · ')}
+                                          </small>
+                                        </div>
+                                      )}
+                                      {Object.keys(repairPreview.proposedPatch ?? {}).length > 0 && (
+                                        <pre className="preview-pane source-text-pane">{JSON.stringify(repairPreview.proposedPatch, null, 2)}</pre>
+                                      )}
+                                      {repairPreview.warnings.length > 0 && (
+                                        <div className="warning-list">
+                                          {repairPreview.warnings.map((warning, index) => (
+                                            <div className="warning-item" key={`${actionKey}-warning-${index}`}>
+                                              {warning}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <p className="subtle-text mapping-editor-note">
+                            Repair работает по локальным chunks из form layout, а не по полному документу. Сначала preview, потом apply.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {(visibleTsDiagnostics.length > 0 || visiblePreviewDiagnostics.length > 0) && (
+                    <div className="generation-diagnostics-stack">
+                      {visibleTsDiagnostics.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>TypeScript diagnostics</strong>
+                          <div className="generation-diagnostics-list">
+                            {visibleTsDiagnostics.slice(0, 6).map((diagnostic, index) => (
+                              <div className="generation-diagnostic-item" key={`ts-${index}`}>
+                                <span>{formatDiagnosticLabel(diagnostic)}</span>
+                                <small>{diagnostic.message}</small>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {visiblePreviewDiagnostics.length > 0 && (
+                        <div className="generation-diagnostics-group">
+                          <strong>Preview vs schema</strong>
+                          <div className="generation-diagnostics-list">
+                            {visiblePreviewDiagnostics.slice(0, 6).map((diagnostic, index) => (
+                              <div className="generation-diagnostic-item" key={`preview-${index}`}>
+                                <span>{formatDiagnosticLabel(diagnostic)}</span>
+                                <small>{diagnostic.message}</small>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </section>
 
                 <section className="insight-card">

@@ -170,6 +170,7 @@ def _build_form_explainability(parsed_file: object) -> dict | None:
         'final_source_mode': layout_meta.get('final_source_mode'),
         'layout_meta': layout_meta,
         'pdf_zone_summary': _build_pdf_zone_explainability(parsed_file),
+        'ocr_zone_summary': _build_ocr_zone_explainability(parsed_file),
         'structure': _to_jsonish(getattr(form_model, 'structure', {}) or {}),
         'quality_summary': quality_summary,
         'repair_plan': repair_plan,
@@ -335,6 +336,40 @@ def _build_form_repair_plan(
             if key not in seen_keys:
                 seen_keys.add(key)
                 actions.append(action)
+        elif code in {'low_confidence_ocr_form_zones', 'ocr_noise_dominates'}:
+            action = {
+                'kind': 'review_ocr_zone_routing',
+                'priority': 'high' if code == 'ocr_noise_dominates' else 'medium',
+                'reason': str(flag.get('message') or 'OCR zone routing should be reviewed.'),
+                'llm_scope': 'disabled_until_ocr_zone_reviewed',
+                'chunk_refs': {
+                    'group_ids': [str(item.get('group_id') or '') for item in groups[:6]],
+                    'scalar_labels': [str(item.get('label') or '') for item in scalars[:8]],
+                    'line_ids': [str(item.get('line_id') or item.get('block_id') or '') for item in layout_lines[:20] if str(item.get('line_id') or item.get('block_id') or '')],
+                },
+                'ocr_zone_routing': quality_summary.get('ocr_zone_routing') or {},
+            }
+            key = (action['kind'], code)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                actions.append(action)
+        elif code == 'ocr_checkbox_selection_review':
+            action = {
+                'kind': 'review_ocr_checkbox_selection',
+                'priority': 'medium',
+                'reason': str(flag.get('message') or 'OCR checkbox detection should be reviewed on the selected image region.'),
+                'llm_scope': 'targeted_group_fragment',
+                'chunk_refs': {
+                    'group_ids': [str(item.get('group_id') or '') for item in groups[:6]],
+                    'scalar_labels': [],
+                    'line_ids': [str(item.get('line_id') or item.get('block_id') or '') for item in layout_lines[:20] if str(item.get('line_id') or item.get('block_id') or '')],
+                },
+                'ocr_zone_routing': quality_summary.get('ocr_zone_routing') or {},
+            }
+            key = (action['kind'], code)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                actions.append(action)
 
     needs_attention = bool(quality_summary.get('needs_attention'))
     return {
@@ -358,6 +393,7 @@ def _build_generic_form_quality(
 ) -> dict:
     document_mode = getattr(parsed_file, 'document_mode', 'data_table_mode')
     pdf_zone_summary = _extract_pdf_zone_summary(parsed_file)
+    ocr_zone_summary = _extract_ocr_zone_summary(parsed_file)
     red_flags: list[dict] = []
     group_quality = _derive_group_quality_signals(groups)
     multiple_selected_single_choice_groups = [
@@ -417,6 +453,31 @@ def _build_generic_form_quality(
                 'best_form_confidence': pdf_zone_summary.get('best_form_confidence'),
             }
         )
+    ocr_zone_routing = _derive_ocr_zone_routing(ocr_zone_summary)
+    if ocr_zone_routing.get('noise_dominates'):
+        red_flags.append(
+            {
+                'code': 'ocr_noise_dominates',
+                'message': 'OCR zone merge is dominated by noise/boilerplate regions.',
+                'best_form_confidence': ocr_zone_routing.get('best_form_confidence'),
+                'best_noise_confidence': ocr_zone_routing.get('best_noise_confidence'),
+            }
+        )
+    elif ocr_zone_routing.get('low_confidence_form_zones'):
+        red_flags.append(
+            {
+                'code': 'low_confidence_ocr_form_zones',
+                'message': 'OCR form zones were detected with low confidence.',
+                'best_form_confidence': ocr_zone_routing.get('best_form_confidence'),
+            }
+        )
+    if getattr(parsed_file, 'ocr_used', False) and groups and ocr_zone_routing.get('checkbox_review_recommended'):
+        red_flags.append(
+            {
+                'code': 'ocr_checkbox_selection_review',
+                'message': 'OCR checkbox interpretation should be reviewed for image/scanned input.',
+            }
+        )
     return {
         'needs_attention': bool(red_flags),
         'repair_recommended': bool(red_flags),
@@ -427,6 +488,7 @@ def _build_generic_form_quality(
         'ambiguous_groups': ambiguous_groups,
         'low_confidence_groups': low_confidence_groups,
         'pdf_zone_routing': pdf_zone_summary,
+        'ocr_zone_routing': ocr_zone_routing,
     }
 
 
@@ -466,6 +528,60 @@ def _build_pdf_zone_explainability(parsed_file: object) -> dict | None:
             'form_zone_count': len(list(dict(parser_outputs.get('form') or {}).get('zones') or [])),
             'text_zone_count': len(list(dict(parser_outputs.get('text') or {}).get('zones') or [])),
             'noise_zone_count': len(list(dict(parser_outputs.get('noise') or {}).get('zones') or [])),
+        },
+    }
+
+
+def _extract_ocr_zone_summary(parsed_file: object) -> dict:
+    ocr_metadata = dict(getattr(parsed_file, 'ocr_metadata', {}) or {})
+    return _to_jsonish(dict(ocr_metadata.get('zone_summary') or {}))
+
+
+def _derive_ocr_zone_routing(ocr_zone_summary: dict) -> dict:
+    if not ocr_zone_summary:
+        return {}
+    parser_outputs = dict(ocr_zone_summary.get('parser_outputs') or {})
+    form_regions = list(dict(parser_outputs.get('form') or {}).get('regions') or [])
+    text_regions = list(dict(parser_outputs.get('text') or {}).get('regions') or [])
+    noise_regions = list(dict(parser_outputs.get('noise') or {}).get('regions') or [])
+    best_form_confidence = max((_coerce_float(region.get('zone_confidence')) or 0.0 for region in form_regions), default=0.0)
+    best_noise_confidence = max((_coerce_float(region.get('zone_confidence')) or 0.0 for region in noise_regions), default=0.0)
+    counts = dict(ocr_zone_summary.get('counts') or {})
+    merge_stats = dict(ocr_zone_summary.get('merge_stats') or {})
+    noise_dominates = int(counts.get('noise') or 0) > max(int(counts.get('form') or 0), int(counts.get('text') or 0))
+    low_confidence_form_zones = bool(form_regions) and best_form_confidence < LOW_GROUP_CONFIDENCE_THRESHOLD
+    checkbox_review_recommended = bool(form_regions) and (
+        low_confidence_form_zones
+        or int(merge_stats.get('dropped_low_confidence_lines') or 0) > 0
+    )
+    return {
+        'available': True,
+        'has_form_zones': bool(form_regions),
+        'has_text_zones': bool(text_regions),
+        'has_noise_zones': bool(noise_regions),
+        'best_form_confidence': round(best_form_confidence, 4) if form_regions else None,
+        'best_noise_confidence': round(best_noise_confidence, 4) if noise_regions else None,
+        'low_confidence_form_zones': low_confidence_form_zones,
+        'noise_dominates': noise_dominates,
+        'checkbox_review_recommended': checkbox_review_recommended,
+        'selected_region_ids': list(ocr_zone_summary.get('selected_region_ids') or []),
+        'merge_stats': merge_stats,
+    }
+
+
+def _build_ocr_zone_explainability(parsed_file: object) -> dict | None:
+    ocr_zone_summary = _extract_ocr_zone_summary(parsed_file)
+    if not ocr_zone_summary:
+        return None
+    parser_outputs = dict(ocr_zone_summary.get('parser_outputs') or {})
+    return {
+        'counts': dict(ocr_zone_summary.get('counts') or {}),
+        'routing': _derive_ocr_zone_routing(ocr_zone_summary),
+        'merge_stats': dict(ocr_zone_summary.get('merge_stats') or {}),
+        'parser_outputs': {
+            'form_zone_count': len(list(dict(parser_outputs.get('form') or {}).get('regions') or [])),
+            'text_zone_count': len(list(dict(parser_outputs.get('text') or {}).get('regions') or [])),
+            'noise_zone_count': len(list(dict(parser_outputs.get('noise') or {}).get('regions') or [])),
         },
     }
 

@@ -1,10 +1,27 @@
 services:
+  llamaparse:
+    build:
+      context: ./llamaparse_service
+    container_name: tsgen-llamaparse
+    env_file:
+      - ./mvp_backend/.env
+    restart: unless-stopped
+    ports:
+      - '8030:8030'
+
   backend:
     build:
       context: ./mvp_backend
     container_name: tsgen-backend
     env_file:
       - ./mvp_backend/.env
+    environment:
+      LLAMAPARSE_SERVICE_URL: http://llamaparse:8030
+      LLAMAPARSE_TIMEOUT_SECONDS: 120
+      OCR_SERVICE_URL: http://ocr:8010
+      OCR_SERVICE_TIMEOUT_SECONDS: 120
+    depends_on:
+      - llamaparse
     ports:
       - '8000:8000'
     volumes:

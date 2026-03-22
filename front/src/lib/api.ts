@@ -14,6 +14,7 @@ import type {
   MappingFeedbackResult,
   RepairApplyResult,
   RepairPreviewResult,
+  BackendHealth,
   UserProfile,
 } from '../types';
 
@@ -86,6 +87,8 @@ type BackendParsedFile = {
     columns: string[];
     rows: Record<string, unknown>[];
   }>;
+  ocr_used?: boolean;
+  ocr_metadata?: Record<string, unknown>;
   form_model?: {
     scalars?: Record<string, unknown>[];
     groups?: Record<string, unknown>[];
@@ -95,6 +98,14 @@ type BackendParsedFile = {
     resolved_fields?: Record<string, unknown>[];
   } | null;
   warnings: string[];
+};
+
+type BackendHealthResponse = {
+  status: string;
+  ocr_service?: {
+    status?: string;
+    paddleocr_available?: boolean;
+  } | null;
 };
 
 type BackendGenerateResponse = {
@@ -495,6 +506,8 @@ function normalizeParsedFile(payload: BackendParsedFile) {
       sectionTitle: candidate.section_title ?? null,
     })),
     sheets: payload.sheets ?? [],
+    ocrUsed: payload.ocr_used ?? false,
+    ocrMetadata: payload.ocr_metadata ?? {},
     formModel: payload.form_model
       ? {
           scalars: payload.form_model.scalars ?? [],
@@ -548,6 +561,8 @@ function serializeParsedFile(payload: NonNullable<GenerationResult['parsedFile']
       columns: sheet.columns,
       rows: sheet.rows,
     })),
+    ocr_used: payload.ocrUsed ?? false,
+    ocr_metadata: payload.ocrMetadata ?? {},
     form_model: payload.formModel
       ? {
           scalars: payload.formModel.scalars,
@@ -618,6 +633,18 @@ type BackendFormExplainability = {
   document_mode: string;
   final_source_mode?: string | null;
   layout_meta?: Record<string, unknown>;
+  pdf_zone_summary?: {
+    dominant_zone?: string;
+    counts?: Record<string, number>;
+    routing?: Record<string, unknown>;
+    parser_outputs?: Record<string, number>;
+  } | null;
+  ocr_zone_summary?: {
+    counts?: Record<string, number>;
+    routing?: Record<string, unknown>;
+    merge_stats?: Record<string, number>;
+    parser_outputs?: Record<string, number>;
+  } | null;
   quality_summary?: {
     needs_attention?: boolean;
     repair_recommended?: boolean;
@@ -958,6 +985,83 @@ function normalizeSourceQualityAdjustment(
   };
 }
 
+function normalizePdfZoneSummary(
+  payload:
+    | {
+        dominant_zone?: string;
+        counts?: Record<string, number>;
+        routing?: Record<string, unknown>;
+        parser_outputs?: Record<string, number>;
+      }
+    | null
+    | undefined
+) {
+  if (!payload) {
+    return null;
+  }
+  const routing = payload.routing ?? {};
+  return {
+    dominantZone: payload.dominant_zone,
+    counts: payload.counts ?? {},
+    routing: {
+      available: routing.available,
+      hasTableZones: routing.has_table_zones,
+      hasFormZones: routing.has_form_zones,
+      hasTextZones: routing.has_text_zones,
+      hasNoiseZones: routing.has_noise_zones,
+      bestTableConfidence: routing.best_table_confidence,
+      bestFormConfidence: routing.best_form_confidence,
+      bestTextConfidence: routing.best_text_confidence,
+      bestNoiseConfidence: routing.best_noise_confidence,
+      hasConfidentTableZone: routing.has_confident_table_zone,
+      hasConfidentFormZone: routing.has_confident_form_zone,
+      lowConfidenceFormZones: routing.low_confidence_form_zones,
+      preferTableSource: routing.prefer_table_source,
+    },
+    parserOutputs: payload.parser_outputs ?? {},
+  };
+}
+
+function normalizeOcrZoneSummary(
+  payload:
+    | {
+        counts?: Record<string, number>;
+        routing?: Record<string, unknown>;
+        merge_stats?: Record<string, number>;
+        parser_outputs?: Record<string, number>;
+      }
+    | null
+    | undefined
+) {
+  if (!payload) {
+    return null;
+  }
+  const routing = payload.routing ?? {};
+  const mergeStats = payload.merge_stats ?? {};
+  return {
+    counts: payload.counts ?? {},
+    routing: {
+      available: routing.available,
+      hasFormZones: routing.has_form_zones,
+      hasTextZones: routing.has_text_zones,
+      hasNoiseZones: routing.has_noise_zones,
+      bestFormConfidence: routing.best_form_confidence,
+      bestNoiseConfidence: routing.best_noise_confidence,
+      lowConfidenceFormZones: routing.low_confidence_form_zones,
+      noiseDominates: routing.noise_dominates,
+      checkboxReviewRecommended: routing.checkbox_review_recommended,
+      selectedRegionIds: Array.isArray(routing.selected_region_ids) ? routing.selected_region_ids : [],
+    },
+    mergeStats: {
+      inputLineCount: mergeStats.input_line_count ?? 0,
+      selectedLineCount: mergeStats.selected_line_count ?? 0,
+      droppedLowConfidenceLines: mergeStats.dropped_low_confidence_lines ?? 0,
+      droppedNoiseLines: mergeStats.dropped_noise_lines ?? 0,
+    },
+    parserOutputs: payload.parser_outputs ?? {},
+  };
+}
+
 function normalizeFormExplainability(payload: BackendFormExplainability | null | undefined): FormExplainability | null {
   if (!payload) {
     return null;
@@ -966,6 +1070,8 @@ function normalizeFormExplainability(payload: BackendFormExplainability | null |
     documentMode: payload.document_mode,
     finalSourceMode: payload.final_source_mode ?? null,
     layoutMeta: payload.layout_meta ?? {},
+    pdfZoneSummary: normalizePdfZoneSummary(payload.pdf_zone_summary),
+    ocrZoneSummary: normalizeOcrZoneSummary(payload.ocr_zone_summary),
     qualitySummary: {
       needsAttention: payload.quality_summary?.needs_attention ?? false,
       repairRecommended: payload.quality_summary?.repair_recommended ?? false,
@@ -1319,6 +1425,20 @@ export async function fetchSourcePreviewFromBackend(file: File) {
 
   const payload = await parseJson<BackendSourcePreviewResponse>(response);
   return normalizeParsedFile(payload.parsed_file);
+}
+
+export async function fetchBackendHealth(): Promise<BackendHealth> {
+  const response = await fetchWithTimeout(buildApiUrl('/health'), { method: 'GET' }, DEFAULT_REQUEST_TIMEOUT_MS);
+  const payload = await parseJson<BackendHealthResponse>(response);
+  return {
+    status: payload.status,
+    ocrService: payload.ocr_service
+      ? {
+          status: payload.ocr_service.status,
+          paddleocrAvailable: payload.ocr_service.paddleocr_available,
+        }
+      : null,
+  };
 }
 
 export async function refreshSourceStructureFromBackend(params: SourceStructureRefreshParams): Promise<{

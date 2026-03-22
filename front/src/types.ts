@@ -43,6 +43,8 @@ export type ParsedFileInfo = {
   kvPairs: ParsedKvPairInfo[];
   sourceCandidates: SourceCandidateInfo[];
   sheets: ParsedSheetInfo[];
+  ocrUsed?: boolean;
+  ocrMetadata?: Record<string, unknown>;
   formModel?: {
     scalars: Record<string, unknown>[];
     groups: Record<string, unknown>[];
@@ -52,6 +54,14 @@ export type ParsedFileInfo = {
     resolvedFields: Record<string, unknown>[];
   } | null;
   warnings: string[];
+};
+
+export type BackendHealth = {
+  status: string;
+  ocrService: {
+    status?: string;
+    paddleocrAvailable?: boolean;
+  } | null;
 };
 
 export type FormRepairAction = {
@@ -84,6 +94,18 @@ export type FormExplainability = {
   documentMode: string;
   finalSourceMode?: string | null;
   layoutMeta: Record<string, unknown>;
+  pdfZoneSummary?: {
+    dominantZone?: string;
+    counts?: Record<string, number>;
+    routing?: Record<string, unknown>;
+    parserOutputs?: Record<string, number>;
+  } | null;
+  ocrZoneSummary?: {
+    counts?: Record<string, number>;
+    routing?: Record<string, unknown>;
+    mergeStats?: Record<string, number>;
+    parserOutputs?: Record<string, number>;
+  } | null;
   qualitySummary: {
     needsAttention?: boolean;
     repairRecommended?: boolean;

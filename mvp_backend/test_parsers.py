@@ -166,7 +166,7 @@ except ModuleNotFoundError:
 from models import ParsedFile, ParsedSheet, RepairApplyPayload, RepairPreviewPayload, TargetField
 from parsers import ParseError, _build_form_model, _resolve_generic_form_layout_source, parse_file, resolve_generation_source
 from pdf_zoning import classify_pdf_document_zones
-from document_parser import _suppress_consumed_group_fragments
+from document_parser import _merge_ocr_image_results, _suppress_consumed_group_fragments
 from form_layout import (
     _extract_scalar_from_table_row,
     _extract_scalars_from_layout_lines,
@@ -223,6 +223,12 @@ class FakePdfContext:
 
     def __exit__(self, exc_type, exc, tb):
         return None
+
+
+class FakeLlamaDocument:
+    def __init__(self, text: str, metadata: dict[str, object] | None = None) -> None:
+        self.text = text
+        self.metadata = metadata or {}
 
 
 @unittest.skipIf(Document is None, 'python-docx is not installed in the current environment')
@@ -374,6 +380,30 @@ class DocumentParserTests(unittest.TestCase):
         self.assertEqual(parsed.columns, [])
         self.assertEqual(parsed.rows, [])
         self.assertTrue(any('OCR' in warning or 'image' in warning.lower() for warning in parsed.warnings))
+
+    def test_image_like_input_can_use_external_ocr_service(self) -> None:
+        path = self.test_root / 'photo.jpg'
+        path.write_bytes(b'not-a-real-photo-but-extension-is-enough')
+
+        with patch(
+            'document_parser.extract_text_from_ocr_service',
+            return_value={
+                'text': 'Наименование организации: ООО "Рога и копыта"\nИНН/КИО: 1234567890',
+                'blocks': [
+                    {'id': 'ocr-line-1', 'kind': 'line', 'text': 'Наименование организации: ООО "Рога и копыта"', 'label': 'ocr'},
+                    {'id': 'ocr-line-2', 'kind': 'line', 'text': 'ИНН/КИО: 1234567890', 'label': 'ocr'},
+                ],
+                'warnings': ['Text was extracted via the external OCR service.'],
+            },
+        ):
+            parsed = parse_file(path, path.name)
+            columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertIn(parsed.content_type, {'form', 'text'})
+        self.assertEqual(parsed.extraction_status, 'text_extracted')
+        self.assertEqual(columns, ['Наименование организации', 'ИНН/КИО'])
+        self.assertEqual(rows[0]['ИНН/КИО'], '1234567890')
+        self.assertTrue(any('external OCR service' in warning for warning in parsed.warnings + warnings))
 
     def test_docx_form_like_table_is_resolved_via_form_aware_extraction(self) -> None:
         path = self.test_root / 'form_layout.docx'
@@ -984,6 +1014,208 @@ class PdfAndRepairParserTests(unittest.TestCase):
         self.assertEqual(parsed.content_type, 'text')
         self.assertEqual(parsed.document_mode, 'data_table_mode')
         self.assertTrue(any('PDF zoning regions' in warning for warning in parsed.warnings))
+
+    def test_image_based_pdf_can_use_external_ocr_service(self) -> None:
+        fake_pdf = FakePdfContext(
+            [
+                FakePdfPage(
+                    text='',
+                    tables=[],
+                    words=[],
+                )
+            ]
+        )
+
+        with patch('pdf_parser.pdfplumber.open', return_value=fake_pdf), patch(
+            'pdf_parser.extract_text_from_ocr_service',
+            return_value={
+                'text': 'Наименование организации: ООО "Рога и копыта"\nИНН/КИО: 1234567890',
+                'blocks': [
+                    {'id': 'ocr-line-1', 'kind': 'line', 'text': 'Наименование организации: ООО "Рога и копыта"', 'label': 'ocr'},
+                    {'id': 'ocr-line-2', 'kind': 'line', 'text': 'ИНН/КИО: 1234567890', 'label': 'ocr'},
+                ],
+                'warnings': ['Text was extracted via the external OCR service.'],
+            },
+        ):
+            parsed = parse_file(Path('scan_pdf.pdf'), 'scan_pdf.pdf')
+            columns, rows, warnings = resolve_generation_source(parsed)
+
+        self.assertEqual(parsed.content_type, 'form')
+        self.assertEqual(parsed.extraction_status, 'text_extracted')
+        self.assertEqual(columns, ['Наименование организации', 'ИНН/КИО'])
+        self.assertEqual(rows[0]['Наименование организации'], 'ООО "Рога и копыта"')
+        self.assertTrue(any('OCR fallback' in warning for warning in parsed.warnings))
+
+    def test_ocr_image_zone_classification_filters_noise_and_tracks_merge_stats(self) -> None:
+        merged_text, scored_blocks, zone_summary = _merge_ocr_image_results(
+            raw_text=(
+                'СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ\n'
+                'Настоящее согласие предоставляется на обработку персональных данных\n'
+                'Наименование организации: ООО "Рога и копыта"\n'
+                'ИНН/КИО: 1234567890'
+            ),
+            layout_blocks=[
+                {'id': 'line-1', 'text': 'СВЕДЕНИЯ О ВЫГОДОПРИОБРЕТАТЕЛЕ', 'page': 1, 'x': 10, 'y': 10, 'width': 240, 'height': 12, 'confidence': 0.96},
+                {'id': 'line-2', 'text': 'Настоящее согласие предоставляется на обработку персональных данных', 'page': 1, 'x': 10, 'y': 32, 'width': 410, 'height': 12, 'confidence': 0.88},
+                {'id': 'line-3', 'text': 'Наименование организации: ООО "Рога и копыта"', 'page': 1, 'x': 10, 'y': 92, 'width': 340, 'height': 12, 'confidence': 0.94},
+                {'id': 'line-4', 'text': 'ИНН/КИО: 1234567890', 'page': 1, 'x': 10, 'y': 108, 'width': 190, 'height': 12, 'confidence': 0.93},
+            ],
+        )
+
+        self.assertIn('Наименование организации', merged_text)
+        self.assertIn('ИНН/КИО', merged_text)
+        self.assertNotIn('Настоящее согласие', merged_text)
+        self.assertTrue(any(block['ocr_zone_type'] == 'noise' for block in scored_blocks))
+        self.assertGreaterEqual(int(zone_summary['counts']['form']), 1)
+        self.assertGreaterEqual(int(zone_summary['counts']['noise']), 1)
+        self.assertGreaterEqual(int(zone_summary['merge_stats']['dropped_noise_lines']), 1)
+        self.assertTrue(zone_summary['selected_region_ids'])
+
+    def test_image_ocr_checkbox_alias_is_detected_as_selected_option(self) -> None:
+        with patch(
+            'document_parser.extract_text_from_ocr_service',
+            return_value={
+                'text': (
+                    'Является ли выгодоприобретатель налоговым резидентом только в РФ\n'
+                    'I\n'
+                    'Не являюсь налоговым резидентом ни в одном государстве'
+                ),
+                'blocks': [
+                    {'id': 'ocr-line-1', 'kind': 'line', 'text': 'Является ли выгодоприобретатель налоговым резидентом только в РФ', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 10, 'width': 320, 'height': 10, 'confidence': 0.92},
+                    {'id': 'ocr-line-2', 'kind': 'line', 'text': 'I', 'label': 'ocr', 'page': 1, 'x': 12, 'y': 34, 'width': 8, 'height': 10, 'confidence': 0.67},
+                    {'id': 'ocr-line-3', 'kind': 'line', 'text': 'Не являюсь налоговым резидентом ни в одном государстве', 'label': 'ocr', 'page': 1, 'x': 34, 'y': 34, 'width': 290, 'height': 10, 'confidence': 0.9},
+                ],
+                'warnings': ['Text was extracted via the external OCR service.'],
+                'ocr_metadata': {'engine': 'paddleocr'},
+            },
+        ):
+            parsed = parse_file(Path('photo_tax.jpg'), 'photo_tax.jpg')
+            columns, rows, _warnings = resolve_generation_source(
+                parsed,
+                target_fields=[TargetField(name='isResidentRF', type='string')],
+            )
+
+        self.assertTrue(parsed.ocr_used)
+        self.assertEqual(parsed.document_mode, 'form_layout_mode')
+        self.assertEqual(columns, ['isResidentRF'])
+        self.assertEqual(rows[0]['isResidentRF'], 'NOWHERE')
+        self.assertTrue(parsed.ocr_metadata.get('zone_summary'))
+        tax_group = next(group for group in parsed.form_model.groups if group.group_id == 'tax_residency')
+        self.assertTrue(any(option.selected for option in tax_group.options))
+
+    def test_image_ocr_table_reconstruction_repairs_numbers_dates_and_names(self) -> None:
+        with patch(
+            'document_parser.extract_text_from_ocr_service',
+            return_value={
+                'text': (
+                    'name | amount | date\n'
+                    'Aнна Иванова | 12оооо | 2025-01-02\n'
+                    'Иван Иванов | 5O0 | 2025-91-02'
+                ),
+                'blocks': [
+                    {'id': 'ocr-row-1', 'kind': 'line', 'text': 'name | amount | date', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 10, 'width': 220, 'height': 10, 'confidence': 0.97},
+                    {'id': 'ocr-row-2', 'kind': 'line', 'text': 'Aнна Иванова | 12оооо | 2025-01-02', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 28, 'width': 280, 'height': 10, 'confidence': 0.94},
+                    {'id': 'ocr-row-3', 'kind': 'line', 'text': 'Иван Иванов | 5O0 | 2025-91-02', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 44, 'width': 260, 'height': 10, 'confidence': 0.92},
+                    {'id': 'ocr-noise-1', 'kind': 'line', 'text': 'тг', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 70, 'width': 16, 'height': 10, 'confidence': 0.31},
+                ],
+                'warnings': ['Text was extracted via the external OCR service.'],
+                'ocr_metadata': {'engine': 'paddleocr'},
+            },
+        ):
+            parsed = parse_file(Path('ocr_table.png'), 'ocr_table.png')
+
+        self.assertTrue(parsed.ocr_used)
+        self.assertEqual(parsed.extraction_status, 'structured_extracted')
+        self.assertEqual(parsed.columns, ['name', 'amount', 'date'])
+        self.assertEqual(len(parsed.rows), 2)
+        self.assertEqual(parsed.rows[0]['name'], 'Анна Иванова')
+        self.assertEqual(parsed.rows[0]['amount'], '120000')
+        self.assertEqual(parsed.rows[0]['date'], '2025-01-02')
+        self.assertEqual(parsed.rows[1]['amount'], '500')
+        self.assertEqual(parsed.rows[1]['date'], '')
+        self.assertEqual(parsed.ocr_metadata['table_reconstruction']['column_types']['amount'], 'number')
+        self.assertEqual(parsed.ocr_metadata['table_reconstruction']['column_types']['date'], 'date')
+        self.assertTrue(any('OCR table reconstruction detected' in warning for warning in parsed.warnings))
+
+    def test_image_ocr_table_reconstruction_drops_inconsistent_row_shapes(self) -> None:
+        with patch(
+            'document_parser.extract_text_from_ocr_service',
+            return_value={
+                'text': (
+                    'name | amount | date\n'
+                    'Анна | 10 | 2025-01-02\n'
+                    'сломанная строка | 2025-01-03\n'
+                    'Борис | 20 | 2025-01-04'
+                ),
+                'blocks': [
+                    {'id': 'ocr-row-1', 'kind': 'line', 'text': 'name | amount | date', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 10, 'width': 220, 'height': 10, 'confidence': 0.97},
+                    {'id': 'ocr-row-2', 'kind': 'line', 'text': 'Анна | 10 | 2025-01-02', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 28, 'width': 220, 'height': 10, 'confidence': 0.94},
+                    {'id': 'ocr-row-3', 'kind': 'line', 'text': 'сломанная строка | 2025-01-03', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 44, 'width': 220, 'height': 10, 'confidence': 0.92},
+                    {'id': 'ocr-row-4', 'kind': 'line', 'text': 'Борис | 20 | 2025-01-04', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 60, 'width': 220, 'height': 10, 'confidence': 0.95},
+                ],
+                'warnings': ['Text was extracted via the external OCR service.'],
+                'ocr_metadata': {'engine': 'paddleocr'},
+            },
+        ):
+            parsed = parse_file(Path('ocr_table_shape.png'), 'ocr_table_shape.png')
+
+        self.assertEqual(parsed.columns, ['name', 'amount', 'date'])
+        self.assertEqual(len(parsed.rows), 2)
+        self.assertEqual(parsed.rows[0]['name'], 'Анна')
+        self.assertEqual(parsed.rows[1]['name'], 'Борис')
+
+    def test_image_ocr_table_reconstruction_can_cluster_row_bands_from_fragments(self) -> None:
+        with patch(
+            'document_parser.extract_text_from_ocr_service',
+            return_value={
+                'text': 'name amount date Анна 10 2025-01-02 Борис 20 2025-01-04',
+                'blocks': [
+                    {'id': 'hdr-1', 'kind': 'line', 'text': 'name', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 10, 'width': 40, 'height': 10, 'confidence': 0.95},
+                    {'id': 'hdr-2', 'kind': 'line', 'text': 'amount', 'label': 'ocr', 'page': 1, 'x': 110, 'y': 11, 'width': 55, 'height': 10, 'confidence': 0.95},
+                    {'id': 'hdr-3', 'kind': 'line', 'text': 'date', 'label': 'ocr', 'page': 1, 'x': 210, 'y': 10, 'width': 40, 'height': 10, 'confidence': 0.95},
+                    {'id': 'row-1a', 'kind': 'line', 'text': 'Анна', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 30, 'width': 40, 'height': 10, 'confidence': 0.93},
+                    {'id': 'row-1b', 'kind': 'line', 'text': '10', 'label': 'ocr', 'page': 1, 'x': 118, 'y': 31, 'width': 18, 'height': 10, 'confidence': 0.91},
+                    {'id': 'row-1c', 'kind': 'line', 'text': '2025-01-02', 'label': 'ocr', 'page': 1, 'x': 208, 'y': 30, 'width': 78, 'height': 10, 'confidence': 0.94},
+                    {'id': 'row-2a', 'kind': 'line', 'text': 'Борис', 'label': 'ocr', 'page': 1, 'x': 10, 'y': 48, 'width': 48, 'height': 10, 'confidence': 0.93},
+                    {'id': 'row-2b', 'kind': 'line', 'text': '20', 'label': 'ocr', 'page': 1, 'x': 118, 'y': 49, 'width': 18, 'height': 10, 'confidence': 0.91},
+                    {'id': 'row-2c', 'kind': 'line', 'text': '2025-01-04', 'label': 'ocr', 'page': 1, 'x': 208, 'y': 48, 'width': 78, 'height': 10, 'confidence': 0.94},
+                ],
+                'warnings': ['Text was extracted via the external OCR service.'],
+                'ocr_metadata': {'engine': 'paddleocr'},
+            },
+        ):
+            parsed = parse_file(Path('ocr_table_bands.png'), 'ocr_table_bands.png')
+
+        self.assertEqual(parsed.columns, ['name', 'amount', 'date'])
+        self.assertEqual(len(parsed.rows), 2)
+        self.assertEqual(parsed.rows[0]['name'], 'Анна')
+        self.assertEqual(parsed.rows[0]['amount'], '10')
+        self.assertEqual(parsed.rows[1]['date'], '2025-01-04')
+        self.assertEqual(parsed.ocr_metadata['table_reconstruction']['recovered_table_confidence'], 'high')
+        self.assertGreaterEqual(parsed.ocr_metadata['table_reconstruction']['row_stats']['accepted_rows'], 2)
+
+    def test_llamaparse_markdown_table_is_routed_to_table_not_unknown_group(self) -> None:
+        with patch(
+            'document_parser.extract_text_from_llamaparse',
+            return_value={
+                'text': '| ПБ | по | П |\n| -- | -- | -- |\n| 6 | 4 | 13 |\n| 4 | 6 | 15 |',
+                'blocks': [
+                    {'id': 'lp-1', 'kind': 'line', 'text': '| ПБ | по | П |', 'label': 'llamaparse', 'page': 1},
+                    {'id': 'lp-2', 'kind': 'line', 'text': '| -- | -- | -- |', 'label': 'llamaparse', 'page': 1},
+                    {'id': 'lp-3', 'kind': 'line', 'text': '| 6 | 4 | 13 |', 'label': 'llamaparse', 'page': 1},
+                    {'id': 'lp-4', 'kind': 'line', 'text': '| 4 | 6 | 15 |', 'label': 'llamaparse', 'page': 1},
+                ],
+                'warnings': ['Primary extraction used LlamaParse.'],
+            },
+        ):
+            parsed = parse_file(Path('llamaparse_markdown_table.png'), 'llamaparse_markdown_table.png')
+
+        self.assertEqual(parsed.content_type, 'table')
+        self.assertEqual(parsed.document_mode, 'data_table_mode')
+        self.assertEqual(parsed.columns, ['ПБ', 'по', 'П'])
+        self.assertEqual(len(parsed.rows), 2)
+        self.assertEqual(parsed.rows[0]['П'], '13')
+        self.assertFalse(parsed.form_model and parsed.form_model.groups)
 
     def test_pdf_zone_routing_can_prefer_table_source_over_form_source(self) -> None:
         parsed = ParsedFile(
@@ -1720,6 +1952,69 @@ class PdfAndRepairParserTests(unittest.TestCase):
         self.assertEqual(explainability['pdf_zone_summary']['routing']['low_confidence_form_zones'], True)
         self.assertIn('low_confidence_form_zones', explainability['repair_plan']['red_flag_codes'])
         self.assertTrue(any(action['kind'] == 'review_pdf_zone_routing' for action in explainability['repair_plan']['actions']))
+
+    def test_form_explainability_exposes_ocr_zone_routing(self) -> None:
+        parsed = ParsedFile(
+            file_name='photo_explainability.jpg',
+            file_type='jpg',
+            columns=[],
+            rows=[],
+            content_type='form',
+            document_mode='form_layout_mode',
+            extraction_status='text_extracted',
+            raw_text='Question\nOption A\n',
+            text_blocks=[],
+            sections=[],
+            kv_pairs=[],
+            source_candidates=[],
+            sheets=[],
+            form_model=_build_form_model(
+                {
+                    'scalars': [],
+                    'groups': [
+                        {
+                            'group_id': 'group_1',
+                            'question': 'Question',
+                            'group_type': 'single_choice',
+                            'group_confidence': 0.57,
+                            'selection_confidence': 0.49,
+                            'options': [{'label': 'Option A', 'selected': True, 'source_ref': {'line_id': 'line-2'}}],
+                            'source_ref': {'line_id': 'line-1'},
+                        }
+                    ],
+                    'layout_lines': [
+                        {'text': 'Question', 'line_id': 'line-1'},
+                        {'text': 'Option A', 'line_id': 'line-2'},
+                    ],
+                    'layout_meta': {},
+                    'resolved_fields': [],
+                }
+            ),
+            ocr_used=True,
+            ocr_metadata={
+                'zone_summary': {
+                    'counts': {'form': 1, 'text': 0, 'noise': 2, 'table': 0},
+                    'merge_stats': {'input_line_count': 5, 'selected_line_count': 2, 'dropped_low_confidence_lines': 1, 'dropped_noise_lines': 2},
+                    'selected_region_ids': ['region_p1_c0_2'],
+                    'parser_outputs': {
+                        'form': {'regions': [{'zone_id': 'region_p1_c0_2', 'zone_confidence': 0.57}]},
+                        'text': {'regions': []},
+                        'noise': {'regions': [{'zone_confidence': 0.91}, {'zone_confidence': 0.86}]},
+                    },
+                }
+            },
+            warnings=[],
+        )
+
+        explainability = _build_form_explainability(parsed)
+
+        self.assertIsNotNone(explainability)
+        self.assertEqual(explainability['ocr_zone_summary']['routing']['low_confidence_form_zones'], True)
+        self.assertTrue(explainability['ocr_zone_summary']['routing']['noise_dominates'])
+        self.assertIn('ocr_noise_dominates', explainability['repair_plan']['red_flag_codes'])
+        self.assertIn('ocr_checkbox_selection_review', explainability['repair_plan']['red_flag_codes'])
+        self.assertTrue(any(action['kind'] == 'review_ocr_zone_routing' for action in explainability['repair_plan']['actions']))
+        self.assertTrue(any(action['kind'] == 'review_ocr_checkbox_selection' for action in explainability['repair_plan']['actions']))
 
     def test_repair_preview_returns_targeted_patch_for_tax_group(self) -> None:
         parsed = ParsedFile(

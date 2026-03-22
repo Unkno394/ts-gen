@@ -20,6 +20,8 @@ from model_client import suggest_form_field_repair
 
 CHECK_MARKERS = {'x', 'X', 'v', 'V', '✓', '✔', '☒', '☑', '■', '1'}
 UNCHECKED_MARKERS = {'□', '☐', '○', '◯', '0'}
+OCR_CHECKED_MARKER_ALIASES = {'I', 'l', '|', '/', '\\'}
+OCR_UNCHECKED_MARKER_ALIASES = {'O', 'o'}
 LINE_SPLIT_RE = re.compile(r'[\n\r]+')
 SPACE_RE = re.compile(r'\s+')
 TOKEN_RE = re.compile(r'[a-zA-Zа-яА-Я0-9]+')
@@ -1038,7 +1040,7 @@ def _extract_option_from_table_row(cells: list[str], *, table_index: int, row_in
 
 
 def _extract_option_from_text_line(text: str, *, source_ref: dict[str, Any]) -> dict[str, Any] | None:
-    marker_match = re.match(r'^\s*([XxVv✓✔☒☑□☐○◯])\s*(.+)$', text)
+    marker_match = re.match(r'^\s*([XxVv✓✔☒☑□☐○◯Iil|/\\Oo])\s*(.+)$', text)
     if marker_match:
         marker_text = marker_match.group(1)
         return {
@@ -1047,7 +1049,7 @@ def _extract_option_from_text_line(text: str, *, source_ref: dict[str, Any]) -> 
             'marker_text': marker_text,
             'source_ref': dict(source_ref),
         }
-    bracket_match = re.match(r'^\s*\[([XxVv✓✔ ])\]\s*(.+)$', text)
+    bracket_match = re.match(r'^\s*\[([XxVv✓✔Iil|/\\Oo ])\]\s*(.+)$', text)
     if bracket_match:
         marker_text = bracket_match.group(1)
         return {
@@ -1790,21 +1792,34 @@ def _phrase_similarity(left: list[str], right: list[str]) -> float:
 
 
 def _contains_marker(value: Any) -> bool:
-    text = _clean_text(value)
+    text = _canonicalize_marker_text(value)
     if not text:
         return False
     if text in CHECK_MARKERS or text in UNCHECKED_MARKERS:
         return True
-    return bool(re.search(r'\[[XxVv✓✔ ]\]', text))
+    return bool(re.search(r'\[[XxVv✓✔Iil|/\\Oo ]\]', text))
 
 
 def _is_marker_cell(value: Any) -> bool:
-    text = _clean_text(value)
+    text = _canonicalize_marker_text(value)
     return text in CHECK_MARKERS or text in UNCHECKED_MARKERS
 
 
 def _is_checked_marker(value: Any) -> bool:
-    return _clean_text(value) in CHECK_MARKERS
+    return _canonicalize_marker_text(value) in CHECK_MARKERS
+
+
+def _canonicalize_marker_text(value: Any) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ''
+    if text in CHECK_MARKERS or text in UNCHECKED_MARKERS:
+        return text
+    if text in OCR_CHECKED_MARKER_ALIASES:
+        return 'X'
+    if text in OCR_UNCHECKED_MARKER_ALIASES:
+        return '0'
+    return text
 
 
 def _safe_float(value: Any) -> float | None:

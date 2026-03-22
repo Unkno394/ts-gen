@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pdfplumber
+from ocr_client import extract_text_from_ocr_service
 from pdf_zoning import classify_pdf_document_zones
 
 
@@ -161,6 +162,31 @@ def parse_pdf(path: str | Path) -> dict[str, Any]:
             "text": direct_text,
             "blocks": blocks or [{"type": "paragraph", "text": direct_text}],
             "zone_summary": zone_summary,
+            "warnings": warnings,
+        }
+
+    ocr_result = extract_text_from_ocr_service(path)
+    if isinstance(ocr_result, dict) and str(ocr_result.get('text') or '').strip():
+        ocr_blocks = [dict(block) for block in ocr_result.get('blocks', []) if isinstance(block, dict)]
+        warnings.extend([str(warning) for warning in ocr_result.get('warnings', [])])
+        warnings.append('PDF text layer was empty, so OCR fallback was used.')
+        return {
+            "file_name": Path(path).name,
+            "file_type": "pdf",
+            "content_type": "text",
+            "columns": [],
+            "rows": [],
+            "tables": data_tables,
+            "text": str(ocr_result.get('text') or ''),
+            "blocks": ocr_blocks,
+            "ocr_used": True,
+            "ocr_metadata": dict(ocr_result.get('ocr_metadata') or {}),
+            "zone_summary": {
+                **dict(zone_summary or {}),
+                'content_type': 'text',
+                'extraction_status': 'text_extracted',
+                'ocr_fallback_used': True,
+            },
             "warnings": warnings,
         }
 

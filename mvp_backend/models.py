@@ -145,6 +145,8 @@ class ParsedFile(BaseModel):
     sheets: list[ParsedSheet] = Field(default_factory=list)
     form_model: FormDocumentModel | None = None
     pdf_zone_summary: dict[str, Any] = Field(default_factory=dict)
+    ocr_used: bool = False
+    ocr_metadata: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 
