@@ -338,6 +338,48 @@ Frontend будет доступен на:
 npm install xlsx mammoth pdfjs-dist
 ```
 
+### Запуск сгенерированного TypeScript на другой локальной машине
+
+Сгенерированный `TypeScript` можно запускать и вне этого репозитория, но на другой машине тоже должно быть подготовлено минимальное JS-окружение.
+
+Минимальный вариант:
+
+```bash
+mkdir tsgen-runner
+cd tsgen-runner
+npm init -y
+npm install xlsx mammoth pdfjs-dist
+npm install -D typescript tsx @types/node
+```
+
+Дальше:
+
+1. сохраните сгенерированный код, например, в `index.mts`
+2. передайте в него ваш `base64`-файл или вызовите exported функцию из своего кода
+3. запустите:
+
+```bash
+npx tsx index.mts
+```
+
+Если хотите сначала скомпилировать:
+
+```bash
+npx tsc index.mts --target ES2020 --module nodenext
+node index.mjs
+```
+
+Что нужно для форматов:
+- `xlsx` — для raw `xlsx/xls`
+- `mammoth` — для raw `docx`
+- `pdfjs-dist` — для raw `pdf`
+
+Если вы обрабатываете только `csv/json/txt`, то дополнительные runtime-пакеты для `docx/pdf` не обязательны. Но самый безопасный вариант для переносимого generated TS — установить все три:
+
+```bash
+npm install xlsx mammoth pdfjs-dist
+```
+
 ### Проверка, что локальный запуск собрался
 
 Backend:
@@ -359,6 +401,77 @@ npm run build
 cd /home/user/Desktop/tsgen-desktop/mvp_backend
 source .venv/bin/activate
 python -m unittest test_validation
+```
+
+## Токеномика по кейсам
+
+В проекте есть два способа получить токеномику:
+
+- точная токеномика:
+  - из сохранённой history
+  - показывает реальные `input/output/total tokens` по generation-кейсам
+- approximate токеномика:
+  - dry-run probe без реального вызова модели
+  - полезна для сравнения кейсов до запуска в production-runtime
+
+Скрипт:
+
+- [tokenomics_report.py](/home/user/Desktop/tsgen-desktop/mvp_backend/tokenomics_report.py)
+
+### 1. Точная токеномика из history
+
+```bash
+cd /home/user/Desktop/tsgen-desktop/mvp_backend
+source .venv/bin/activate
+python tokenomics_report.py history --user-id <external_user_id>
+```
+
+Если вы не знаете `user_id`, можно сначала просто вывести доступных пользователей:
+
+```bash
+python tokenomics_report.py history
+```
+
+### 2. Approximate токеномика для одного кейса
+
+```bash
+cd /home/user/Desktop/tsgen-desktop/mvp_backend
+source .venv/bin/activate
+python tokenomics_report.py probe ./example.csv ./example_target.json --name example-case
+```
+
+### 3. Approximate токеномика для нескольких кейсов
+
+Сначала создайте manifest, например:
+
+```json
+[
+  {
+    "name": "crm",
+    "source_file": "/absolute/path/to/crmData.csv",
+    "target_json": "/absolute/path/to/dataExample.json"
+  },
+  {
+    "name": "doctor-type",
+    "source_file": "/absolute/path/to/doctorTypeList.csv",
+    "target_json": "/absolute/path/to/dataExample.json"
+  }
+]
+```
+
+Потом запустите:
+
+```bash
+cd /home/user/Desktop/tsgen-desktop/mvp_backend
+source .venv/bin/activate
+python tokenomics_report.py manifest ./cases.json
+```
+
+По умолчанию отчёт печатается в markdown-таблице. Для JSON:
+
+```bash
+python tokenomics_report.py history --user-id <external_user_id> --format json
+python tokenomics_report.py manifest ./cases.json --format json
 ```
 
 ## Electron-режим
